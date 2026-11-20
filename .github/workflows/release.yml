@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build Windows x64 & Publish Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable MSVC x64)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Verify tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $tagVer = $tag.TrimStart('v', 'V')
+          $cargoToml = Get-Content -Raw Cargo.toml
+          if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
+            $pkgVer = $Matches[1]
+          } else {
+            throw "Failed to parse version from Cargo.toml"
+          }
+          if ($tagVer -ne $pkgVer) {
+            throw "Tag version ($tagVer) does not match Cargo.toml version ($pkgVer)"
+          }
+          Write-Host "Verified release version: $tag (Cargo.toml = $pkgVer)"
+
+      - name: Run unit tests
+        shell: pwsh
+        run: cargo test --locked
+
+      - name: Build release binaries
+        shell: pwsh
+        run: cargo build --release --locked --bin airmonitor --bin airmonitor-probe
+
+      - name: Stage artifacts and generate SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/airmonitor.exe dist/airmonitor.exe
+          Copy-Item target/release/airmonitor-probe.exe dist/airmonitor-probe.exe
+
+          $files = @("airmonitor.exe", "airmonitor-probe.exe")
+          $lines = foreach ($f in $files) {
+            $hash = (Get-FileHash (Join-Path dist $f) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $f"
+          }
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "dist/SHA256SUMS.txt"),
+            (($lines -join "`n") + "`n"),
+            $utf8NoBom
+          )
+
+          $mainSize = (Get-Item dist/airmonitor.exe).Length
+          $probeSize = (Get-Item dist/airmonitor-probe.exe).Length
+          $mainMb = [math]::Round($mainSize / 1MB, 2)
+          $probeMb = [math]::Round($probeSize / 1MB, 2)
+          $shaTable = ($lines | ForEach-Object { "- ``$_``" }) -join "`n"
+
+          $notesLines = @(
+            "## AirMonitor ${{ github.ref_name }}"
+            ""
+            "Ultra-lightweight native Windows 10/11 taskbar hardware & wireless device battery monitor (Rust + Win32 + Direct2D, zero runtime/driver dependencies, static CRT)."
+            ""
+            "### Downloads"
+            "- **``airmonitor.exe``** (~$mainMb MB, $mainSize bytes) - Main taskbar & system tray application (portable, no installer required)."
+            "- **``airmonitor-probe.exe``** (~$probeMb MB, $probeSize bytes) - CLI hardware & wireless HID diagnostic tool."
+            "- **``SHA256SUMS.txt``** - SHA-256 checksums for manual and in-app updater verification."
+            ""
+            "### SHA-256 Checksums"
+            $shaTable
+            ""
+            "### Notes"
+            "- Requires Windows 10 / Windows 11 (x64), runs without administrator privileges."
+            "- Because these binaries are not Authenticode-signed, Windows SmartScreen may show an unrecognized-publisher prompt on first launch; you can also verify the checksums or build directly from source."
+          )
+          $notes = ($notesLines -join "`n") + "`n"
+
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "dist/RELEASE_NOTES.md"),
+            $notes,
+            $utf8NoBom
+          )
+
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release create $tag `
+            dist/airmonitor.exe `
+            dist/airmonitor-probe.exe `
+            dist/SHA256SUMS.txt `
+            --title "AirMonitor $tag" `
+            --notes-file dist/RELEASE_NOTES.md `
+            --verify-tag
