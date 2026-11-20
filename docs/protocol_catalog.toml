@@ -1,0 +1,1425 @@
+# AirMonitor Verified Open-Source Wireless HID Battery Protocol Catalog
+# Curated strictly from inspected upstream open-source repositories (see docs/protocol_sources.md).
+# All VID, PID, UsagePage, Usage, ReportType, TX hex, RX prefix, and byte offsets below
+# were directly observed in upstream source code/protocol docs — zero fabricated values.
+#
+# Schema:
+# 1) [[device]] / [[vendor]]: compatible with devices.toml for native protocol-family modules
+#    (rapoo, sonix, hidpp, compx, rongyuan, standard), optional min_poll_secs.
+# 2) [[custom_hid]]: declarative HID rule entries for generic / pre-adapted devices:
+#      vid, pid, name, kind ("mouse" | "keyboard" | "headset" | "earbuds" | "gamepad" | "other")
+#      usage_page, usage (hex strings), interface (optional int, -1 = any)
+#      report_type ("output_input" | "feature" | "get_feature" | "set_feature" | "passive_input")
+#      in_len / out_len / feat_len (optional exact/min Win32 report lengths incl. report ID)
+#      tx_hex (hex bytes to send; "" for passive_input / get_feature), rx_prefix_hex (hex bytes to match)
+#      rx_match (optional list of [offset, byte] exact assertions)
+#      battery_offset (int), battery_max (int), optional battery_mask (hex/int), battery_xor (hex/int)
+#      charging_offset (int, -1 if unavailable), charging_mask (int/hex)
+#      min_poll_secs (optional u64), allow_write (optional bool; required for external write rules)
+#      notes / source
+
+# ==============================================================================
+# PART 1: Protocol-Family Entries (mergeable into devices.toml [[device]]/[[vendor]])
+# ==============================================================================
+
+# --- Rapoo (VID 24AE) — Passive Push Nordic 54L (0x07) & Legacy (0xBB) ---
+[[device]]
+vid = "24AE"
+pid = "1410"
+name = "Rapoo VT0"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4610"
+name = "Rapoo VT0 (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1420"
+name = "Rapoo VT0 Max"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4620"
+name = "Rapoo VT0 Max (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1415"
+name = "Rapoo VT1"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4615"
+name = "Rapoo VT1 (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1444"
+name = "Rapoo VT1 Max"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4644"
+name = "Rapoo VT1 Max (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1422"
+name = "Rapoo VT2"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4622"
+name = "Rapoo VT2 (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1423"
+name = "Rapoo VT2 Max"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4623"
+name = "Rapoo VT2 Max (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1412"
+name = "Rapoo VT3"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4612"
+name = "Rapoo VT3 (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1417"
+name = "Rapoo VT3 Max (Gen 2)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4617"
+name = "Rapoo VT3 Max (Gen 2) (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1B06"
+name = "Rapoo VT3 Max V2"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4B06"
+name = "Rapoo VT3 Max V2 (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1411"
+name = "Rapoo VT3S"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4611"
+name = "Rapoo VT3S (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1406"
+name = "Rapoo VT3S (1406)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4606"
+name = "Rapoo VT3S (4606 USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1464"
+name = "Rapoo VT3S V2"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1421"
+name = "Rapoo VT3S Max"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4621"
+name = "Rapoo VT3S Max (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1413"
+name = "Rapoo VT7"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4613"
+name = "Rapoo VT7 (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1460"
+name = "Rapoo VT7 (1460)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4660"
+name = "Rapoo VT7 (4660 USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1416"
+name = "Rapoo VT7 Max"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4616"
+name = "Rapoo VT7 Max (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1414"
+name = "Rapoo VT9 (Gen 2)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4614"
+name = "Rapoo VT9 (Gen 2) (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1418"
+name = "Rapoo VT9 Max"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4618"
+name = "Rapoo VT9 Max (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+# Rapoo Legacy 7-byte BB B0 protocol
+[[device]]
+vid = "24AE"
+pid = "1215"
+name = "Rapoo VT3 Pro"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4415"
+name = "Rapoo VT3 Pro (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1233"
+name = "Rapoo VT1 Pro Max"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "4433"
+name = "Rapoo VT1 Pro Max (USB)"
+kind = "mouse"
+protocol = "rapoo"
+
+[[device]]
+vid = "24AE"
+pid = "1244"
+name = "Rapoo VT3 Pro Max"
+kind = "mouse"
+protocol = "rapoo"
+
+# --- CompX / Nordic 52840 (17B Report 0x08 Cmd 0x04, FF02:0002) ---
+[[device]]
+vid = "260D"
+pid = "1175"
+name = "Dareu A950 Air"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "260D"
+pid = "1193"
+name = "Dareu A950 Air (USB)"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "260D"
+pid = "1154"
+name = "Dareu A950 Wing"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "260D"
+pid = "1196"
+name = "Dareu A950 Wing (USB)"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "260D"
+pid = "1074"
+name = "Dareu EM901X"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "260D"
+pid = "1090"
+name = "Dareu EM901X (USB)"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "260D"
+pid = "1125"
+name = "Sharkoon Skiller SGM50W"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "046A"
+pid = "0330"
+name = "Cherry XTRFY 1K Wireless Mouse"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "1B1C"
+pid = "2B2A"
+name = "Corsair Sabre V2 Pro Ultralight"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F503"
+name = "VGN Dragonfly F1 Pro"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F502"
+name = "VGN Dragonfly F1 Pro (USB)"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "FB3E"
+name = "VGN F2 Pro Max"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F58A"
+name = "VXE R1 Pro Max"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F58C"
+name = "VXE R1 Pro Max (USB)"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F58E"
+name = "VXE R1 SE+"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F58F"
+name = "VXE R1 SE+ (USB)"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F505"
+name = "VXE Dragonfly R1"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F524"
+name = "Zaopin Z2 Mini"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F5F7"
+name = "Scyrox V8"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3554"
+pid = "F55D"
+name = "Redragon M916 Pro / G49"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "373B"
+pid = "1031"
+name = "ATK F1 Ultimate"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "373B"
+pid = "11D9"
+name = "ATK A9 / F1 Ultimate 2.0"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "373B"
+pid = "104D"
+name = "VXE MAD R"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "373B"
+pid = "1040"
+name = "VXE MAD R Major Plus"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "373B"
+pid = "1085"
+name = "VXE R1 SE+ (1K Dongle)"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3770"
+pid = "0200"
+name = "Hitscan Hyperlight"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "3710"
+pid = "5406"
+name = "Pulsar XS-1 8K Dongle"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "35BB"
+pid = "D3FB"
+name = "HECATE Wireless Mouse"
+kind = "mouse"
+protocol = "compx"
+
+[[device]]
+vid = "25A7"
+pid = "FA7C"
+name = "Fantech Helios Go XD5 / Ironcat Zero"
+kind = "mouse"
+protocol = "compx"
+
+# --- RongYuan 2.4G Receivers (00 F7 status on iface 2 FFFF:0002) ---
+[[device]]
+vid = "3151"
+pid = "4011"
+name = "RongYuan / Attack Shark 2.4G Receiver"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "4014"
+name = "RongYuan 2.4G Receiver (4014)"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "4017"
+name = "RongYuan 2.4G Receiver (4017)"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "4021"
+name = "RongYuan 2.4G Receiver (4021)"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "4027"
+name = "RongYuan 2.4G Receiver (4027)"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "402D"
+name = "Attack Shark R3 / AJAZZ AJ179 Pro"
+kind = "mouse"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "4038"
+name = "RongYuan 2.4G Receiver (4038)"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "5006"
+name = "Akko Air 01"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "5026"
+name = "Attack Shark X82 PRO HE"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "5038"
+name = "MonsGeek 2.4G Wireless Keyboard"
+kind = "keyboard"
+protocol = "rongyuan"
+
+[[device]]
+vid = "3151"
+pid = "5055"
+name = "RongYuan 2.4G Receiver (5055)"
+kind = "keyboard"
+protocol = "rongyuan"
+
+# --- SONiX 2.4G Keyboards (FF60:0061 iface 3, 33B, 20 01 00 ... checksum) ---
+[[device]]
+vid = "05AC"
+pid = "024F"
+name = "AJAZZ AK820 MAX / AULA F108 Pro (SONiX 2.4G)"
+kind = "keyboard"
+protocol = "sonix"
+
+[[device]]
+vid = "0C45"
+pid = "FEFE"
+name = "AJAZZ AK980 V2 / AK820 Pro (SONiX 2.4G)"
+kind = "keyboard"
+protocol = "sonix"
+
+[[device]]
+vid = "0C45"
+pid = "FDFD"
+name = "AJAZZ AK820 Pro (SONiX 2.4G)"
+kind = "keyboard"
+protocol = "sonix"
+
+[[device]]
+vid = "260D"
+pid = "0022"
+name = "Dareu A84 Wireless Keyboard"
+kind = "keyboard"
+protocol = "sonix"
+
+# --- Logitech HID++ (VID 046D) ---
+[[device]]
+vid = "046D"
+pid = "C548"
+name = "Logitech Logi Bolt"
+kind = "mouse"
+protocol = "hidpp"
+
+[[device]]
+vid = "046D"
+pid = "C52B"
+name = "Logitech Unifying"
+kind = "mouse"
+protocol = "hidpp"
+
+[[device]]
+vid = "046D"
+pid = "C547"
+name = "Logitech Lightspeed"
+kind = "mouse"
+protocol = "hidpp"
+
+[[device]]
+vid = "046D"
+pid = "C54D"
+name = "Logitech G PRO X SUPERLIGHT 2 (Lightspeed)"
+kind = "mouse"
+protocol = "hidpp"
+
+[[device]]
+vid = "046D"
+pid = "C09B"
+name = "Logitech G PRO X SUPERLIGHT 2 (USB)"
+kind = "mouse"
+protocol = "hidpp"
+
+[[device]]
+vid = "046D"
+pid = "C54F"
+name = "Logitech PRO X3 SUPERSTRIKE (Lightspeed)"
+kind = "mouse"
+protocol = "hidpp"
+
+[[device]]
+vid = "046D"
+pid = "0ABA"
+name = "Logitech G PRO X Wireless Headset"
+kind = "headset"
+protocol = "hidpp"
+
+[[device]]
+vid = "046D"
+pid = "0A66"
+name = "Logitech G533 Wireless Headset"
+kind = "headset"
+protocol = "hidpp"
+
+[[device]]
+vid = "046D"
+pid = "0AC4"
+name = "Logitech G535 Wireless Headset"
+kind = "headset"
+protocol = "hidpp"
+
+# ==============================================================================
+# PART 2: Declarative Custom HID Rules ([[custom_hid]])
+# ==============================================================================
+
+# --- Rapoo Nordic 54L Passive Push (Report 0x07 on FF00:0002) ---
+[[custom_hid]]
+vid = "24AE"
+pid = "1412"
+name = "Rapoo VT3 (Nordic 54L)"
+kind = "mouse"
+usage_page = "FF00"
+usage = "0002"
+interface = 1
+report_type = "passive_input"
+in_len = 19
+tx_hex = ""
+rx_prefix_hex = "07"
+battery_offset = 8
+battery_max = 100
+charging_offset = 7
+charging_mask = 2
+notes = "Passive push every ~3-10s; byte[7]=1 discharging, byte[7]=2 charging; bytes[13..14]=mouse PID LE"
+source = "Thirt927/rapoo-vt3s-autoswitch (docs/PROTOCOL.md), krisgfx9 (src/drivers/rapoo.cpp)"
+
+# --- Rapoo Legacy 7-byte Passive Push (Report 0xBB on FF00:0002) ---
+[[custom_hid]]
+vid = "24AE"
+pid = "1215"
+name = "Rapoo VT3 Pro (Legacy)"
+kind = "mouse"
+usage_page = "FF00"
+usage = "0002"
+interface = 1
+report_type = "passive_input"
+in_len = 7
+tx_hex = ""
+rx_prefix_hex = "BBB0"
+battery_offset = 6
+battery_max = 100
+charging_offset = 5
+charging_mask = 2
+notes = "Passive push every ~3.2s; byte[5]=1 discharging, byte[5]=2 charging; byte[6]=0x7F unknown while charging"
+source = "krisgfx9 (src/drivers/rapoo_protocol.h), zbndev/rapoo_battery (rapoo-battery.py)"
+
+# --- SONiX 2.4G Keyboard Dongle (33B Report ID 0, Cmd 0x20 0x01, trailing byte sum) ---
+[[custom_hid]]
+vid = "05AC"
+pid = "024F"
+name = "SONiX 2.4G Keyboard (AJAZZ AK820 MAX / AULA F108 Pro / CompX)"
+kind = "keyboard"
+usage_page = "FF60"
+usage = "0061"
+interface = 3
+report_type = "output_input"
+in_len = 33
+out_len = 33
+tx_hex = "002001000000000000000000000000000000000000000000000000000000000021"
+rx_prefix_hex = "00200100"
+battery_offset = 4
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "With RID 0 prepended: [0..3]=00 20 01 00, [4]=percent (1..100). If OS strips RID 0: prefix 200100, offset 3. No charging flag."
+source = "krisgfx9 (src/drivers/sonix.cpp), FerrisPulse (src/Hardware/CompxWirelessKeyboardHelper.cs)"
+
+[[custom_hid]]
+vid = "0C45"
+pid = "FEFE"
+name = "AJAZZ AK980 V2 / AK820 Pro (SONiX 2.4G)"
+kind = "keyboard"
+usage_page = "FF60"
+usage = "0061"
+interface = 3
+report_type = "output_input"
+in_len = 33
+out_len = 33
+tx_hex = "002001000000000000000000000000000000000000000000000000000000000021"
+rx_prefix_hex = "00200100"
+battery_offset = 4
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+source = "krisgfx9 (src/drivers/sonix.cpp)"
+
+[[custom_hid]]
+vid = "0C45"
+pid = "FDFD"
+name = "AJAZZ AK820 Pro (SONiX 2.4G)"
+kind = "keyboard"
+usage_page = "FF60"
+usage = "0061"
+interface = 3
+report_type = "output_input"
+in_len = 33
+out_len = 33
+tx_hex = "002001000000000000000000000000000000000000000000000000000000000021"
+rx_prefix_hex = "00200100"
+battery_offset = 4
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+source = "krisgfx9 (src/drivers/sonix.cpp)"
+
+# --- Cherry / Akko V9 Dash Pro / Evision 64B Report 0x04 Type 0x1A (FF1C:0092) ---
+[[custom_hid]]
+vid = "046A"
+pid = "00EA"
+name = "CHERRY MX 3.0S Wireless (2.4G Dongle)"
+kind = "keyboard"
+usage_page = "FF1C"
+usage = "0092"
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "0472001A030000550000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+rx_prefix_hex = "04"
+rx_match = [[3, 0x1A]]
+battery_offset = 8
+battery_max = 100
+charging_offset = 9
+charging_mask = 255
+min_poll_secs = 600
+notes = "Checksum bytes [1..2] LE = sum(bytes[3..63]) = 0x0072. Verifies rx[3]==0x1A; min_poll_secs=600 preserves keyboard sleep."
+source = "krisgfx9 (src/drivers/cherry.cpp)"
+
+
+[[custom_hid]]
+vid = "046A"
+pid = "00E3"
+name = "CHERRY MX 3.0S Wireless (USB Cable)"
+kind = "keyboard"
+usage_page = "FF1C"
+usage = "0092"
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "0472001A030000550000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+rx_prefix_hex = "04"
+rx_match = [[3, 0x1A]]
+battery_offset = 8
+battery_max = 100
+charging_offset = 9
+charging_mask = 255
+notes = "Verifies rx[3]==0x1A. Reply [8]=pct (0..100), [9]!=0 while USB powered."
+source = "krisgfx9 (src/drivers/cherry.cpp)"
+
+[[custom_hid]]
+vid = "38EE"
+pid = "000C"
+name = "Akko V9 Dash Pro (2.4G)"
+kind = "mouse"
+usage_page = "FF1C"
+usage = "0092"
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "0472001A030000550000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+rx_prefix_hex = "04"
+rx_match = [[3, 0x1A]]
+battery_offset = 8
+battery_max = 100
+charging_offset = 9
+charging_mask = 255
+notes = "Verifies rx[3]==0x1A. Same 64B 0x04/0x1A protocol as Cherry MX 3.0S."
+source = "krisgfx9 (src/drivers/akko.cpp)"
+
+# --- Evision / ATK / VGN Keyboards (320F:5088 / 320F:5055, FF1C:0092, Report 0x04) ---
+[[custom_hid]]
+vid = "320F"
+pid = "5088"
+name = "ATK V75X / VGN VXE75 / N75 Pro (Evision 2.4G)"
+kind = "keyboard"
+usage_page = "FF1C"
+usage = "0092"
+report_type = "output_input"
+tx_hex = "0401001A00000000000000000000000000000000000000000000000000000000"
+rx_prefix_hex = "0401001A"
+battery_offset = 8
+battery_max = 100
+charging_offset = 9
+charging_mask = 3
+min_poll_secs = 600
+notes = "32B Report 04 on FF1C:0092. VGN variants send byte[4]=0x06. Poll at >=10min interval over 2.4G to avoid keeping keyboard awake."
+source = "krisgfx9 (src/drivers/atk_keyboard.cpp)"
+
+[[custom_hid]]
+vid = "320F"
+pid = "5055"
+name = "ATK V75X / VGN Keyboard (USB Cable)"
+kind = "keyboard"
+usage_page = "FF1C"
+usage = "0092"
+report_type = "output_input"
+tx_hex = "0401001A00000000000000000000000000000000000000000000000000000000"
+rx_prefix_hex = "0401001A"
+battery_offset = 8
+battery_max = 100
+charging_offset = 9
+charging_mask = 3
+source = "krisgfx9 (src/drivers/atk_keyboard.cpp)"
+
+# --- CompX / Nordic 52840 (17B Report 0x08 Cmd 0x04, Checksum 0x55) ---
+[[custom_hid]]
+vid = "260D"
+pid = "1175"
+name = "Dareu A950 Air (2.4G)"
+kind = "mouse"
+usage_page = "FF02"
+usage = "0002"
+report_type = "output_input"
+in_len = 17
+out_len = 17
+tx_hex = "0804000000000000000000000000000049"
+rx_prefix_hex = "0804"
+battery_offset = 6
+battery_max = 100
+charging_offset = 7
+charging_mask = 1
+notes = "Checksum = 0x55 - sum(bytes[0..15]). Bytes[8..9]=mV BE."
+source = "Fan4Metal/mouse_tray (mouse_tray/drivers/chipset/nordic52.py)"
+
+[[custom_hid]]
+vid = "260D"
+pid = "1154"
+name = "Dareu A950 Wing (2.4G)"
+kind = "mouse"
+usage_page = "FF02"
+usage = "0002"
+report_type = "output_input"
+in_len = 17
+out_len = 17
+tx_hex = "0804000000000000000000000000000049"
+rx_prefix_hex = "0804"
+battery_offset = 6
+battery_max = 100
+charging_offset = 7
+charging_mask = 1
+source = "Fan4Metal/mouse_tray (mouse_tray/drivers/chipset/nordic52.py)"
+
+# --- CompX / Nordic 54L15 (64B Report 0x08 Cmd 0x72 Sub 0x07, FF05:0001) ---
+[[custom_hid]]
+vid = "373B"
+pid = "1155"
+name = "ATK Zero (8K Dongle-L1)"
+kind = "mouse"
+usage_page = "FF05"
+usage = "0001"
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "087D7202000107010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+rx_prefix_hex = "087200"
+battery_offset = 7
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "Byte[5]=0x01 for dongle link, 0x00 for cable (PID 1154). Reply [2]=0x00 means answered, [5]=0x07 echo, [7]=pct."
+source = "Fan4Metal/mouse_tray (mouse_tray/drivers/chipset/nordic54.py)"
+
+# --- RongYuan 2.4G Receiver (65B Feature 0x00 0xF7 on iface 2 FFFF:0002) ---
+[[custom_hid]]
+vid = "3151"
+pid = "4011"
+name = "RongYuan 2.4G Receiver (Keyboard Slot)"
+kind = "keyboard"
+usage_page = "FFFF"
+usage = "0002"
+interface = 2
+report_type = "feature"
+feat_len = 65
+tx_hex = "00F7000000000000"
+rx_prefix_hex = "00"
+battery_offset = 2
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "Pad TX to featLen (65B). Reply [2]=kb%, [3]=mouse%, [4]=kb_offline(0=online), [5]=mouse_offline(0=online)."
+source = "qu1ncky/BatteryTray (RongyuanDongleProvider.cs), krisgfx9 (rongyuan.cpp), dniminenn/sharkfin (docs/PROTOCOL.md)"
+
+[[custom_hid]]
+vid = "3151"
+pid = "402D"
+name = "Attack Shark R3 / AJAZZ AJ179 Pro (RongYuan 2.4G Mouse Slot)"
+kind = "mouse"
+usage_page = "FFFF"
+usage = "0002"
+interface = 2
+report_type = "feature"
+feat_len = 65
+tx_hex = "00F7000000000000"
+rx_prefix_hex = "00"
+battery_offset = 3
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "Pad TX to featLen (65B). Check [5]==0 (mouse online) before trusting [3]=mouse%."
+source = "qu1ncky/BatteryTray (RongyuanDongleProvider.cs), krisgfx9 (rongyuan.cpp)"
+
+# --- Glorious / Hitscan / Lamzu / G-Wolves / WLMouse (65B Feature 0x00 ... 02 02 00 83) ---
+[[custom_hid]]
+vid = "373E"
+pid = "001E"
+name = "Lamzu Maya X (2.4G)"
+kind = "mouse"
+usage_page = "FFFF"
+usage = "0000"
+interface = 2
+report_type = "feature"
+feat_len = 65
+tx_hex = "0000000202008300"
+rx_prefix_hex = "00A1"
+battery_offset = 8
+battery_max = 100
+charging_offset = 7
+charging_mask = 1
+notes = "Pad TX to 65B. Reply [1]=A1 awake (A4 asleep, A0 waking), [6]=0x83, [7]=charging, [8]=pct."
+source = "Fan4Metal/mouse_tray (lamzu.py), krisgfx9 (glorious.cpp)"
+
+[[custom_hid]]
+vid = "258A"
+pid = "2022"
+name = "Glorious Model O Wireless"
+kind = "mouse"
+usage_page = "FFFF"
+usage = "0000"
+report_type = "feature"
+feat_len = 65
+tx_hex = "0000000202008300"
+rx_prefix_hex = "00A1"
+battery_offset = 8
+battery_max = 100
+charging_offset = 7
+charging_mask = 1
+source = "krisgfx9 (src/drivers/glorious.cpp)"
+
+# --- AULA / MCHOSE "BY" 2.4G Keyboard Receivers (20B Output/Input 0x13 0x4A, FF02:0002) ---
+[[custom_hid]]
+vid = "3554"
+pid = "FA09"
+name = "AULA F75 / F87 Pro / F99 / MCHOSE G75 Pro (BY 2.4G)"
+kind = "keyboard"
+usage_page = "FF02"
+usage = "0002"
+report_type = "output_input"
+in_len = 20
+out_len = 20
+tx_hex = "134A00000000000000000000000000000000005D"
+rx_prefix_hex = "13"
+battery_offset = 5
+battery_max = 100
+charging_offset = 6
+charging_mask = 240
+notes = "Reply (r[1] & 0x7F)==0x4A, [5]=pct(1..100), [6] high nibble=charging (0x10 charging, 0x01 on battery). Do NOT send 0x08/0x04 mouse frames to 3554:FA09."
+source = "krisgfx9 (src/drivers/aula.cpp), FerrisPulse (HARDWARE_PROTOCOLS.md)"
+
+[[custom_hid]]
+vid = "41E4"
+pid = "2001"
+name = "MCHOSE K99 V2 / G75 Pro (BY 2.4G)"
+kind = "keyboard"
+usage_page = "FF02"
+usage = "0002"
+report_type = "output_input"
+in_len = 20
+out_len = 20
+tx_hex = "134A01000000000000000000000000000000005E"
+rx_prefix_hex = "13"
+battery_offset = 5
+battery_max = 100
+charging_offset = 6
+charging_mask = 240
+source = "krisgfx9 (src/drivers/aula.cpp)"
+
+# --- MCHOSE Modern 4D Mice (64B Report 0x4D Cmd 0x0900, FF01:0001) ---
+[[custom_hid]]
+vid = "3837"
+pid = "1018"
+name = "MCHOSE K7 V2 Ultra+ (4D 2.4G)"
+kind = "mouse"
+usage_page = "FF01"
+usage = "0001"
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "4D0101000009000009"
+rx_prefix_hex = "4D01"
+battery_offset = 20
+battery_max = 100
+charging_offset = 19
+charging_mask = 1
+notes = "Pad TX to 64B. Checksum [8]=XOR(bytes[2..7]). Reply [3]=len>=14, [4..5]=0009, [18]=link(1=USB,2=2.4G), [19]=charging, [20]=pct."
+source = "krisgfx9 (mchose_modern.cpp), FerrisPulse (HARDWARE_PROTOCOLS.md)"
+
+[[custom_hid]]
+vid = "3837"
+pid = "4028"
+name = "MCHOSE K7 V2 Ultra+ (4D USB)"
+kind = "mouse"
+usage_page = "FF01"
+usage = "0001"
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "4D0101000009000009"
+rx_prefix_hex = "4D01"
+battery_offset = 20
+battery_max = 100
+charging_offset = 19
+charging_mask = 1
+source = "krisgfx9 (mchose_modern.cpp), FerrisPulse (HARDWARE_PROTOCOLS.md)"
+
+# --- MCHOSE GLW Keyboards (3837:3033, 65B Output/Input 00 55 05 00 38 38 ...) ---
+[[custom_hid]]
+vid = "3837"
+pid = "3033"
+name = "MCHOSE G75 V2 / G87 V2 / K99 V3 (GLW 2.4G)"
+kind = "keyboard"
+usage_page = "0001"
+usage = "0000"
+report_type = "output_input"
+in_len = 65
+out_len = 65
+tx_hex = "005505003838000000"
+rx_prefix_hex = "AA05"
+battery_offset = 40
+battery_max = 100
+battery_mask = 127
+charging_offset = 40
+charging_mask = 128
+notes = "Pad TX to 65B. Fallback collection FF31:0074. Reply [0]=AA,[1]=05,[40]=bit7 charging + bits0..6 pct (or +1 offset if RID 0 preserved: [41])."
+source = "krisgfx9 (mchose_keyboard.cpp), FerrisPulse (HARDWARE_PROTOCOLS.md)"
+
+# --- MCHOSE Realtek XOR 0xFF (5253:1020 / 3837:100C, 65B Feature 0x12 0xF9) ---
+[[custom_hid]]
+vid = "5253"
+pid = "1020"
+name = "MCHOSE L7 / M7 / A7 / K7 (Realtek 2.4G)"
+kind = "mouse"
+usage_page = "FF01"
+usage = "0001"
+report_type = "feature"
+feat_len = 65
+tx_hex = "12F9FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+rx_prefix_hex = "12F9"
+battery_offset = 11
+battery_max = 100
+battery_xor = 255
+charging_offset = 12
+charging_mask = 255
+notes = "Pad TX with 0xFF to 65B. All payload bytes [2..12] are XOR 0xFF: decoded [9]=r[11]^0xFF pct, [10]=r[12]^0xFF charging."
+source = "krisgfx9 (mchose.cpp), Fan4Metal/mouse_tray (realtek.py)"
+
+# --- Ninjutso Sora V2 (1915:AE1C / AE11, 32B Feature ID 5 on FFA0) ---
+[[custom_hid]]
+vid = "1915"
+pid = "AE1C"
+name = "Ninjutso Sora V2 (2.4G)"
+kind = "mouse"
+usage_page = "FFA0"
+usage = "0001"
+report_type = "feature"
+feat_len = 32
+tx_hex = "0515000001000000000000000000000000000000000000000000000000000000"
+rx_prefix_hex = "05"
+battery_offset = 9
+battery_max = 100
+charging_offset = 10
+charging_mask = 1
+notes = "Reply [9]=pct, [10]=charging, [11]=full, [12]=online."
+source = "Fan4Metal/mouse_tray (ninjutso.py)"
+
+# --- Attack Shark X3 Beken Push (1D57:FA60, iface 2 000A:0000, passive Report 0x03) ---
+[[custom_hid]]
+vid = "1D57"
+pid = "FA60"
+name = "Attack Shark X3 (2.4G)"
+kind = "mouse"
+usage_page = "000A"
+usage = "0000"
+interface = 2
+report_type = "passive_input"
+tx_hex = ""
+rx_prefix_hex = "03"
+battery_offset = 4
+battery_max = 10
+charging_offset = -1
+charging_mask = 0
+notes = "Passive push ~2s; byte[2]=0x40/0x41 event code, byte[4]=level (0..10 -> *10% in mouse_tray)."
+source = "Fan4Metal/mouse_tray (attackshark.py)"
+
+# --- SteelSeries Headsets & Mice (VID 1038) ---
+[[custom_hid]]
+vid = "1038"
+pid = "2232"
+name = "SteelSeries Arctis Nova 5 (2.4G)"
+kind = "headset"
+usage_page = "FFC0"
+usage = "0001"
+report_type = "output_input"
+tx_hex = "00B0"
+rx_prefix_hex = ""
+battery_offset = 3
+battery_max = 100
+charging_offset = 4
+charging_mask = 1
+notes = "Reply [1]!=0x02 connected, [3]=pct(0..100), [4]==0x01 charging."
+source = "krisgfx9 (steelseries.cpp), FerrisPulse (HARDWARE_PROTOCOLS.md)"
+
+[[custom_hid]]
+vid = "1038"
+pid = "2202"
+name = "SteelSeries Arctis Nova 7 (2.4G)"
+kind = "headset"
+usage_page = "FFC0"
+usage = "0001"
+report_type = "output_input"
+tx_hex = "00B0"
+rx_prefix_hex = ""
+battery_offset = 2
+battery_max = 4
+charging_offset = 3
+charging_mask = 3
+notes = "Reply [3]!=0x00 connected, [3]==1|2 charging, [2]=level(0..4 -> *25%)."
+source = "krisgfx9 (steelseries.cpp), Sapd/HeadsetControl (steelseries_arctis_nova_7.hpp)"
+
+[[custom_hid]]
+vid = "1038"
+pid = "12E0"
+name = "SteelSeries Arctis Nova Pro Wireless"
+kind = "headset"
+usage_page = "FFC0"
+usage = "0001"
+interface = 4
+report_type = "output_input"
+tx_hex = "06B0"
+rx_prefix_hex = ""
+battery_offset = 6
+battery_max = 8
+charging_offset = 15
+charging_mask = 2
+notes = "Reply [15]!=0x01 connected, [15]==0x02 charging, [6]=level(0..8)."
+source = "krisgfx9 (steelseries.cpp), Sapd/HeadsetControl (steelseries_arctis_nova_pro_wireless.hpp)"
+
+[[custom_hid]]
+vid = "1038"
+pid = "12B3"
+name = "SteelSeries Arctis 1 Wireless"
+kind = "headset"
+usage_page = "FF43"
+usage = "0202"
+report_type = "output_input"
+tx_hex = "0612"
+rx_prefix_hex = ""
+battery_offset = 3
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "Reply [2]!=0x01 online, [3]=pct(0..100)."
+source = "krisgfx9 (steelseries.cpp)"
+
+[[custom_hid]]
+vid = "1038"
+pid = "1260"
+name = "SteelSeries Arctis 7 (2019)"
+kind = "headset"
+usage_page = "FF43"
+usage = "0202"
+report_type = "output_input"
+tx_hex = "0618"
+rx_prefix_hex = ""
+battery_offset = 2
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+source = "krisgfx9 (steelseries.cpp)"
+
+[[custom_hid]]
+vid = "1038"
+pid = "1890"
+name = "SteelSeries Aerox 3 Wireless Gen 2 (2.4G)"
+kind = "mouse"
+usage_page = "FF00"
+usage = "0001"
+interface = 3
+report_type = "output_input"
+tx_hex = "00D2"
+rx_prefix_hex = "D2"
+battery_offset = 2
+battery_max = 100
+charging_offset = 1
+charging_mask = 3
+notes = "Reply [1]: 00 battery, 01 charging, 02 full; [2]=0..100 (FF=unknown)."
+source = "krisgfx9 (steelseries.cpp)"
+
+# --- Corsair Headsets (VID 1B1C) ---
+[[custom_hid]]
+vid = "1B1C"
+pid = "0A14"
+name = "Corsair Void Wireless Family"
+kind = "headset"
+usage_page = "FFC5"
+usage = "0001"
+interface = 3
+report_type = "output_input"
+tx_hex = "C964"
+rx_prefix_hex = ""
+battery_offset = 2
+battery_max = 100
+battery_mask = 127
+charging_offset = 4
+charging_mask = 4
+notes = "Reply [2]&0x7F = pct (bit7=mic), [4] status (0=offline, 1-2=ok, 4-5=charging). Also applies to 0A16,0A17,0A1A,0A1D,0A2B,0A38,0A4F,0A51,0A52,0A55,0A56,0A75,1B1C,1B23,1B27,1B29,1B2A."
+source = "Sapd/HeadsetControl (corsair_void_rich.hpp), krisgfx9 (corsair.cpp)"
+
+[[custom_hid]]
+vid = "1B1C"
+pid = "0A97"
+name = "Corsair HS80 MAX (Bragi 2.4G)"
+kind = "headset"
+usage_page = "FF42"
+usage = "0001"
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "0209020F"
+rx_prefix_hex = "02010200"
+battery_offset = 4
+battery_max = 1000
+notes = "Bragi GET property 0x0F (0..1000 tenths of %) on target 0x09 (paired) or 0x08 (self); LE u16/u32 at [4..7] (prefixed) or [3..6] (plain)."
+charging_offset = -1
+charging_mask = 0
+source = "krisgfx9 (corsair.cpp), FerrisPulse (HARDWARE_PROTOCOLS.md)"
+
+# --- HyperX Headsets & Mice (VID 03F0 / 0951) ---
+[[custom_hid]]
+vid = "03F0"
+pid = "0C9D"
+name = "HyperX Cloud III Wireless"
+kind = "headset"
+usage_page = "FF90"
+usage = "0303"
+report_type = "output_input"
+tx_hex = "6689"
+rx_prefix_hex = "6689"
+battery_offset = 4
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "66 82 -> [2]!=0 connected; 66 8A -> [2]==1 charging; 66 89 -> [2..3]=mV BE, [4]=pct."
+source = "krisgfx9 (hyperx.cpp)"
+
+[[custom_hid]]
+vid = "03F0"
+pid = "0696"
+name = "HyperX Cloud II Wireless (HP)"
+kind = "headset"
+usage_page = "FF90"
+usage = "0303"
+interface = 0
+report_type = "output_input"
+tx_hex = "06FFBB0200"
+rx_prefix_hex = "06FFBB02"
+battery_offset = 7
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "Charging via separate query 06FFBB03 -> [4]==1. Also PID 018B."
+source = "Sapd/HeadsetControl (hyperx_cloud_2_wireless.hpp), krisgfx9 (hyperx.cpp)"
+
+[[custom_hid]]
+vid = "03F0"
+pid = "02CC"
+name = "HyperX Cloud III S Wireless"
+kind = "headset"
+usage_page = "01C0"
+usage = "0001"
+report_type = "output_input"
+tx_hex = "0C0203010006"
+rx_prefix_hex = "0C0203010006"
+battery_offset = 6
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "0C 02 03 01 00 02 -> [6]==2 connected; cmd 06 -> [6]=pct; cmd 48 -> [6]==1|2 charging."
+source = "krisgfx9 (hyperx.cpp), FerrisPulse (HARDWARE_PROTOCOLS.md)"
+
+[[custom_hid]]
+vid = "03F0"
+pid = "0F98"
+name = "HyperX Pulsefire Haste 2 Wireless"
+kind = "mouse"
+usage_page = "FF00"
+usage = "0001"
+interface = 2
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "5002"
+rx_prefix_hex = "5102"
+battery_offset = 2
+battery_max = 100
+charging_offset = 3
+charging_mask = 3
+notes = "52 01 -> 53 01 [2]!=0 linked; 50 02 -> 51 02 [2]=pct, [3]==1|2 charging. Also 0AB5 (Core) and 0DA0 (Mini)."
+source = "krisgfx9 (hyperx.cpp)"
+
+# --- ASUS ROG (VID 0B05) ---
+[[custom_hid]]
+vid = "0B05"
+pid = "1A85"
+name = "ASUS ROG Azoth (2.4G)"
+kind = "keyboard"
+usage_page = "FF00"
+usage = "0001"
+interface = 1
+report_type = "output_input"
+tx_hex = "001201"
+rx_prefix_hex = "1201"
+battery_offset = 5
+battery_max = 100
+charging_offset = 8
+charging_mask = 1
+notes = "Without RID 0: [0..1]=12 01, [5]=pct, [8]==1 charging. Omni receiver (1ACE col02 RID 2) preserves RID 2 so offset+1 ([6]=pct, [9]=chg)."
+source = "krisgfx9 (rog.cpp)"
+
+[[custom_hid]]
+vid = "0B05"
+pid = "1B84"
+name = "ASUS ROG Pelta (2.4G)"
+kind = "headset"
+usage_page = "FF00"
+usage = "0001"
+interface = 3
+report_type = "output_input"
+in_len = 64
+out_len = 64
+tx_hex = "CC1207"
+rx_prefix_hex = "CC1207"
+battery_offset = 6
+battery_max = 100
+charging_offset = -1
+charging_mask = 0
+notes = "CC 12 08 -> [5]==1 charging. Same protocol for ROG Delta II (0B05:1AFA)."
+source = "krisgfx9 (rog.cpp), FerrisPulse (HARDWARE_PROTOCOLS.md)"

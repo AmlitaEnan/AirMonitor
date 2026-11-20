@@ -1,0 +1,19 @@
+# Rust / Cargo build outputs
+/target/
+*.pdb
+
+# User runtime configuration & staged updater/backup files
+/config.toml
+/config.toml.bak
+*.bak
+*.new
+*.old
+*.tmp
+*.log
+
+# Editors & OS metadata
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

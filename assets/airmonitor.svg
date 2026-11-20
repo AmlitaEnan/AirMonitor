@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <!-- Hand-drawn organic squircle badge -->
+  <path
+    d="M 132 58 C 210 50, 305 52, 382 60 C 438 66, 454 92, 456 148 C 462 224, 458 302, 452 372 C 446 432, 422 452, 366 456 C 292 462, 212 460, 140 454 C 80 448, 58 424, 56 364 C 50 290, 52 212, 58 142 C 64 84, 86 64, 132 58 Z"
+    fill="#F8FAFC"
+    stroke="#1F2937"
+    stroke-width="24"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Mint wireless / battery pulse dot -->
+  <circle cx="154" cy="186" r="24" fill="#10B981" stroke="#1F2937" stroke-width="14" />
+
+  <!-- Hand-drawn wireless signal arcs -->
+  <path
+    d="M 164 134 C 196 130, 224 154, 226 188"
+    stroke="#1F2937"
+    stroke-width="22"
+    stroke-linecap="round"
+  />
+  <path
+    d="M 162 96 C 220 92, 266 136, 268 192"
+    stroke="#1F2937"
+    stroke-width="22"
+    stroke-linecap="round"
+  />
+
+  <!-- Hand-drawn flowing air / breeze waves -->
+  <path
+    d="M 118 282 C 175 248, 240 250, 294 280 C 336 304, 386 288, 396 250 C 402 226, 380 206, 356 216"
+    stroke="#0EA5E9"
+    stroke-width="26"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M 134 356 C 194 332, 254 338, 308 362 C 344 378, 382 366, 386 338"
+    stroke="#0EA5E9"
+    stroke-width="24"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

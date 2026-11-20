@@ -1,0 +1,69 @@
+[package]
+name = "airmonitor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Ultra-lightweight Windows taskbar hardware & wireless device battery monitor"
+readme = "README.md"
+repository = "https://github.com/AmlitaEnan/AirMonitor"
+keywords = ["windows", "taskbar", "hardware-monitor", "battery", "direct2d"]
+categories = ["os::windows-apis", "hardware-support", "gui"]
+
+[[bin]]
+name = "airmonitor"
+path = "src/main.rs"
+
+[[bin]]
+name = "airmonitor-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+    "Win32_System_Com",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_IO",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Devices_Bluetooth_Advertisement",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+    "Foundation_Numerics",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
