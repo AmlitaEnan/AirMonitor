@@ -225,8 +225,9 @@ fn build_version_info(
         |root| {
             write_version_node(root, "StringFileInfo", 1, 0, &[], |sfi| {
                 write_version_node(sfi, "040904B0", 1, 0, &[], |table| {
+                    append_version_string(table, "Comments", description);
                     append_version_string(table, "CompanyName", "AirMonitor");
-                    append_version_string(table, "FileDescription", description);
+                    append_version_string(table, "FileDescription", "AirMonitor");
                     append_version_string(table, "FileVersion", &four_part_ver);
                     append_version_string(table, "InternalName", "airmonitor");
                     append_version_string(
@@ -234,7 +235,7 @@ fn build_version_info(
                         "LegalCopyright",
                         "Copyright (c) 2026 AirMonitor Contributors",
                     );
-                    append_version_string(table, "OriginalFilename", "airmonitor.exe");
+                    append_version_string(table, "OriginalFilename", "AirMonitor.exe");
                     append_version_string(table, "ProductName", "AirMonitor");
                     append_version_string(table, "ProductVersion", pkg_version);
                 });

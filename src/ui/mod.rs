@@ -80,12 +80,16 @@ const TIMER_DEVICE_DEBOUNCE: usize = 2;
 const TIMER_SMOKE_TEST: usize = 3;
 const TIMER_STARTUP_TRIM: usize = 4;
 const TIMER_GEOM_SETTLE: usize = 5;
+const TIMER_DEVICE_FOLLOWUP: usize = 6;
 
 const ZORDER_TICK_MS: u32 = 500;
 const GEOM_SETTLE_TICK_MS: u32 = 180;
 const DEVICE_DEBOUNCE_MS: u32 = 800;
+const DEVICE_FOLLOWUP_MS: u32 = 2500;
 const STARTUP_TRIM_MS: u32 = 1500;
 const SMOKE_STEADY_MS: u32 = 4000;
+const PASSIVE_FAST_RETRY_SECS: u64 = 5;
+const MAX_PASSIVE_FAST_RETRIES: u8 = 2;
 
 /// Immutable snapshot paired with per-subsystem revision numbers so UI views
 /// only redraw when their own inputs actually change.
@@ -403,6 +407,7 @@ impl UiApp {
         unsafe {
             let _ = KillTimer(self.host_hwnd, TIMER_ZORDER_CHECK);
             let _ = KillTimer(self.host_hwnd, TIMER_DEVICE_DEBOUNCE);
+            let _ = KillTimer(self.host_hwnd, TIMER_DEVICE_FOLLOWUP);
             let _ = KillTimer(self.host_hwnd, TIMER_SMOKE_TEST);
             let _ = KillTimer(self.host_hwnd, TIMER_STARTUP_TRIM);
             let _ = KillTimer(self.host_hwnd, TIMER_GEOM_SETTLE);
@@ -705,6 +710,16 @@ fn spawn_hw_worker(
         .ok()
 }
 
+fn has_pending_passive_telemetry(devices: &[crate::state::WirelessDevice]) -> bool {
+    devices.iter().any(|d| {
+        d.online
+            && d.battery_pct.is_none()
+            && d.detail_note.as_deref().is_some_and(|note| {
+                note.contains("no telemetry frame yet") || note.contains("awaiting telemetry frame")
+            })
+    })
+}
+
 fn spawn_wireless_worker(
     state: SnapshotStore,
     stop_flag: Arc<AtomicBool>,
@@ -715,8 +730,10 @@ fn spawn_wireless_worker(
         .name("wireless-worker".to_string())
         .spawn(move || {
             let mut mgr = WirelessManager::with_stop_flag(Arc::clone(&stop_flag));
+            let mut passive_fast_retries: u8 = 0;
             while !stop_flag.load(Ordering::Relaxed) {
                 let devices = mgr.poll_once();
+                let awaiting_passive = has_pending_passive_telemetry(&devices);
                 state.update_devices(devices);
                 post_wireless_update(host_hwnd_raw);
 
@@ -725,11 +742,22 @@ fn spawn_wireless_worker(
                     .map(|s| s.config.hid_poll_interval_secs.clamp(10, 600))
                     .unwrap_or(45);
 
+                let wait_secs =
+                    if awaiting_passive && passive_fast_retries < MAX_PASSIVE_FAST_RETRIES {
+                        passive_fast_retries = passive_fast_retries.saturating_add(1);
+                        PASSIVE_FAST_RETRY_SECS.min(poll_secs)
+                    } else {
+                        if !awaiting_passive {
+                            passive_fast_retries = 0;
+                        }
+                        poll_secs
+                    };
+
                 let (lock, cvar) = &*wake_sig;
                 if let Ok(mut woken) = lock.lock() {
                     if !*woken && !stop_flag.load(Ordering::Relaxed) {
                         let (guard, _) = cvar
-                            .wait_timeout(woken, Duration::from_secs(poll_secs))
+                            .wait_timeout(woken, Duration::from_secs(wait_secs))
                             .unwrap_or_else(|e| e.into_inner());
                         woken = guard;
                     }
@@ -1023,6 +1051,12 @@ unsafe extern "system" fn host_wnd_proc(
                         }
                         TIMER_DEVICE_DEBOUNCE => {
                             let _ = KillTimer(hwnd, TIMER_DEVICE_DEBOUNCE);
+                            let _ = SetTimer(hwnd, TIMER_DEVICE_FOLLOWUP, DEVICE_FOLLOWUP_MS, None);
+                            let _ =
+                                PostMessageW(hwnd, WM_APP_REFRESH_WIRELESS, WPARAM(0), LPARAM(0));
+                        }
+                        TIMER_DEVICE_FOLLOWUP => {
+                            let _ = KillTimer(hwnd, TIMER_DEVICE_FOLLOWUP);
                             let _ =
                                 PostMessageW(hwnd, WM_APP_REFRESH_WIRELESS, WPARAM(0), LPARAM(0));
                         }
@@ -1262,6 +1296,11 @@ unsafe extern "system" fn host_wnd_proc(
                 }
                 TIMER_DEVICE_DEBOUNCE => {
                     let _ = KillTimer(hwnd, TIMER_DEVICE_DEBOUNCE);
+                    let _ = SetTimer(hwnd, TIMER_DEVICE_FOLLOWUP, DEVICE_FOLLOWUP_MS, None);
+                    app.wake_wireless_worker();
+                }
+                TIMER_DEVICE_FOLLOWUP => {
+                    let _ = KillTimer(hwnd, TIMER_DEVICE_FOLLOWUP);
                     app.wake_wireless_worker();
                 }
                 TIMER_SMOKE_TEST => {
@@ -1694,5 +1733,49 @@ mod tests {
         sig.wake();
         sig.stop();
         assert!(!sig.wait_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn pending_passive_telemetry_matches_only_awaiting_passive_devices() {
+        let now = Instant::now();
+        let make_dev =
+            |pct: Option<u8>, online: bool, note: Option<&str>| crate::state::WirelessDevice {
+                id: "hid:test".into(),
+                name: "Test".into(),
+                kind: crate::state::DeviceKind::Mouse,
+                transport: crate::state::Transport::Wireless24G,
+                battery_pct: pct,
+                charging: false,
+                sub_batteries: None,
+                online,
+                last_seen: now,
+                detail_note: note.map(str::to_string),
+            };
+
+        // SKN / generic no-battery receiver should NOT trigger fast retry.
+        assert!(!has_pending_passive_telemetry(&[make_dev(
+            None,
+            true,
+            Some("2.4G Receiver (interface present, battery unavailable)"),
+        )]));
+
+        // Rapoo with battery already resolved should NOT trigger fast retry.
+        assert!(!has_pending_passive_telemetry(&[make_dev(
+            Some(64),
+            true,
+            Some("Rapoo Gen2 (54L)"),
+        )]));
+
+        // Rapoo awaiting first passive telemetry frame SHOULD trigger fast retry.
+        assert!(has_pending_passive_telemetry(&[make_dev(
+            None,
+            true,
+            Some("Rapoo Gen2 (54L) (no telemetry frame yet)"),
+        )]));
+        assert!(has_pending_passive_telemetry(&[make_dev(
+            None,
+            true,
+            Some("Rapoo (awaiting telemetry frame)"),
+        )]));
     }
 }

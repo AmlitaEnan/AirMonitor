@@ -883,6 +883,7 @@ pub(crate) fn apply_menu_command(
                 }
                 ID_LAYOUT_SPLIT => {
                     cfg.layout_mode = LayoutMode::Split;
+                    cfg.ensure_split_anchors_distinct();
                     true
                 }
                 ID_LAYOUT_HARDWARE_ONLY => {
@@ -902,19 +903,19 @@ pub(crate) fn apply_menu_command(
                     true
                 }
                 ID_ANCHOR_HW_LEFT => {
-                    cfg.hardware_zone.anchor = AnchorEdge::Left;
+                    cfg.set_hardware_anchor(AnchorEdge::Left);
                     true
                 }
                 ID_ANCHOR_HW_RIGHT => {
-                    cfg.hardware_zone.anchor = AnchorEdge::Right;
+                    cfg.set_hardware_anchor(AnchorEdge::Right);
                     true
                 }
                 ID_ANCHOR_DEV_LEFT => {
-                    cfg.devices_zone.anchor = AnchorEdge::Left;
+                    cfg.set_devices_anchor(AnchorEdge::Left);
                     true
                 }
                 ID_ANCHOR_DEV_RIGHT => {
-                    cfg.devices_zone.anchor = AnchorEdge::Right;
+                    cfg.set_devices_anchor(AnchorEdge::Right);
                     true
                 }
                 id if id >= ID_METRIC_BASE

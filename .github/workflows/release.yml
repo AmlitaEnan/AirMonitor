@@ -49,10 +49,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/airmonitor.exe dist/airmonitor.exe
+          Copy-Item target/release/airmonitor.exe dist/AirMonitor.exe
           Copy-Item target/release/airmonitor-probe.exe dist/airmonitor-probe.exe
 
-          $files = @("airmonitor.exe", "airmonitor-probe.exe")
+          $files = @("AirMonitor.exe", "airmonitor-probe.exe")
           $lines = foreach ($f in $files) {
             $hash = (Get-FileHash (Join-Path dist $f) -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $f"
@@ -64,7 +64,7 @@ jobs:
             $utf8NoBom
           )
 
-          $mainSize = (Get-Item dist/airmonitor.exe).Length
+          $mainSize = (Get-Item dist/AirMonitor.exe).Length
           $probeSize = (Get-Item dist/airmonitor-probe.exe).Length
           $mainMb = [math]::Round($mainSize / 1MB, 2)
           $probeMb = [math]::Round($probeSize / 1MB, 2)
@@ -76,7 +76,7 @@ jobs:
             "Ultra-lightweight native Windows 10/11 taskbar hardware & wireless device battery monitor (Rust + Win32 + Direct2D, zero runtime/driver dependencies, static CRT)."
             ""
             "### Downloads"
-            "- **``airmonitor.exe``** (~$mainMb MB, $mainSize bytes) - Main taskbar & system tray application (portable, no installer required)."
+            "- **``AirMonitor.exe``** (~$mainMb MB, $mainSize bytes) - Main taskbar & system tray application (portable, no installer required)."
             "- **``airmonitor-probe.exe``** (~$probeMb MB, $probeSize bytes) - CLI hardware & wireless HID diagnostic tool."
             "- **``SHA256SUMS.txt``** - SHA-256 checksums for manual and in-app updater verification."
             ""
@@ -104,7 +104,7 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           gh release create $tag `
-            dist/airmonitor.exe `
+            dist/AirMonitor.exe `
             dist/airmonitor-probe.exe `
             dist/SHA256SUMS.txt `
             --title "AirMonitor $tag" `

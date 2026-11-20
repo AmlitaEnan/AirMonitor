@@ -215,9 +215,13 @@ impl BluetoothMonitor {
 
         // 2. Passive Apple AirPods BLE advertisements
         if let Ok(mut guard) = self.ble_state.lock() {
-            guard.airpods.retain(|_, v| {
-                now.saturating_duration_since(v.last_seen).as_secs() <= AIRPODS_STALE_SECS
-            });
+            if !radio_present {
+                guard.airpods.clear();
+            } else {
+                guard.airpods.retain(|_, v| {
+                    now.saturating_duration_since(v.last_seen).as_secs() <= AIRPODS_STALE_SECS
+                });
+            }
             for entry in guard.airpods.values() {
                 out.push(WirelessDevice {
                     id: entry.id.clone(),
@@ -683,13 +687,22 @@ where
     F: FnOnce() -> Vec<PnpBtRecord>,
 {
     if !radio_present {
-        if cache.is_empty() {
-            return Vec::new();
-        }
-        return reconcile_pnp_bt_devices(cache, Vec::new(), now);
+        // Bluetooth radio is off/absent: evict cached Bluetooth devices immediately
+        // instead of holding stale battery icons for multiple poll cycles.
+        cache.clear();
+        return Vec::new();
     }
-    let online_records = filter_online_bt_records(enumerate_fn());
-    reconcile_pnp_bt_devices(cache, online_records, now)
+    let all_records = enumerate_fn();
+    let mut online_records = Vec::new();
+    let mut explicitly_offline = HashSet::new();
+    for rec in all_records {
+        if is_bt_record_online(&rec) {
+            online_records.push(rec);
+        } else {
+            explicitly_offline.insert(rec.key);
+        }
+    }
+    reconcile_pnp_bt_devices(cache, online_records, &explicitly_offline, now)
 }
 
 fn merge_pnp_bt_nodes(nodes: Vec<RawPnpBtNode>) -> Vec<PnpBtRecord> {
@@ -753,22 +766,23 @@ fn merge_pnp_bt_nodes(nodes: Vec<RawPnpBtNode>) -> Vec<PnpBtRecord> {
     list
 }
 
+fn is_bt_record_online(rec: &PnpBtRecord) -> bool {
+    // If parent DEV_<MAC> node exists and says connected=false, treat entire MAC as offline.
+    if let Some(false) = rec.primary_connected {
+        return false;
+    }
+    rec.connected && rec.is_present
+}
+
+#[cfg(test)]
 fn filter_online_bt_records(records: Vec<PnpBtRecord>) -> Vec<PnpBtRecord> {
-    records
-        .into_iter()
-        .filter(|rec| {
-            // If parent DEV_<MAC> node exists and says connected=false, treat entire MAC as offline.
-            if let Some(false) = rec.primary_connected {
-                return false;
-            }
-            rec.connected && rec.is_present
-        })
-        .collect()
+    records.into_iter().filter(is_bt_record_online).collect()
 }
 
 fn reconcile_pnp_bt_devices(
     cache: &mut HashMap<String, CachedPnpBtEntry>,
     online_records: Vec<PnpBtRecord>,
+    explicitly_offline: &HashSet<String>,
     now: Instant,
 ) -> Vec<WirelessDevice> {
     let mut seen_keys = HashSet::with_capacity(online_records.len());
@@ -837,6 +851,12 @@ fn reconcile_pnp_bt_devices(
     let keys: Vec<String> = cache.keys().cloned().collect();
     for key in keys {
         if !seen_keys.contains(&key) {
+            if explicitly_offline.contains(&key) {
+                // Windows PnP explicitly reported this device as disconnected:
+                // remove immediately instead of debouncing across multiple poll cycles.
+                cache.remove(&key);
+                continue;
+            }
             let should_evict = match cache.get_mut(&key) {
                 Some(entry) => {
                     entry.miss_streak = entry.miss_streak.saturating_add(1);
@@ -1468,33 +1488,67 @@ mod tests {
             primary_connected: Some(true),
         };
 
-        let out0 = reconcile_pnp_bt_devices(&mut cache, vec![rec(Some(80))], t0);
+        let no_offline = HashSet::new();
+        let out0 = reconcile_pnp_bt_devices(&mut cache, vec![rec(Some(80))], &no_offline, t0);
         assert_eq!(out0.len(), 1);
         assert!(out0[0].online);
         assert_eq!(out0[0].battery_pct, Some(80));
 
         // Transient PnP battery property missing while still connected preserves 80%
         let t1 = t0 + Duration::from_secs(45);
-        let out1 = reconcile_pnp_bt_devices(&mut cache, vec![rec(None)], t1);
+        let out1 = reconcile_pnp_bt_devices(&mut cache, vec![rec(None)], &no_offline, t1);
         assert_eq!(out1.len(), 1);
         assert!(out1[0].online);
         assert_eq!(out1[0].battery_pct, Some(80));
 
-        // 1~2 transient PnP refresh drops keep device online
+        // 1~2 transient PnP refresh drops (node missing entirely) keep device online
         let t2 = t1 + Duration::from_secs(45);
-        let out2 = reconcile_pnp_bt_devices(&mut cache, vec![], t2);
+        let out2 = reconcile_pnp_bt_devices(&mut cache, vec![], &no_offline, t2);
         assert_eq!(out2.len(), 1);
         assert!(out2[0].online);
 
         let t3 = t2 + Duration::from_secs(45);
-        let out3 = reconcile_pnp_bt_devices(&mut cache, vec![], t3);
+        let out3 = reconcile_pnp_bt_devices(&mut cache, vec![], &no_offline, t3);
         assert_eq!(out3.len(), 1);
         assert!(out3[0].online);
 
         // 3rd consecutive miss -> genuinely disconnected, evicted cleanly
         let t4 = t3 + Duration::from_secs(45);
-        let out4 = reconcile_pnp_bt_devices(&mut cache, vec![], t4);
+        let out4 = reconcile_pnp_bt_devices(&mut cache, vec![], &no_offline, t4);
         assert!(out4.is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_pnp_bt_evicts_explicitly_disconnected_device_immediately() {
+        let mut cache = HashMap::new();
+        let t0 = Instant::now();
+        let online_rec = PnpBtRecord {
+            key: "bt:AABBCCDDEEFF".into(),
+            instance_id: r"BTHENUM\DEV_AABBCCDDEEFF".into(),
+            name: "Galaxy Buds Pro".into(),
+            battery_pct: Some(100),
+            battery_from_present: true,
+            connected: true,
+            is_present: true,
+            is_primary_node: true,
+            primary_connected: Some(true),
+        };
+        let offline_rec = PnpBtRecord {
+            connected: false,
+            is_present: false,
+            primary_connected: Some(false),
+            ..online_rec.clone()
+        };
+
+        let out0 = poll_pnp_bt_with_radio(&mut cache, true, t0, || vec![online_rec]);
+        assert_eq!(out0.len(), 1);
+        assert_eq!(out0[0].battery_pct, Some(100));
+
+        // As soon as Windows PnP reports connected=false, device is removed on the very first poll.
+        let t1 = t0 + Duration::from_secs(1);
+        let out1 = poll_pnp_bt_with_radio(&mut cache, true, t1, || vec![offline_rec]);
+        assert!(out1.is_empty());
+        assert!(cache.is_empty());
     }
 
     #[test]
@@ -1528,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn test_poll_pnp_bt_debounces_cached_devices_offline_when_radio_absent() {
+    fn test_poll_pnp_bt_evicts_cached_devices_immediately_when_radio_absent() {
         let mut cache = HashMap::new();
         let t0 = Instant::now();
         let sample_rec = || PnpBtRecord {
@@ -1547,25 +1601,12 @@ mod tests {
         assert_eq!(out0.len(), 1);
         assert_eq!(out0[0].battery_pct, Some(85));
 
-        // Radio disappears: SetupDi is skipped, cached device debounces smoothly offline
-        let t1 = t0 + Duration::from_secs(45);
+        // Radio disappears: SetupDi is skipped and cached Bluetooth devices are evicted immediately.
+        let t1 = t0 + Duration::from_secs(1);
         let out1 = poll_pnp_bt_with_radio(&mut cache, false, t1, || {
             panic!("should skip SetupDi enumeration when radio is absent")
         });
-        assert_eq!(out1.len(), 1);
-
-        let t2 = t1 + Duration::from_secs(45);
-        let out2 = poll_pnp_bt_with_radio(&mut cache, false, t2, || {
-            panic!("should skip SetupDi enumeration when radio is absent")
-        });
-        assert_eq!(out2.len(), 1);
-
-        // 3rd miss evicts cached entry cleanly
-        let t3 = t2 + Duration::from_secs(45);
-        let out3 = poll_pnp_bt_with_radio(&mut cache, false, t3, || {
-            panic!("should skip SetupDi enumeration when radio is absent")
-        });
-        assert!(out3.is_empty());
+        assert!(out1.is_empty());
         assert!(cache.is_empty());
     }
 }

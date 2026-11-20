@@ -16,7 +16,7 @@
 
 ## 核心特性
 
-- **极致轻量化**：纯 Rust 原生 Win32 + Direct2D（Software RT）/ DirectWrite 实现，无 WebView / Electron、无内核驱动、免管理员权限。默认静态链接 MSVC CRT（`+crt-static`，零 `VCRUNTIME140.dll` 运行库依赖）并内嵌应用图标、版本与 PerMonitorV2 Manifest 资源；实测 Release 单文件仅 **~1.19 MB**（`1,247,744` 字节），常驻内存 Working Set 约 **3–6 MB**，空闲 CPU 占用 **< 0.2%**。
+- **极致轻量化**：纯 Rust 原生 Win32 + Direct2D（Software RT）/ DirectWrite 实现，无 WebView / Electron、无内核驱动、免管理员权限。默认静态链接 MSVC CRT（`+crt-static`，零 `VCRUNTIME140.dll` 运行库依赖）并内嵌应用图标、版本与 PerMonitorV2 Manifest 资源；实测 Release 单文件仅 **~1.19 MB**（`1,250,304` 字节），常驻内存 Working Set 约 **1.4–6 MB**，空闲 CPU 占用 **< 0.2%**。
 - **按需硬件采集与紧凑双行监控**：
   - 默认 2 列布局：第 1 列网络上行/下行（`B/K/M/G` 自动切换、固定 5 字符右对齐等宽，消除数字跳动），第 2 列 `CPU` / `MEM` 占用率。
   - 支持全部 **18 项硬件指标**自由勾选与 2 行所见即所得拖拽排布：`CpuUsage`、`CpuFreq`、`CpuTemp`、`CpuPower`、`CpuFan`、`MemUsage`、`NetUp`、`NetDown`、`DiskRead`、`DiskWrite`、`DiskTemp`、`SysBattery`、`GpuUsage`、`GpuTemp`、`GpuHotspot`、`GpuPower`、`GpuVram`、`GpuFan`。
@@ -103,8 +103,8 @@ cargo build --release --bin airmonitor --bin airmonitor-probe
 
 - 打开浮窗 **「关于」** 标签页（或托盘右键 **「关于 / 检查更新」**）可手动向 [GitHub Releases](https://github.com/AmlitaEnan/AirMonitor/releases) 检查最新版本。
 - 更新流程通过系统 `winhttp.dll` 强制 HTTPS 传输，校验下载 URL 白名单与重定向、文件体积区间、x64 可执行 PE 头以及 `SHA256SUMS.txt` / `airmonitor.exe.sha256`（存在时强制使用 Windows CNG `bcrypt.dll` 计算比对），随后执行原子替换并支持启动失败自动回滚；若程序所在目录为只读（如 `Program Files`），将自动引导至浏览器手动下载。
-- **发布资产约定**：建议每次 Release 上传 `airmonitor.exe` 及对应的 `SHA256SUMS.txt`（或 `airmonitor.exe.sha256`）以启用完整哈希校验。
-- **SmartScreen 提示**：由于开源个人发行的二进制未购买商业 Authenticode 代码签名证书，首次运行从 GitHub 下载的 `airmonitor.exe` 时 Windows SmartScreen 可能会弹出未知发布者提示；您也可以按上方命令从源码自行编译。
+- **发布资产约定**：每次 GitHub Release 自动上传 `AirMonitor.exe`、`airmonitor-probe.exe` 及对应的 `SHA256SUMS.txt` 以启用完整哈希校验（应用内更新器大小写不敏感，兼容 `AirMonitor.exe` 与 `airmonitor.exe`）。
+- **SmartScreen 提示**：由于开源个人发行的二进制未购买商业 Authenticode 代码签名证书，首次运行从 GitHub 下载的 `AirMonitor.exe` 时 Windows SmartScreen 可能会弹出未知发布者提示；您也可以按上方命令从源码自行编译。
 
 ---
 

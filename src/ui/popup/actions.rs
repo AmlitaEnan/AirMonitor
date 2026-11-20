@@ -147,6 +147,7 @@ pub(crate) fn apply_popup_action(action: PopupAction, state: &SnapshotStore) -> 
             if let Some(o) = order {
                 cfg.combined_order = o;
             }
+            cfg.ensure_split_anchors_distinct();
             (true, None)
         }),
         PopupAction::SetAnchor {
@@ -157,9 +158,9 @@ pub(crate) fn apply_popup_action(action: PopupAction, state: &SnapshotStore) -> 
             if is_combined {
                 cfg.combined_zone.anchor = anchor;
             } else if is_devices {
-                cfg.devices_zone.anchor = anchor;
+                cfg.set_devices_anchor(anchor);
             } else {
-                cfg.hardware_zone.anchor = anchor;
+                cfg.set_hardware_anchor(anchor);
             }
             (true, None)
         }),
@@ -745,5 +746,51 @@ mod tests {
         // Once Downloading, neither check nor download can re-enter.
         assert!(!try_begin_update_check(&mut avail_with_url));
         assert!(try_begin_download_update(&mut avail_with_url).is_none());
+    }
+
+    #[test]
+    fn split_mode_anchor_actions_auto_swap_to_prevent_overlap() {
+        use crate::config::{AnchorEdge, LayoutMode};
+
+        crate::config::set_read_only_mode(true);
+        let mut cfg = AppConfig {
+            layout_mode: LayoutMode::HardwareOnly,
+            ..AppConfig::default()
+        };
+        cfg.hardware_zone.anchor = AnchorEdge::Right;
+        cfg.devices_zone.anchor = AnchorEdge::Right;
+        let store = SnapshotStore::new(cfg);
+
+        // Switching into Split mode separates same-side anchors automatically.
+        apply_popup_action(PopupAction::SetLayout(LayoutMode::Split, None), &store);
+        let snap = store.read_snapshot().unwrap();
+        assert_eq!(snap.config.hardware_zone.anchor, AnchorEdge::Right);
+        assert_eq!(snap.config.devices_zone.anchor, AnchorEdge::Left);
+
+        // Setting devices to Right swaps hardware to Left.
+        apply_popup_action(
+            PopupAction::SetAnchor {
+                is_devices: true,
+                is_combined: false,
+                anchor: AnchorEdge::Right,
+            },
+            &store,
+        );
+        let snap = store.read_snapshot().unwrap();
+        assert_eq!(snap.config.devices_zone.anchor, AnchorEdge::Right);
+        assert_eq!(snap.config.hardware_zone.anchor, AnchorEdge::Left);
+
+        // Setting hardware to Right swaps devices back to Left.
+        apply_popup_action(
+            PopupAction::SetAnchor {
+                is_devices: false,
+                is_combined: false,
+                anchor: AnchorEdge::Right,
+            },
+            &store,
+        );
+        let snap = store.read_snapshot().unwrap();
+        assert_eq!(snap.config.hardware_zone.anchor, AnchorEdge::Right);
+        assert_eq!(snap.config.devices_zone.anchor, AnchorEdge::Left);
     }
 }

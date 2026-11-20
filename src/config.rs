@@ -132,6 +132,15 @@ pub enum AnchorEdge {
     Right,
 }
 
+impl AnchorEdge {
+    pub fn opposite(self) -> Self {
+        match self {
+            AnchorEdge::Left => AnchorEdge::Right,
+            AnchorEdge::Right => AnchorEdge::Left,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ZoneLayout {
@@ -336,10 +345,39 @@ impl AppConfig {
         PathBuf::from("config.toml")
     }
 
+    /// In `Split` mode, hardware and wireless zones must stay on opposite edges
+    /// so they cannot overlap on the same side of the taskbar.
+    pub fn ensure_split_anchors_distinct(&mut self) {
+        if self.layout_mode == LayoutMode::Split
+            && self.hardware_zone.anchor == self.devices_zone.anchor
+        {
+            self.devices_zone.anchor = self.hardware_zone.anchor.opposite();
+        }
+    }
+
+    /// Sets the hardware zone anchor; in `Split` mode, automatically moves the
+    /// wireless zone to the opposite edge if they would collide on the same side.
+    pub fn set_hardware_anchor(&mut self, anchor: AnchorEdge) {
+        self.hardware_zone.anchor = anchor;
+        if self.layout_mode == LayoutMode::Split && self.devices_zone.anchor == anchor {
+            self.devices_zone.anchor = anchor.opposite();
+        }
+    }
+
+    /// Sets the wireless devices zone anchor; in `Split` mode, automatically moves
+    /// the hardware zone to the opposite edge if they would collide on the same side.
+    pub fn set_devices_anchor(&mut self, anchor: AnchorEdge) {
+        self.devices_zone.anchor = anchor;
+        if self.layout_mode == LayoutMode::Split && self.hardware_zone.anchor == anchor {
+            self.hardware_zone.anchor = anchor.opposite();
+        }
+    }
+
     /// Clamps numeric settings to safe bounds and removes duplicates/invalid entries.
     pub fn sanitize(&mut self) {
         // Fullscreen auto-hide is always active at runtime; keep field normalized.
         self.hide_on_fullscreen = true;
+        self.ensure_split_anchors_distinct();
         self.combined_zone.offset_x = self.combined_zone.offset_x.clamp(0, MAX_OFFSET_X);
         self.hardware_zone.offset_x = self.hardware_zone.offset_x.clamp(0, MAX_OFFSET_X);
         self.devices_zone.offset_x = self.devices_zone.offset_x.clamp(0, MAX_OFFSET_X);
@@ -837,5 +875,48 @@ hardware_items = ["cpu_temp", "cpu_power", "cpu_fan", "disk_read", "disk_write",
         assert_eq!(HwMetric::DiskWrite.display_name(), "磁盘写入");
         assert_eq!(HwMetric::DiskTemp.display_name(), "硬盘温度");
         assert_eq!(HwMetric::SysBattery.display_name(), "本机电池");
+    }
+
+    #[test]
+    fn split_mode_anchors_stay_on_opposite_edges() {
+        let mut cfg = AppConfig {
+            layout_mode: LayoutMode::Split,
+            hardware_zone: ZoneLayout {
+                anchor: AnchorEdge::Right,
+                offset_x: 12,
+                visible: true,
+            },
+            devices_zone: ZoneLayout {
+                anchor: AnchorEdge::Right,
+                offset_x: 8,
+                visible: true,
+            },
+            ..AppConfig::default()
+        };
+        cfg.sanitize();
+        assert_eq!(cfg.hardware_zone.anchor, AnchorEdge::Right);
+        assert_eq!(cfg.devices_zone.anchor, AnchorEdge::Left);
+
+        // Moving devices to Right swaps hardware to Left.
+        cfg.set_devices_anchor(AnchorEdge::Right);
+        assert_eq!(cfg.devices_zone.anchor, AnchorEdge::Right);
+        assert_eq!(cfg.hardware_zone.anchor, AnchorEdge::Left);
+
+        // Moving hardware to Right swaps devices to Left.
+        cfg.set_hardware_anchor(AnchorEdge::Right);
+        assert_eq!(cfg.hardware_zone.anchor, AnchorEdge::Right);
+        assert_eq!(cfg.devices_zone.anchor, AnchorEdge::Left);
+
+        // Single-zone modes allow independent anchor changes without touching the other zone.
+        cfg.layout_mode = LayoutMode::HardwareOnly;
+        cfg.set_hardware_anchor(AnchorEdge::Left);
+        assert_eq!(cfg.hardware_zone.anchor, AnchorEdge::Left);
+        assert_eq!(cfg.devices_zone.anchor, AnchorEdge::Left);
+
+        // Entering Split mode separates colliding anchors immediately.
+        cfg.layout_mode = LayoutMode::Split;
+        cfg.ensure_split_anchors_distinct();
+        assert_eq!(cfg.hardware_zone.anchor, AnchorEdge::Left);
+        assert_eq!(cfg.devices_zone.anchor, AnchorEdge::Right);
     }
 }

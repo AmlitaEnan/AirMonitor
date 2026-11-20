@@ -69,7 +69,7 @@ AirMonitor/
 - **零重型依赖**：严禁引入 WebView2、Electron、Qt、Tokio 等重型运行时或 UI 框架；UI 严格使用 Win32 + Direct2D / DirectWrite。
 - **软件渲染策略（P-1）**：任务栏浮条、详情浮窗与托盘图标统一使用 `D2D1_RENDER_TARGET_TYPE_SOFTWARE` 配合 `thread_local!` 共享 D2D/DWrite 工厂（退出前调用 `release_thread_local_d2d()` 释放 COM 句柄），避免加载 40+ MB 硬件 GPU UMD（如 `amdxx64.dll`）导致常驻内存膨胀。
 - **体积与资源预算**：
-  - `cargo build --release` 下 `airmonitor.exe` 单文件体积 **< 2 MB**（当前 ~1.19 MB / `1,247,744` 字节，已配置 `opt-level = "s"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`、`+crt-static` 及内置图标/版本/PerMonitorV2 Manifest）。
+  - `cargo build --release` 下 `airmonitor.exe` 单文件体积 **< 2 MB**（当前 ~1.19 MB / `1,250,304` 字节，已配置 `opt-level = "s"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`、`+crt-static` 及内置图标/版本/PerMonitorV2 Manifest）。
   - 常驻内存 Working Set 控制在 **≤ 15 MB** 区间（SOFTWARE RT 实测约 2.6–6 MB）。
   - 空闲 CPU 占用 **< 0.5%**（当前 < 0.2%）。
   - `--smoke-test` 预算自检：自动附加父控制台（`ATTACH_PARENT_PROCESS`）并开启配置只读模式（`set_read_only_mode(true)`）；若已有实例运行则以非零退出码失败；执行采样与渲染后校验 `WorkingSet <= 15.00 MB` 与 `IdleCpuPct <= 0.50%` 并报告 `GpuUmd`。

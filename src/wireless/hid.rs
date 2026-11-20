@@ -40,6 +40,8 @@ const HID_IOCTL_TIMEOUT_MS: u32 = 300;
 const HID_WAIT_SLICE_MS: u32 = 50;
 const HID_MAX_BACKOFF_SECS: u64 = 600;
 const HID_DEFAULT_POLL_BASE_SECS: u64 = 45;
+const HID_PASSIVE_INITIAL_RETRY_SECS: u64 = 4;
+const HID_PASSIVE_INITIAL_FAST_RETRIES: u32 = 2;
 
 // Win32 WDK CTL_CODE definitions for hidclass.sys (hidclass.h):
 // CTL_CODE(FILE_DEVICE_KEYBOARD=0x0B, Function, Method, FILE_ANY_ACCESS=0)
@@ -591,6 +593,7 @@ impl HidMonitor {
         let mut skipped_groups: HashSet<String> = HashSet::new();
         let mut group_had_success: HashMap<String, bool> = HashMap::new();
         let mut group_min_poll: HashMap<String, Option<u64>> = HashMap::new();
+        let mut passive_push_groups: HashSet<String> = HashSet::new();
 
         for cand in candidates {
             let PollCandidate {
@@ -630,6 +633,9 @@ impl HidMonitor {
             group_min_poll
                 .entry(group_key.clone())
                 .or_insert(min_poll_secs);
+            if meta.protocol == ProtocolFamily::Rapoo {
+                passive_push_groups.insert(group_key.clone());
+            }
 
             // Enforce per-device min_poll_secs / exponential backoff & overall poll budget
             // once per device group per round.
@@ -806,7 +812,9 @@ impl HidMonitor {
                 // only treat as sleeping/offline if it previously reported a battery reading
                 // and its cache has expired; otherwise the USB/2.4G interface is online without battery.
                 let online = !ever_had_battery;
-                let note = if online {
+                let note = if online && meta.protocol == ProtocolFamily::Rapoo {
+                    "Rapoo (awaiting telemetry frame)"
+                } else if online {
                     "2.4G Receiver (interface present, battery unavailable)"
                 } else {
                     "2.4G Receiver (standby / awaiting telemetry)"
@@ -835,10 +843,22 @@ impl HidMonitor {
         for group_key in probed_groups_this_round {
             let success = group_had_success.get(&group_key).copied().unwrap_or(false);
             let min_poll = group_min_poll.get(&group_key).copied().flatten();
+            let is_passive_push = passive_push_groups.contains(&group_key);
             let prev = self.poll_states.get(&group_key);
             let prev_streak = prev.map(|s| s.fail_streak).unwrap_or(0);
             let prev_ever = prev.map(|s| s.ever_had_battery).unwrap_or(false);
             let mut next_state = update_poll_state(now, success, prev_streak, min_poll);
+            if is_passive_push
+                && !success
+                && !prev_ever
+                && next_state.fail_streak <= HID_PASSIVE_INITIAL_FAST_RETRIES
+            {
+                // Passive-push devices (e.g. Rapoo Gen2 54L) emit periodic 0x07 frames
+                // every ~3-10s without active TX; allow 2 short passive buffer re-reads
+                // before falling back to normal 45s/90s exponential backoff.
+                next_state.next_probe_after =
+                    now + Duration::from_secs(HID_PASSIVE_INITIAL_RETRY_SECS);
+            }
             next_state.ever_had_battery = prev_ever || success;
             self.poll_states.insert(group_key, next_state);
         }
