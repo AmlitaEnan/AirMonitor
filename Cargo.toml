@@ -10,7 +10,7 @@ keywords = ["windows", "taskbar", "hardware-monitor", "battery", "direct2d"]
 categories = ["os::windows-apis", "hardware-support", "gui"]
 
 [[bin]]
-name = "airmonitor"
+name = "AirMonitor"
 path = "src/main.rs"
 
 [[bin]]

@@ -85,16 +85,16 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 
 # 2. 编译 Release 二进制（开启 size 优化 + LTO + strip）
-cargo build --release --bin airmonitor --bin airmonitor-probe
+cargo build --release --bin AirMonitor --bin airmonitor-probe
 
 # 3. 运行硬件与无线诊断探针（排查硬件数据源、设备 VID/PID 与原始 HID 报文）
 .\target\release\airmonitor-probe.exe
 
 # 4. 运行主程序（任务栏常驻 + 系统托盘）
-.\target\release\airmonitor.exe
+.\target\release\AirMonitor.exe
 
 # 5. 无头自检模式（打印内存占用、空闲 CPU、GPU UMD 与探测到的设备数量后退出）
-.\target\release\airmonitor.exe --smoke-test
+.\target\release\AirMonitor.exe --smoke-test
 ```
 
 ---
@@ -113,7 +113,7 @@ cargo build --release --bin airmonitor --bin airmonitor-probe
 ### 1. 运行时配置 `config.toml`
 
 首次运行会自动创建配置文件（原子写入并在解析损坏时自动保留 `.bak` 备份），查找优先级为：
-1. `airmonitor.exe` 同级目录下的 `config.toml`（绿色便携模式）
+1. `AirMonitor.exe` 同级目录下的 `config.toml`（绿色便携模式）
 2. `%APPDATA%\AirMonitor\config.toml`
 
 常用字段包括：

@@ -43,13 +43,13 @@ jobs:
 
       - name: Build release binaries
         shell: pwsh
-        run: cargo build --release --locked --bin airmonitor --bin airmonitor-probe
+        run: cargo build --release --locked --bin AirMonitor --bin airmonitor-probe
 
       - name: Stage artifacts and generate SHA256SUMS.txt
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/airmonitor.exe dist/AirMonitor.exe
+          Copy-Item target/release/AirMonitor.exe dist/AirMonitor.exe
           Copy-Item target/release/airmonitor-probe.exe dist/airmonitor-probe.exe
 
           $files = @("AirMonitor.exe", "airmonitor-probe.exe")

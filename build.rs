@@ -46,7 +46,7 @@ fn main() {
     let res_path = out_dir.join("airmonitor.res");
     fs::write(&res_path, res_bytes).expect("failed to write airmonitor.res");
 
-    println!("cargo:rustc-link-arg-bin=airmonitor={}", res_path.display());
+    println!("cargo:rustc-link-arg-bin=AirMonitor={}", res_path.display());
 
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg=/DEPENDENTLOADFLAG:0x800");
