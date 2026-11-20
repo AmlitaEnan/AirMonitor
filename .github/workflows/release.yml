@@ -73,19 +73,19 @@ jobs:
           $notesLines = @(
             "## AirMonitor ${{ github.ref_name }}"
             ""
-            "Ultra-lightweight native Windows 10/11 taskbar hardware & wireless device battery monitor (Rust + Win32 + Direct2D, zero runtime/driver dependencies, static CRT)."
+            "极致轻量化的 Windows 10 / Windows 11 原生任务栏硬件监控与无线外设电量监视器（Rust + Win32 + Direct2D，免驱动、免管理员权限、静态 CRT 零运行库依赖）。"
             ""
-            "### Downloads"
-            "- **``AirMonitor.exe``** (~$mainMb MB, $mainSize bytes) - Main taskbar & system tray application (portable, no installer required)."
-            "- **``airmonitor-probe.exe``** (~$probeMb MB, $probeSize bytes) - CLI hardware & wireless HID diagnostic tool."
-            "- **``SHA256SUMS.txt``** - SHA-256 checksums for manual and in-app updater verification."
+            "### 下载说明"
+            "- **``AirMonitor.exe``**（约 $mainMb MB，$mainSize 字节）— 主程序，绿色单文件即开即用，支持任务栏浮条与系统托盘（日常使用仅下载此文件即可）。"
+            "- **``airmonitor-probe.exe``**（约 $probeMb MB，$probeSize 字节）— 命令行硬件与无线 HID 诊断工具，用于排查设备数据源或适配新外设。"
+            "- **``SHA256SUMS.txt``** — SHA-256 校验文件，供手动校验及应用内自动更新验签使用。"
             ""
-            "### SHA-256 Checksums"
+            "### SHA-256 校验值"
             $shaTable
             ""
-            "### Notes"
-            "- Requires Windows 10 / Windows 11 (x64), runs without administrator privileges."
-            "- Because these binaries are not Authenticode-signed, Windows SmartScreen may show an unrecognized-publisher prompt on first launch; you can also verify the checksums or build directly from source."
+            "### 使用提示"
+            "- 运行环境：Windows 10 / Windows 11（64 位），无需管理员权限。"
+            "- 由于个人开源发行的二进制未购买商业代码签名证书，首次运行从 GitHub 下载的 ``AirMonitor.exe`` 时，Windows SmartScreen 可能会弹出「未知发布者」提示，点「更多信息 → 仍要运行」即可；您也可以核对上方 SHA-256 校验值或直接从源码自行编译。"
           )
           $notes = ($notesLines -join "`n") + "`n"
 
