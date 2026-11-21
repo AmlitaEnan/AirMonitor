@@ -60,15 +60,37 @@ pub fn metric_col_width(metric: HwMetric) -> f32 {
 
 pub fn format_hw_metric(metric: HwMetric, hw: &HardwareMetrics) -> (&'static str, String) {
     match metric {
-        HwMetric::NetUp => ("↑", format_speed(hw.net_up_bps)),
-        HwMetric::NetDown => ("↓", format_speed(hw.net_down_bps)),
+        HwMetric::NetUp => (
+            "↑",
+            if hw.net_valid {
+                format_speed(hw.net_up_bps)
+            } else {
+                "  N/A".to_string()
+            },
+        ),
+        HwMetric::NetDown => (
+            "↓",
+            if hw.net_valid {
+                format_speed(hw.net_down_bps)
+            } else {
+                "  N/A".to_string()
+            },
+        ),
         HwMetric::CpuUsage => (
             "CPU",
-            format!("{:>3.0}%", hw.cpu_usage_pct.clamp(0.0, 999.0)),
+            if hw.cpu_usage_valid && hw.cpu_usage_pct.is_finite() {
+                format!("{:>3.0}%", hw.cpu_usage_pct.clamp(0.0, 999.0))
+            } else {
+                " N/A".to_string()
+            },
         ),
         HwMetric::MemUsage => (
             "MEM",
-            format!("{:>3.0}%", hw.mem_usage_pct.clamp(0.0, 999.0)),
+            if hw.mem_valid && hw.mem_usage_pct.is_finite() {
+                format!("{:>3.0}%", hw.mem_usage_pct.clamp(0.0, 999.0))
+            } else {
+                " N/A".to_string()
+            },
         ),
         HwMetric::CpuFreq => (
             "FRQ",
@@ -194,6 +216,9 @@ fn format_fan_rpm(rpm: Option<u32>) -> String {
 }
 
 pub fn visible_hardware_items(snapshot: &MonitorSnapshot) -> Vec<HwMetric> {
+    if !snapshot.config.hardware_enabled {
+        return Vec::new();
+    }
     if snapshot.config.hide_unavailable_metrics {
         snapshot
             .config
@@ -208,6 +233,9 @@ pub fn visible_hardware_items(snapshot: &MonitorSnapshot) -> Vec<HwMetric> {
 }
 
 pub fn active_wireless_devices(snapshot: &MonitorSnapshot) -> Vec<&WirelessDevice> {
+    if !snapshot.config.wireless_enabled {
+        return Vec::new();
+    }
     snapshot
         .devices
         .iter()
@@ -246,11 +274,7 @@ pub fn compute_devices_logical_width(device_count: usize) -> f32 {
     ZONE_PAD_X * 2.0 + cols + gaps
 }
 
-pub fn compute_logical_width(snapshot: &MonitorSnapshot, content: RenderContent) -> f32 {
-    let hw_items = visible_hardware_items(snapshot);
-    let hw_w = compute_hw_logical_width(&hw_items);
-    let dev_count = active_wireless_devices(snapshot).len();
-    let dev_w = compute_devices_logical_width(dev_count);
+fn combine_zone_widths(hw_w: f32, dev_w: f32, content: RenderContent) -> f32 {
     match content {
         RenderContent::HardwareOnly => hw_w,
         RenderContent::DevicesOnly => dev_w,
@@ -262,6 +286,97 @@ pub fn compute_logical_width(snapshot: &MonitorSnapshot, content: RenderContent)
             }
         }
     }
+}
+
+fn drop_last_hw_column(hw_items: &mut Vec<HwMetric>) {
+    if hw_items.is_empty() {
+        return;
+    }
+    let rem = hw_items.len() % 2;
+    let drop_n = if rem == 0 { 2 } else { rem };
+    hw_items.truncate(hw_items.len().saturating_sub(drop_n));
+}
+
+/// Trims trailing hardware/device columns in priority order so the rendered bar
+/// stays strictly within `max_logical_w`.
+pub fn fit_content_to_width(
+    snapshot: &MonitorSnapshot,
+    content: RenderContent,
+    max_logical_w: f32,
+) -> (Vec<HwMetric>, usize, f32) {
+    if max_logical_w <= 0.0 || !max_logical_w.is_finite() {
+        return (Vec::new(), 0, 0.0);
+    }
+
+    let mut hw_items = if content == RenderContent::DevicesOnly {
+        Vec::new()
+    } else {
+        visible_hardware_items(snapshot)
+    };
+    let mut dev_count = if content == RenderContent::HardwareOnly {
+        0
+    } else {
+        active_wireless_devices(snapshot).len()
+    };
+
+    loop {
+        let hw_w = if content == RenderContent::DevicesOnly {
+            0.0
+        } else {
+            compute_hw_logical_width(&hw_items)
+        };
+        let dev_w = if content == RenderContent::HardwareOnly {
+            0.0
+        } else {
+            compute_devices_logical_width(dev_count)
+        };
+        let total_w = combine_zone_widths(hw_w, dev_w, content);
+        if total_w <= max_logical_w + 0.01 {
+            return (hw_items, dev_count, total_w);
+        }
+
+        let hw_cols = hw_items.len().div_ceil(2);
+        if hw_cols == 0 && dev_count == 0 {
+            return (Vec::new(), 0, 0.0);
+        }
+
+        match content {
+            RenderContent::HardwareOnly => drop_last_hw_column(&mut hw_items),
+            RenderContent::DevicesOnly => {
+                dev_count = dev_count.saturating_sub(1);
+            }
+            RenderContent::Combined => {
+                if hw_cols > 1 && dev_count > 1 {
+                    if dev_w >= hw_w {
+                        dev_count -= 1;
+                    } else {
+                        drop_last_hw_column(&mut hw_items);
+                    }
+                } else if dev_count > 1 {
+                    dev_count -= 1;
+                } else if hw_cols > 1 {
+                    drop_last_hw_column(&mut hw_items);
+                } else if hw_cols == 1 && dev_count == 1 {
+                    match snapshot.config.combined_order {
+                        CombinedOrder::DevicesFirst => drop_last_hw_column(&mut hw_items),
+                        CombinedOrder::HardwareFirst => dev_count = 0,
+                    }
+                } else if dev_count > 0 {
+                    dev_count = 0;
+                } else {
+                    drop_last_hw_column(&mut hw_items);
+                }
+            }
+        }
+    }
+}
+
+pub fn compute_logical_width(snapshot: &MonitorSnapshot, content: RenderContent) -> f32 {
+    let hw_items = visible_hardware_items(snapshot);
+    let hw_w = compute_hw_logical_width(&hw_items);
+    let dev_count = active_wireless_devices(snapshot).len();
+    let dev_w = compute_devices_logical_width(dev_count);
+    combine_zone_widths(hw_w, dev_w, content)
 }
 
 struct DibSurface {
@@ -633,8 +748,9 @@ impl TaskbarRenderer {
             base_rt.FillRoundedRectangle(&pill, brush);
         }
 
-        let devices = active_wireless_devices(snapshot);
-        let hw_items = visible_hardware_items(snapshot);
+        let all_devices = active_wireless_devices(snapshot);
+        let (hw_items, dev_count, _) = fit_content_to_width(snapshot, content, logical_w);
+        let devices = &all_devices[..dev_count.min(all_devices.len())];
         let hw_w = compute_hw_logical_width(&hw_items);
         let dev_w = compute_devices_logical_width(devices.len());
 
@@ -651,7 +767,7 @@ impl TaskbarRenderer {
                     self.draw_devices_zone(
                         base_rt,
                         brush,
-                        &devices,
+                        devices,
                         snapshot.config.low_battery_threshold,
                         &palette,
                         0.0,
@@ -679,7 +795,7 @@ impl TaskbarRenderer {
                             self.draw_devices_zone(
                                 base_rt,
                                 brush,
-                                &devices,
+                                devices,
                                 snapshot.config.low_battery_threshold,
                                 &palette,
                                 x,
@@ -693,7 +809,7 @@ impl TaskbarRenderer {
                             self.draw_devices_zone(
                                 base_rt,
                                 brush,
-                                &devices,
+                                devices,
                                 snapshot.config.low_battery_threshold,
                                 &palette,
                                 x,
@@ -1447,5 +1563,79 @@ mod tests {
         assert_eq!(active_wireless_devices(&snap).len(), 1);
         assert!(compute_logical_width(&snap, RenderContent::DevicesOnly) > 0.0);
         assert!(compute_logical_width(&snap, RenderContent::Combined) > hw_w);
+    }
+
+    #[test]
+    fn unavailable_validity_flags_render_na_and_respect_hide_unavailable() {
+        let mut snap = MonitorSnapshot::new(AppConfig::default());
+        snap.hw = HardwareMetrics::unavailable();
+
+        assert_eq!(
+            format_hw_metric(HwMetric::CpuUsage, &snap.hw).1.trim(),
+            "N/A"
+        );
+        assert_eq!(
+            format_hw_metric(HwMetric::MemUsage, &snap.hw).1.trim(),
+            "N/A"
+        );
+        assert_eq!(format_hw_metric(HwMetric::NetUp, &snap.hw).1.trim(), "N/A");
+        assert_eq!(
+            format_hw_metric(HwMetric::NetDown, &snap.hw).1.trim(),
+            "N/A"
+        );
+
+        snap.config.hide_unavailable_metrics = false;
+        assert_eq!(visible_hardware_items(&snap).len(), 4);
+
+        snap.config.hide_unavailable_metrics = true;
+        assert!(visible_hardware_items(&snap).is_empty());
+    }
+
+    #[test]
+    fn fit_content_to_width_trims_overflow_columns_gracefully() {
+        let mut snap = MonitorSnapshot::new(AppConfig::default());
+        snap.config.hardware_items = vec![
+            HwMetric::NetUp,
+            HwMetric::NetDown,
+            HwMetric::CpuUsage,
+            HwMetric::MemUsage,
+            HwMetric::GpuUsage,
+            HwMetric::GpuTemp,
+        ];
+        for i in 0..5 {
+            snap.devices.push(WirelessDevice {
+                id: format!("dev{i}"),
+                name: format!("Dev{i}"),
+                kind: DeviceKind::Mouse,
+                transport: Transport::Wireless24G,
+                battery_pct: Some(80),
+                charging: false,
+                sub_batteries: None,
+                online: true,
+                last_seen: Instant::now(),
+                detail_note: None,
+            });
+        }
+
+        let full_w = compute_logical_width(&snap, RenderContent::Combined);
+        assert!(full_w > 300.0);
+
+        // Narrow budget trims columns so fitted width never exceeds budget.
+        let (hw, dev_n, fitted_w) = fit_content_to_width(&snap, RenderContent::Combined, 220.0);
+        assert!(fitted_w <= 220.01);
+        assert!(!hw.is_empty());
+        assert!((1..5).contains(&dev_n));
+
+        // Tiny budget below a single column yields empty cleanly.
+        let (hw0, dev0, w0) = fit_content_to_width(&snap, RenderContent::Combined, 10.0);
+        assert!(hw0.is_empty());
+        assert_eq!(dev0, 0);
+        assert_eq!(w0, 0.0);
+
+        // Disabled zones yield empty regardless of budget.
+        snap.config.hardware_enabled = false;
+        snap.config.wireless_enabled = false;
+        assert!(visible_hardware_items(&snap).is_empty());
+        assert!(active_wireless_devices(&snap).is_empty());
     }
 }

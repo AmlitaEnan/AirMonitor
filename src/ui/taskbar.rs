@@ -21,16 +21,58 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config::{AnchorEdge, LayoutMode, ZoneLayout};
 use crate::state::MonitorSnapshot;
 use crate::ui::renderer::{
-    compute_logical_width, read_taskbar_theme, RenderContent, TaskbarRenderer, TaskbarTheme,
-    WindowSurface,
+    compute_logical_width, fit_content_to_width, read_taskbar_theme, RenderContent,
+    TaskbarRenderer, TaskbarTheme, WindowSurface,
 };
 use crate::ui::VersionedSnapshot;
+
+pub const MAX_BAR_DIB_WIDTH_PX: i32 = 2048;
+const SPLIT_MIN_GAP_LOGICAL: f32 = 4.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarWindowOp {
+    ShowNoActivate(HWND),
+    Hide(HWND),
+    RaiseTop { hwnd: HWND, frame_changed: bool },
+}
+
+pub(crate) fn execute_bar_window_ops(ops: &[BarWindowOp]) {
+    unsafe {
+        for &op in ops {
+            match op {
+                BarWindowOp::ShowNoActivate(hwnd) => {
+                    if !hwnd.0.is_null() {
+                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    }
+                }
+                BarWindowOp::Hide(hwnd) => {
+                    if !hwnd.0.is_null() && IsWindowVisible(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
+                BarWindowOp::RaiseTop {
+                    hwnd,
+                    frame_changed,
+                } => {
+                    if !hwnd.0.is_null() {
+                        let mut flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+                        if frame_changed {
+                            flags |= SWP_FRAMECHANGED;
+                        }
+                        let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags);
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TaskbarGeometry {
     pub taskbar_hwnd: HWND,
     pub taskbar_rect: RECT,
     pub tray_rect: Option<RECT>,
+    pub start_rect: Option<RECT>,
     pub dpi: u32,
     pub taskbar_hidden: bool,
 }
@@ -75,6 +117,26 @@ pub fn find_taskbar_geometry() -> Option<TaskbarGeometry> {
                 }
             });
 
+        let start_rect = FindWindowExW(taskbar_hwnd, HWND::default(), w!("Start"), None)
+            .ok()
+            .and_then(|start_hwnd| {
+                if start_hwnd.0.is_null() || !IsWindowVisible(start_hwnd).as_bool() {
+                    return None;
+                }
+                let mut r = RECT::default();
+                let tb_w = taskbar_rect.right - taskbar_rect.left;
+                if GetWindowRect(start_hwnd, &mut r).is_ok()
+                    && r.right > r.left
+                    && r.bottom > r.top
+                    && r.left <= taskbar_rect.left + 16
+                    && r.right <= taskbar_rect.left + (tb_w / 3)
+                {
+                    Some(r)
+                } else {
+                    None
+                }
+            });
+
         let raw_dpi = GetDpiForWindow(taskbar_hwnd);
         let dpi = if raw_dpi == 0 { 96 } else { raw_dpi };
 
@@ -82,6 +144,7 @@ pub fn find_taskbar_geometry() -> Option<TaskbarGeometry> {
             taskbar_hwnd,
             taskbar_rect,
             tray_rect,
+            start_rect,
             dpi,
             taskbar_hidden,
         })
@@ -180,31 +243,48 @@ pub fn is_fullscreen_active(geom: &TaskbarGeometry, own_hwnds: &[HWND]) -> bool 
     }
 }
 
+/// Returns the safe horizontal interval `[safe_left, safe_right]` on the taskbar
+/// excluding the Start button on the left and `TrayNotifyWnd` on the right.
+pub fn safe_horizontal_interval(geom: &TaskbarGeometry) -> (i32, i32) {
+    let tb_w = (geom.taskbar_rect.right - geom.taskbar_rect.left).max(0);
+    let safe_left = geom
+        .start_rect
+        .filter(|sr| {
+            sr.right > geom.taskbar_rect.left
+                && sr.right < geom.taskbar_rect.right
+                && (sr.right - geom.taskbar_rect.left) <= tb_w / 3
+        })
+        .map(|sr| sr.right)
+        .unwrap_or(geom.taskbar_rect.left);
+    let safe_right = geom
+        .tray_rect
+        .filter(|tr| tr.left > safe_left && tr.left <= geom.taskbar_rect.right)
+        .map(|tr| tr.left)
+        .unwrap_or(geom.taskbar_rect.right);
+    (safe_left, safe_right.max(safe_left))
+}
+
 pub fn compute_zone_rect(
     geom: &TaskbarGeometry,
     zone: &ZoneLayout,
     logical_w: f32,
 ) -> (i32, i32, i32, i32) {
     let scale = geom.dpi.max(96) as f32 / 96.0;
-    let width_px = (logical_w * scale).ceil().max(1.0) as i32;
+    let (safe_left, safe_right) = safe_horizontal_interval(geom);
+    let avail_w = (safe_right - safe_left).max(0);
+    let desired_px = (logical_w * scale).ceil().max(1.0) as i32;
+    let width_px = desired_px.min(avail_w.max(1)).min(MAX_BAR_DIB_WIDTH_PX);
     let tb_h = (geom.taskbar_rect.bottom - geom.taskbar_rect.top).max(24);
     let y = geom.taskbar_rect.top;
     let offset_px = (zone.offset_x.max(0) as f32 * scale).round() as i32;
 
     let raw_x = match zone.anchor {
-        AnchorEdge::Left => geom.taskbar_rect.left + offset_px,
-        AnchorEdge::Right => {
-            let right_anchor = geom
-                .tray_rect
-                .filter(|tr| tr.left > geom.taskbar_rect.left)
-                .map(|tr| tr.left)
-                .unwrap_or(geom.taskbar_rect.right);
-            right_anchor - offset_px - width_px
-        }
+        AnchorEdge::Left => safe_left + offset_px,
+        AnchorEdge::Right => safe_right - offset_px - width_px,
     };
 
-    let min_x = geom.taskbar_rect.left;
-    let max_x = (geom.taskbar_rect.right - width_px).max(min_x);
+    let min_x = safe_left;
+    let max_x = (safe_right - width_px).max(min_x);
     let x = raw_x.clamp(min_x, max_x);
     (x, y, width_px, tb_h)
 }
@@ -216,6 +296,7 @@ struct BarRenderKey {
     dpi: u32,
     tb_rect: RECT,
     tray_rect: Option<RECT>,
+    start_rect: Option<RECT>,
     global_hide: bool,
     hovered: bool,
     config_rev: u64,
@@ -237,6 +318,7 @@ impl BarRenderKey {
             dpi: geom.dpi,
             tb_rect: geom.taskbar_rect,
             tray_rect: geom.tray_rect,
+            start_rect: geom.start_rect,
             global_hide,
             hovered,
             config_rev: vs.config_rev,
@@ -259,6 +341,7 @@ impl BarRenderKey {
             dpi: geom.dpi,
             tb_rect: geom.taskbar_rect,
             tray_rect: geom.tray_rect,
+            start_rect: geom.start_rect,
             global_hide,
             hovered,
             config_rev: vs.config_rev,
@@ -281,6 +364,7 @@ impl BarRenderKey {
             dpi: geom.dpi,
             tb_rect: geom.taskbar_rect,
             tray_rect: geom.tray_rect,
+            start_rect: geom.start_rect,
             global_hide,
             hovered,
             config_rev: vs.config_rev,
@@ -298,6 +382,7 @@ fn same_layout_geom(a: &TaskbarGeometry, b: &TaskbarGeometry) -> bool {
     a.taskbar_hwnd == b.taskbar_hwnd
         && a.taskbar_rect == b.taskbar_rect
         && a.tray_rect == b.tray_rect
+        && a.start_rect == b.start_rect
         && a.dpi == b.dpi
         && a.taskbar_hidden == b.taskbar_hidden
 }
@@ -425,14 +510,18 @@ pub struct TaskbarManager {
     pub renderer: TaskbarRenderer,
     pub theme: TaskbarTheme,
     pub drag: Option<DragState>,
+    pub(crate) bar_commits: u64,
     geom_stabilizer: GeometryStabilizer,
     last_fullscreen: bool,
     last_global_hide: Option<bool>,
     last_tb_rect: Option<RECT>,
     last_tray_rect: Option<RECT>,
+    last_start_rect: Option<RECT>,
     last_dpi: u32,
     last_primary_key: Option<BarRenderKey>,
     last_secondary_key: Option<BarRenderKey>,
+    last_primary_rect: Option<(i32, i32, i32, i32)>,
+    last_secondary_rect: Option<(i32, i32, i32, i32)>,
 }
 
 impl TaskbarManager {
@@ -447,14 +536,18 @@ impl TaskbarManager {
             renderer: TaskbarRenderer::new()?,
             theme: read_taskbar_theme(),
             drag: None,
+            bar_commits: 0,
             geom_stabilizer: GeometryStabilizer::default(),
             last_fullscreen: false,
             last_global_hide: None,
             last_tb_rect: None,
             last_tray_rect: None,
+            last_start_rect: None,
             last_dpi: 0,
             last_primary_key: None,
             last_secondary_key: None,
+            last_primary_rect: None,
+            last_secondary_rect: None,
         })
     }
 
@@ -485,9 +578,11 @@ impl TaskbarManager {
 
     pub fn bar_diagnostic_summary(&self) -> String {
         unsafe {
-            let tb = find_taskbar_geometry();
-            let parent_match = match (&tb, GetParent(self.primary_hwnd)) {
-                (Some(g), Ok(p)) => p == g.taskbar_hwnd,
+            let Some(g) = find_taskbar_geometry() else {
+                return "BarCommits=headless_skip | ChildAttached=headless_skip | BarVisible=headless_skip | InTaskbarRect=headless_skip".to_string();
+            };
+            let parent_match = match GetParent(self.primary_hwnd) {
+                Ok(p) => p == g.taskbar_hwnd,
                 _ => false,
             };
             let vis =
@@ -495,33 +590,37 @@ impl TaskbarManager {
             let mut bar_rect = RECT::default();
             let has_rect = !self.primary_hwnd.0.is_null()
                 && GetWindowRect(self.primary_hwnd, &mut bar_rect).is_ok();
-            let inside_tb = match (&tb, has_rect) {
-                (Some(g), true) => {
-                    bar_rect.left >= g.taskbar_rect.left
-                        && bar_rect.right <= g.taskbar_rect.right
-                        && bar_rect.top >= g.taskbar_rect.top
-                        && bar_rect.bottom <= g.taskbar_rect.bottom
-                }
-                _ => false,
+            let inside_tb = if has_rect {
+                bar_rect.left >= g.taskbar_rect.left
+                    && bar_rect.right <= g.taskbar_rect.right
+                    && bar_rect.top >= g.taskbar_rect.top
+                    && bar_rect.bottom <= g.taskbar_rect.bottom
+            } else {
+                false
             };
             format!(
-                "ChildAttached={} | BarVisible={} | InTaskbarRect={}",
-                parent_match, vis, inside_tb
+                "BarCommits={} | ChildAttached={} | BarVisible={} | InTaskbarRect={}",
+                self.bar_commits, parent_match, vis, inside_tb
             )
         }
     }
 
     /// Lightweight periodic watchdog: stabilizes taskbar geometry against transient
-    /// Win11 layout/fullscreen-exit frames, avoids redundant Direct2D redraws, and keeps
-    /// child bars above Win11's XAML DesktopWindowContentBridge inside `Shell_TrayWnd`.
-    pub(crate) fn check_tick(&mut self, vs: &VersionedSnapshot, host_hwnd: HWND) {
+    /// Win11 layout/fullscreen-exit frames, avoids redundant Direct2D redraws, and returns
+    /// deferred `ShowWindow`/`SetWindowPos` operations to execute after releasing `UiApp`.
+    pub(crate) fn check_tick(
+        &mut self,
+        vs: &VersionedSnapshot,
+        host_hwnd: HWND,
+    ) -> Vec<BarWindowOp> {
+        let mut ops = Vec::new();
         let Some(raw_geom) = find_taskbar_geometry() else {
             self.geom_stabilizer.reset();
             self.last_fullscreen = false;
             if self.last_global_hide != Some(true) {
-                self.hide_all_bars();
+                self.hide_all_bars_into(&mut ops);
             }
-            return;
+            return ops;
         };
 
         let own_hwnds = [host_hwnd, self.primary_hwnd, self.secondary_hwnd];
@@ -532,12 +631,19 @@ impl TaskbarManager {
         // Child bars inside Shell_TrayWnd are naturally occluded by fullscreen windows
         // in DWM/Win32 Z-order; hiding them with SW_HIDE during fullscreen would cause
         // a 0..500 ms pop-in flash on fullscreen exit.
-        let global_hide = geom.taskbar_hidden || is_vertical_taskbar(&geom.taskbar_rect);
+        let effective_mode = vs.snapshot.config.effective_layout_mode();
+        let global_hide = geom.taskbar_hidden
+            || is_vertical_taskbar(&geom.taskbar_rect)
+            || effective_mode.is_none();
 
-        let is_split = vs.snapshot.config.layout_mode == LayoutMode::Split;
-        let parent_changed = unsafe {
-            GetParent(self.primary_hwnd).ok() != Some(geom.taskbar_hwnd)
-                || (is_split && GetParent(self.secondary_hwnd).ok() != Some(geom.taskbar_hwnd))
+        let is_split = effective_mode == Some(LayoutMode::Split);
+        let parent_changed = if global_hide {
+            false
+        } else {
+            unsafe {
+                GetParent(self.primary_hwnd).ok() != Some(geom.taskbar_hwnd)
+                    || (is_split && GetParent(self.secondary_hwnd).ok() != Some(geom.taskbar_hwnd))
+            }
         };
 
         if parent_changed {
@@ -550,30 +656,37 @@ impl TaskbarManager {
             || self.last_global_hide != Some(global_hide)
             || self.last_tb_rect != Some(geom.taskbar_rect)
             || self.last_tray_rect != geom.tray_rect
+            || self.last_start_rect != geom.start_rect
             || self.last_dpi != geom.dpi
-            || self.last_primary_key.is_none()
-            || (is_split && self.last_secondary_key.is_none());
+            || (!global_hide && self.last_primary_key.is_none())
+            || (!global_hide && is_split && self.last_secondary_key.is_none());
 
         if changed {
-            self.apply_bars_with_geom_inner(vs, &geom, global_hide, fullscreen);
+            return self.apply_bars_with_geom_inner(vs, &geom, global_hide, fullscreen);
         } else if !global_hide && !fullscreen {
             unsafe {
                 if IsWindowVisible(self.primary_hwnd).as_bool() {
-                    ensure_child_top_order(self.primary_hwnd, self.secondary_hwnd);
+                    ensure_child_top_order(self.primary_hwnd, self.secondary_hwnd, &mut ops);
                 }
                 if is_split && IsWindowVisible(self.secondary_hwnd).as_bool() {
-                    ensure_child_top_order(self.secondary_hwnd, self.primary_hwnd);
+                    ensure_child_top_order(self.secondary_hwnd, self.primary_hwnd, &mut ops);
                 }
             }
         }
+        ops
     }
 
-    pub(crate) fn update_bars(&mut self, vs: &VersionedSnapshot, host_hwnd: HWND) {
+    pub(crate) fn update_bars(
+        &mut self,
+        vs: &VersionedSnapshot,
+        host_hwnd: HWND,
+    ) -> Vec<BarWindowOp> {
+        let mut ops = Vec::new();
         let Some(raw_geom) = find_taskbar_geometry() else {
             self.geom_stabilizer.reset();
             self.last_fullscreen = false;
-            self.hide_all_bars();
-            return;
+            self.hide_all_bars_into(&mut ops);
+            return ops;
         };
 
         let own_hwnds = [host_hwnd, self.primary_hwnd, self.secondary_hwnd];
@@ -581,28 +694,34 @@ impl TaskbarManager {
         let geom = self
             .geom_stabilizer
             .resolve(Instant::now(), raw_geom, fullscreen);
-        let global_hide = geom.taskbar_hidden || is_vertical_taskbar(&geom.taskbar_rect);
-        self.apply_bars_with_geom_inner(vs, &geom, global_hide, fullscreen);
+        let global_hide = geom.taskbar_hidden
+            || is_vertical_taskbar(&geom.taskbar_rect)
+            || vs.snapshot.config.effective_layout_mode().is_none();
+        self.apply_bars_with_geom_inner(vs, &geom, global_hide, fullscreen)
     }
 
-    fn hide_all_bars(&mut self) {
+    fn hide_all_bars_into(&mut self, ops: &mut Vec<BarWindowOp>) {
         self.last_global_hide = Some(true);
         self.last_primary_key = None;
         self.last_secondary_key = None;
-        hide_window(self.primary_hwnd);
-        hide_window(self.secondary_hwnd);
+        self.last_primary_rect = None;
+        self.last_secondary_rect = None;
+        collect_hide_window(self.primary_hwnd, ops);
+        collect_hide_window(self.secondary_hwnd, ops);
         self.primary_surface.clear();
         self.secondary_surface.clear();
     }
 
-    fn hide_secondary_bar(&mut self) {
+    fn hide_secondary_bar_into(&mut self, ops: &mut Vec<BarWindowOp>) {
         if self.last_secondary_key.is_some()
+            || self.last_secondary_rect.is_some()
             || unsafe { IsWindowVisible(self.secondary_hwnd).as_bool() }
         {
-            hide_window(self.secondary_hwnd);
+            collect_hide_window(self.secondary_hwnd, ops);
             self.secondary_surface.clear();
         }
         self.last_secondary_key = None;
+        self.last_secondary_rect = None;
     }
 
     #[cfg(test)]
@@ -612,7 +731,8 @@ impl TaskbarManager {
         geom: &TaskbarGeometry,
         global_hide: bool,
     ) {
-        self.apply_bars_with_geom_inner(vs, geom, global_hide, false);
+        let ops = self.apply_bars_with_geom_inner(vs, geom, global_hide, false);
+        execute_bar_window_ops(&ops);
     }
 
     fn apply_bars_with_geom_inner(
@@ -621,13 +741,23 @@ impl TaskbarManager {
         geom: &TaskbarGeometry,
         global_hide: bool,
         fullscreen: bool,
-    ) {
+    ) -> Vec<BarWindowOp> {
+        let mut ops = Vec::new();
         let snapshot = &vs.snapshot;
-        let layout_mode = snapshot.config.layout_mode;
+        let Some(layout_mode) = snapshot.config.effective_layout_mode() else {
+            self.last_fullscreen = fullscreen;
+            self.last_tb_rect = Some(geom.taskbar_rect);
+            self.last_tray_rect = geom.tray_rect;
+            self.last_start_rect = geom.start_rect;
+            self.last_dpi = geom.dpi;
+            self.hide_all_bars_into(&mut ops);
+            return ops;
+        };
 
-        let primary_attached = ensure_attached_to_taskbar(self.primary_hwnd, geom.taskbar_hwnd);
+        let primary_attached =
+            ensure_attached_to_taskbar(self.primary_hwnd, geom.taskbar_hwnd, &mut ops);
         let secondary_attached = if layout_mode == LayoutMode::Split {
-            ensure_attached_to_taskbar(self.secondary_hwnd, geom.taskbar_hwnd)
+            ensure_attached_to_taskbar(self.secondary_hwnd, geom.taskbar_hwnd, &mut ops)
         } else {
             false
         };
@@ -636,16 +766,119 @@ impl TaskbarManager {
         self.last_global_hide = Some(global_hide);
         self.last_tb_rect = Some(geom.taskbar_rect);
         self.last_tray_rect = geom.tray_rect;
+        self.last_start_rect = geom.start_rect;
         self.last_dpi = geom.dpi;
 
         if layout_mode != LayoutMode::Split {
-            self.hide_secondary_bar();
+            self.hide_secondary_bar_into(&mut ops);
+        }
+
+        if layout_mode == LayoutMode::Split {
+            let (hw_rect, dev_rect) = if global_hide {
+                (None, None)
+            } else {
+                plan_split_bar_rects(geom, snapshot)
+            };
+
+            if !primary_attached {
+                collect_hide_window(self.primary_hwnd, &mut ops);
+                self.primary_surface.clear();
+                self.last_primary_key = None;
+                self.last_primary_rect = None;
+            } else if global_hide || !fullscreen || self.last_primary_key.is_none() {
+                let hw_key = BarRenderKey::for_hardware_bar(
+                    LayoutMode::Split,
+                    self.theme,
+                    geom,
+                    global_hide,
+                    self.primary_hovered,
+                    vs,
+                );
+                let rect_changed = self.last_primary_rect != hw_rect;
+                if self.last_primary_key.as_ref() != Some(&hw_key) || rect_changed {
+                    match hw_rect {
+                        Some(rect) => {
+                            if render_bar_at_rect(
+                                &mut self.renderer,
+                                self.theme,
+                                self.primary_hwnd,
+                                self.secondary_hwnd,
+                                &mut self.primary_surface,
+                                self.primary_hovered,
+                                snapshot,
+                                RenderContent::HardwareOnly,
+                                geom,
+                                rect,
+                                &mut ops,
+                            ) {
+                                self.bar_commits = self.bar_commits.saturating_add(1);
+                                self.last_primary_key = Some(hw_key);
+                                self.last_primary_rect = Some(rect);
+                            }
+                        }
+                        None => {
+                            collect_hide_window(self.primary_hwnd, &mut ops);
+                            self.primary_surface.clear();
+                            self.last_primary_key = Some(hw_key);
+                            self.last_primary_rect = None;
+                        }
+                    }
+                }
+            }
+
+            if !secondary_attached {
+                collect_hide_window(self.secondary_hwnd, &mut ops);
+                self.secondary_surface.clear();
+                self.last_secondary_key = None;
+                self.last_secondary_rect = None;
+            } else if global_hide || !fullscreen || self.last_secondary_key.is_none() {
+                let dev_key = BarRenderKey::for_devices_bar(
+                    LayoutMode::Split,
+                    self.theme,
+                    geom,
+                    global_hide,
+                    self.secondary_hovered,
+                    vs,
+                );
+                let rect_changed = self.last_secondary_rect != dev_rect;
+                if self.last_secondary_key.as_ref() != Some(&dev_key) || rect_changed {
+                    match dev_rect {
+                        Some(rect) => {
+                            if render_bar_at_rect(
+                                &mut self.renderer,
+                                self.theme,
+                                self.secondary_hwnd,
+                                self.primary_hwnd,
+                                &mut self.secondary_surface,
+                                self.secondary_hovered,
+                                snapshot,
+                                RenderContent::DevicesOnly,
+                                geom,
+                                rect,
+                                &mut ops,
+                            ) {
+                                self.bar_commits = self.bar_commits.saturating_add(1);
+                                self.last_secondary_key = Some(dev_key);
+                                self.last_secondary_rect = Some(rect);
+                            }
+                        }
+                        None => {
+                            collect_hide_window(self.secondary_hwnd, &mut ops);
+                            self.secondary_surface.clear();
+                            self.last_secondary_key = Some(dev_key);
+                            self.last_secondary_rect = None;
+                        }
+                    }
+                }
+            }
+            return ops;
         }
 
         if !primary_attached {
-            hide_window(self.primary_hwnd);
+            collect_hide_window(self.primary_hwnd, &mut ops);
             self.primary_surface.clear();
             self.last_primary_key = None;
+            self.last_primary_rect = None;
         } else if global_hide || !fullscreen || self.last_primary_key.is_none() {
             let (key, zone, content) = match layout_mode {
                 LayoutMode::Combined => (
@@ -659,7 +892,7 @@ impl TaskbarManager {
                     &snapshot.config.combined_zone,
                     RenderContent::Combined,
                 ),
-                LayoutMode::HardwareOnly | LayoutMode::Split => (
+                LayoutMode::HardwareOnly => (
                     BarRenderKey::for_hardware_bar(
                         layout_mode,
                         self.theme,
@@ -683,64 +916,253 @@ impl TaskbarManager {
                     &snapshot.config.devices_zone,
                     RenderContent::DevicesOnly,
                 ),
+                LayoutMode::Split => unreachable!(),
             };
-            if self.last_primary_key.as_ref() != Some(&key)
-                && update_single_bar(
-                    &mut self.renderer,
-                    self.theme,
-                    self.primary_hwnd,
-                    self.secondary_hwnd,
-                    &mut self.primary_surface,
-                    self.primary_hovered,
-                    snapshot,
-                    zone,
-                    content,
-                    geom,
-                    global_hide,
-                )
-            {
-                self.last_primary_key = Some(key);
+            if self.last_primary_key.as_ref() != Some(&key) {
+                let target_rect = if global_hide || !zone.visible {
+                    None
+                } else {
+                    plan_single_bar_rect(geom, snapshot, zone, content)
+                };
+                match target_rect {
+                    Some(rect) => {
+                        if render_bar_at_rect(
+                            &mut self.renderer,
+                            self.theme,
+                            self.primary_hwnd,
+                            self.secondary_hwnd,
+                            &mut self.primary_surface,
+                            self.primary_hovered,
+                            snapshot,
+                            content,
+                            geom,
+                            rect,
+                            &mut ops,
+                        ) {
+                            self.bar_commits = self.bar_commits.saturating_add(1);
+                            self.last_primary_key = Some(key);
+                            self.last_primary_rect = Some(rect);
+                        }
+                    }
+                    None => {
+                        collect_hide_window(self.primary_hwnd, &mut ops);
+                        self.primary_surface.clear();
+                        self.last_primary_key = Some(key);
+                        self.last_primary_rect = None;
+                    }
+                }
             }
         }
+        ops
+    }
+}
 
-        if layout_mode == LayoutMode::Split {
-            if !secondary_attached {
-                hide_window(self.secondary_hwnd);
-                self.secondary_surface.clear();
-                self.last_secondary_key = None;
-            } else if global_hide || !fullscreen || self.last_secondary_key.is_none() {
-                let dev_key = BarRenderKey::for_devices_bar(
-                    LayoutMode::Split,
-                    self.theme,
-                    geom,
-                    global_hide,
-                    self.secondary_hovered,
-                    vs,
+fn plan_single_bar_rect(
+    geom: &TaskbarGeometry,
+    snapshot: &MonitorSnapshot,
+    zone: &ZoneLayout,
+    content: RenderContent,
+) -> Option<(i32, i32, i32, i32)> {
+    let scale = geom.dpi.max(96) as f32 / 96.0;
+    let (safe_left, safe_right) = safe_horizontal_interval(geom);
+    let avail_w_px = (safe_right - safe_left).max(0);
+    let max_w_px = avail_w_px.min(MAX_BAR_DIB_WIDTH_PX);
+    if max_w_px <= 0 {
+        return None;
+    }
+    let max_logical_w = max_w_px as f32 / scale;
+    let (_, _, fitted_logical_w) = fit_content_to_width(snapshot, content, max_logical_w);
+    if fitted_logical_w <= 0.5 {
+        return None;
+    }
+    Some(compute_zone_rect(geom, zone, fitted_logical_w))
+}
+
+#[allow(clippy::type_complexity)]
+pub fn plan_split_bar_rects(
+    geom: &TaskbarGeometry,
+    snapshot: &MonitorSnapshot,
+) -> (Option<(i32, i32, i32, i32)>, Option<(i32, i32, i32, i32)>) {
+    let hw_zone = &snapshot.config.hardware_zone;
+    let dev_zone = &snapshot.config.devices_zone;
+    let hw_raw_w = if hw_zone.visible {
+        compute_logical_width(snapshot, RenderContent::HardwareOnly)
+    } else {
+        0.0
+    };
+    let dev_raw_w = if dev_zone.visible {
+        compute_logical_width(snapshot, RenderContent::DevicesOnly)
+    } else {
+        0.0
+    };
+    let hw_active = hw_raw_w > 0.5;
+    let dev_active = dev_raw_w > 0.5;
+
+    match (hw_active, dev_active) {
+        (false, false) => (None, None),
+        (true, false) => (
+            plan_single_bar_rect(geom, snapshot, hw_zone, RenderContent::HardwareOnly),
+            None,
+        ),
+        (false, true) => (
+            None,
+            plan_single_bar_rect(geom, snapshot, dev_zone, RenderContent::DevicesOnly),
+        ),
+        (true, true) => {
+            let scale = geom.dpi.max(96) as f32 / 96.0;
+            let (safe_left, safe_right) = safe_horizontal_interval(geom);
+            let avail_w_px = (safe_right - safe_left).max(0);
+            if avail_w_px <= 0 {
+                return (None, None);
+            }
+            let min_gap_px = (SPLIT_MIN_GAP_LOGICAL * scale).round().max(1.0) as i32;
+            if avail_w_px <= min_gap_px {
+                return (
+                    plan_single_bar_rect(geom, snapshot, hw_zone, RenderContent::HardwareOnly),
+                    None,
                 );
-                if self.last_secondary_key.as_ref() != Some(&dev_key)
-                    && update_single_bar(
-                        &mut self.renderer,
-                        self.theme,
-                        self.secondary_hwnd,
-                        self.primary_hwnd,
-                        &mut self.secondary_surface,
-                        self.secondary_hovered,
-                        snapshot,
-                        &snapshot.config.devices_zone,
-                        RenderContent::DevicesOnly,
-                        geom,
-                        global_hide,
-                    )
-                {
-                    self.last_secondary_key = Some(dev_key);
+            }
+            let budget_px = avail_w_px - min_gap_px;
+            let tb_h = (geom.taskbar_rect.bottom - geom.taskbar_rect.top).max(24);
+            let y = geom.taskbar_rect.top;
+
+            let hw_is_left = if hw_zone.anchor != dev_zone.anchor {
+                hw_zone.anchor == AnchorEdge::Left
+            } else {
+                true
+            };
+            let (left_content, left_zone, right_content, right_zone) = if hw_is_left {
+                (
+                    RenderContent::HardwareOnly,
+                    hw_zone,
+                    RenderContent::DevicesOnly,
+                    dev_zone,
+                )
+            } else {
+                (
+                    RenderContent::DevicesOnly,
+                    dev_zone,
+                    RenderContent::HardwareOnly,
+                    hw_zone,
+                )
+            };
+
+            let max_single_logical = MAX_BAR_DIB_WIDTH_PX as f32 / scale;
+            let left_ideal_logical =
+                fit_content_to_width(snapshot, left_content, max_single_logical).2;
+            let right_ideal_logical =
+                fit_content_to_width(snapshot, right_content, max_single_logical).2;
+            let left_ideal_px = (left_ideal_logical * scale).ceil() as i32;
+            let right_ideal_px = (right_ideal_logical * scale).ceil() as i32;
+
+            let (left_logical, right_logical) = if left_ideal_px + right_ideal_px > budget_px {
+                let half = budget_px / 2;
+                let (l_cap, r_cap) = if left_ideal_px <= half {
+                    (left_ideal_px, budget_px - left_ideal_px)
+                } else if right_ideal_px <= half {
+                    (budget_px - right_ideal_px, right_ideal_px)
+                } else {
+                    (half, budget_px - half)
+                };
+                let l_fit = fit_content_to_width(
+                    snapshot,
+                    left_content,
+                    (l_cap.min(MAX_BAR_DIB_WIDTH_PX) as f32) / scale,
+                )
+                .2;
+                let r_fit = fit_content_to_width(
+                    snapshot,
+                    right_content,
+                    (r_cap.min(MAX_BAR_DIB_WIDTH_PX) as f32) / scale,
+                )
+                .2;
+                (l_fit, r_fit)
+            } else {
+                (left_ideal_logical, right_ideal_logical)
+            };
+
+            let left_w_px = if left_logical > 0.5 {
+                ((left_logical * scale).ceil() as i32)
+                    .min(budget_px)
+                    .min(MAX_BAR_DIB_WIDTH_PX)
+            } else {
+                0
+            };
+            let right_w_px = if right_logical > 0.5 {
+                ((right_logical * scale).ceil() as i32)
+                    .min(budget_px)
+                    .min(MAX_BAR_DIB_WIDTH_PX)
+            } else {
+                0
+            };
+
+            if left_w_px == 0 && right_w_px == 0 {
+                return (None, None);
+            }
+            if left_w_px == 0 {
+                let r_rect = plan_single_bar_rect(geom, snapshot, right_zone, right_content);
+                return if hw_is_left {
+                    (None, r_rect)
+                } else {
+                    (r_rect, None)
+                };
+            }
+            if right_w_px == 0 {
+                let l_rect = plan_single_bar_rect(geom, snapshot, left_zone, left_content);
+                return if hw_is_left {
+                    (l_rect, None)
+                } else {
+                    (None, l_rect)
+                };
+            }
+
+            let left_off = (left_zone.offset_x.max(0) as f32 * scale).round() as i32;
+            let right_off = (right_zone.offset_x.max(0) as f32 * scale).round() as i32;
+            let max_lx = (safe_right - right_w_px - min_gap_px - left_w_px).max(safe_left);
+            let min_rx = safe_left + left_w_px + min_gap_px;
+            let max_rx = (safe_right - right_w_px).max(min_rx);
+
+            let mut lx = match left_zone.anchor {
+                AnchorEdge::Left => safe_left + left_off,
+                AnchorEdge::Right => safe_right - left_off - left_w_px,
+            }
+            .clamp(safe_left, max_lx);
+
+            let mut rx = match right_zone.anchor {
+                AnchorEdge::Right => safe_right - right_off - right_w_px,
+                AnchorEdge::Left => safe_left + right_off,
+            }
+            .clamp(min_rx, max_rx);
+
+            if lx + left_w_px + min_gap_px > rx {
+                let needed = (lx + left_w_px + min_gap_px) - rx;
+                let rx_slack = (max_rx - rx).max(0);
+                let lx_slack = (lx - safe_left).max(0);
+                let shift_r = (needed / 2).min(rx_slack);
+                let shift_l = (needed - shift_r).min(lx_slack);
+                let extra_r = (needed - shift_r - shift_l).min(rx_slack - shift_r);
+                rx += shift_r + extra_r;
+                lx -= shift_l;
+                if lx + left_w_px + min_gap_px > rx {
+                    let extra_l = (lx + left_w_px + min_gap_px - rx).min((lx - safe_left).max(0));
+                    lx -= extra_l;
                 }
+                rx = rx.max(lx + left_w_px + min_gap_px).min(max_rx);
+            }
+
+            let left_rect = Some((lx, y, left_w_px, tb_h));
+            let right_rect = Some((rx, y, right_w_px, tb_h));
+            if hw_is_left {
+                (left_rect, right_rect)
+            } else {
+                (right_rect, left_rect)
             }
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_single_bar(
+fn render_bar_at_rect(
     renderer: &mut TaskbarRenderer,
     theme: TaskbarTheme,
     hwnd: HWND,
@@ -748,19 +1170,12 @@ fn update_single_bar(
     surface: &mut WindowSurface,
     hovered: bool,
     snapshot: &MonitorSnapshot,
-    zone: &ZoneLayout,
     content: RenderContent,
     geom: &TaskbarGeometry,
-    global_hide: bool,
+    rect: (i32, i32, i32, i32),
+    ops: &mut Vec<BarWindowOp>,
 ) -> bool {
-    let logical_w = compute_logical_width(snapshot, content);
-    if global_hide || !zone.visible || logical_w <= 0.5 {
-        hide_window(hwnd);
-        surface.clear();
-        return true;
-    }
-
-    let (screen_x, screen_y, w_px, h_px) = compute_zone_rect(geom, zone, logical_w);
+    let (screen_x, screen_y, w_px, h_px) = rect;
     // Child windows of Shell_TrayWnd take client coordinates for UpdateLayeredWindow.
     let Some((client_x, client_y)) =
         screen_to_taskbar_client(geom.taskbar_hwnd, screen_x, screen_y)
@@ -777,11 +1192,9 @@ fn update_single_bar(
     {
         // Commit position + size + DIB atomically via UpdateLayeredWindow above before
         // raising Z-order and revealing a previously hidden bar, avoiding a 1-frame left flash.
-        ensure_child_top_order(hwnd, sibling_bar);
+        ensure_child_top_order(hwnd, sibling_bar, ops);
         if !was_visible {
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            }
+            ops.push(BarWindowOp::ShowNoActivate(hwnd));
         }
         true
     } else {
@@ -807,7 +1220,7 @@ fn screen_to_taskbar_client(
     }
 }
 
-fn ensure_attached_to_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
+fn ensure_attached_to_taskbar(hwnd: HWND, taskbar_hwnd: HWND, ops: &mut Vec<BarWindowOp>) -> bool {
     unsafe {
         if hwnd.0.is_null() || taskbar_hwnd.0.is_null() {
             return false;
@@ -816,7 +1229,8 @@ fn ensure_attached_to_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
             return true;
         }
         if IsWindowVisible(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            ops.push(BarWindowOp::Hide(hwnd));
+            return false;
         }
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_POPUP.0) | WS_CHILD.0 | WS_CLIPSIBLINGS.0;
@@ -829,30 +1243,25 @@ fn ensure_attached_to_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
         if GetParent(hwnd).ok() != Some(taskbar_hwnd) {
             return false;
         }
-        let _ = SetWindowPos(
+        ops.push(BarWindowOp::RaiseTop {
             hwnd,
-            HWND_TOP,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
+            frame_changed: true,
+        });
         true
     }
 }
 
-fn hide_window(hwnd: HWND) {
+fn collect_hide_window(hwnd: HWND, ops: &mut Vec<BarWindowOp>) {
     unsafe {
         if !hwnd.0.is_null() && IsWindowVisible(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            ops.push(BarWindowOp::Hide(hwnd));
         }
     }
 }
 
 /// Ensures our child bar sits above Shell_TrayWnd's XAML DesktopWindowContentBridge
 /// inside Shell_TrayWnd's child list without changing position, size, or visibility.
-fn ensure_child_top_order(hwnd: HWND, sibling_bar: HWND) {
+fn ensure_child_top_order(hwnd: HWND, sibling_bar: HWND, ops: &mut Vec<BarWindowOp>) {
     unsafe {
         if hwnd.0.is_null() {
             return;
@@ -876,15 +1285,10 @@ fn ensure_child_top_order(hwnd: HWND, sibling_bar: HWND) {
         }
 
         if needs_raise {
-            let _ = SetWindowPos(
+            ops.push(BarWindowOp::RaiseTop {
                 hwnd,
-                HWND_TOP,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+                frame_changed: false,
+            });
         }
     }
 }
@@ -909,6 +1313,7 @@ mod tests {
                 right: 1920,
                 bottom: 1080,
             }),
+            start_rect: None,
             dpi: 96,
             taskbar_hidden: false,
         };
@@ -936,6 +1341,7 @@ mod tests {
                 bottom: 1080,
             },
             tray_rect: None,
+            start_rect: None,
             dpi: 144, // 150% DPI
             taskbar_hidden: false,
         };
@@ -1018,7 +1424,9 @@ mod tests {
             )
             .unwrap();
 
-            assert!(ensure_attached_to_taskbar(child, parent));
+            let mut attach_ops = Vec::new();
+            assert!(ensure_attached_to_taskbar(child, parent, &mut attach_ops));
+            execute_bar_window_ops(&attach_ops);
             assert_eq!(GetParent(child).ok(), Some(parent));
 
             let mut renderer = TaskbarRenderer::new().unwrap();
@@ -1038,6 +1446,7 @@ mod tests {
                     right: 900,
                     bottom: 248,
                 }),
+                start_rect: None,
                 dpi: 96,
                 taskbar_hidden: false,
             };
@@ -1064,7 +1473,9 @@ mod tests {
                     false,
                 )
                 .unwrap();
-            ensure_child_top_order(child, HWND::default());
+            let mut order_ops = Vec::new();
+            ensure_child_top_order(child, HWND::default(), &mut order_ops);
+            execute_bar_window_ops(&order_ops);
             let _ = ShowWindow(child, SW_SHOWNOACTIVATE);
 
             assert!(IsWindowVisible(child).as_bool());
@@ -1126,6 +1537,7 @@ mod tests {
                 bottom: 1080,
             },
             tray_rect: None,
+            start_rect: None,
             dpi: 96,
             taskbar_hidden: false,
         };
@@ -1330,12 +1742,15 @@ mod tests {
                     right: 1000,
                     bottom: 48,
                 }),
+                start_rect: None,
                 dpi: 96,
                 taskbar_hidden: false,
             };
 
             let mut cfg = AppConfig {
                 layout_mode: LayoutMode::DevicesOnly,
+                hardware_enabled: false,
+                wireless_enabled: true,
                 ..AppConfig::default()
             };
             cfg.devices_zone.anchor = AnchorEdge::Right;
@@ -1392,6 +1807,8 @@ mod tests {
             // Switch to HardwareOnly -> primary stays right/left per hardware_zone, secondary hidden.
             let mut hw_snap = MonitorSnapshot::new(AppConfig {
                 layout_mode: LayoutMode::HardwareOnly,
+                hardware_enabled: true,
+                wireless_enabled: false,
                 ..cfg
             });
             hw_snap.hw.cpu_usage_pct = 25.0;
@@ -1456,6 +1873,7 @@ mod tests {
                 right: width,
                 bottom: 1080,
             }),
+            start_rect: None,
             dpi: 96,
             taskbar_hidden: false,
         }
@@ -1648,12 +2066,15 @@ mod tests {
                     right: 1000,
                     bottom: 48,
                 }),
+                start_rect: None,
                 dpi: 96,
                 taskbar_hidden: false,
             };
 
             let mut cfg = AppConfig {
                 layout_mode: LayoutMode::HardwareOnly,
+                hardware_enabled: true,
+                wireless_enabled: false,
                 ..AppConfig::default()
             };
             cfg.hardware_zone.anchor = AnchorEdge::Right;
@@ -1666,7 +2087,8 @@ mod tests {
                 wireless_rev: 1,
                 config_rev: 1,
             };
-            mgr.apply_bars_with_geom_inner(&vs1, &geom, false, false);
+            let ops1 = mgr.apply_bars_with_geom_inner(&vs1, &geom, false, false);
+            execute_bar_window_ops(&ops1);
             assert!(IsWindowVisible(primary).as_bool());
             assert_eq!(GetParent(primary).ok(), Some(parent));
             let mut before_rect = RECT::default();
@@ -1681,14 +2103,16 @@ mod tests {
                 wireless_rev: 1,
                 config_rev: 1,
             };
-            mgr.apply_bars_with_geom_inner(&vs2, &geom, false, true);
+            let ops2 = mgr.apply_bars_with_geom_inner(&vs2, &geom, false, true);
+            execute_bar_window_ops(&ops2);
             assert!(IsWindowVisible(primary).as_bool());
             let mut fs_rect = RECT::default();
             GetWindowRect(primary, &mut fs_rect).unwrap();
             assert_eq!(fs_rect, before_rect);
 
             // Exiting fullscreen updates content in place without hiding/re-showing.
-            mgr.apply_bars_with_geom_inner(&vs2, &geom, false, false);
+            let ops3 = mgr.apply_bars_with_geom_inner(&vs2, &geom, false, false);
+            execute_bar_window_ops(&ops3);
             assert!(IsWindowVisible(primary).as_bool());
             let mut after_rect = RECT::default();
             GetWindowRect(primary, &mut after_rect).unwrap();
@@ -1699,8 +2123,228 @@ mod tests {
                 taskbar_hwnd: HWND::default(),
                 ..geom
             };
-            mgr.apply_bars_with_geom_inner(&vs2, &bad_geom, false, false);
+            let ops4 = mgr.apply_bars_with_geom_inner(&vs2, &bad_geom, false, false);
+            execute_bar_window_ops(&ops4);
             assert!(!IsWindowVisible(primary).as_bool());
+
+            let _ = DestroyWindow(secondary);
+            let _ = DestroyWindow(primary);
+            let _ = DestroyWindow(parent);
+        }
+    }
+
+    #[test]
+    fn split_layout_prevents_overlap_with_system_controls_and_sibling_bar() {
+        use crate::config::AppConfig;
+        use crate::state::{DeviceKind, Transport, WirelessDevice};
+        use std::time::Instant;
+
+        let mut cfg = AppConfig {
+            layout_mode: LayoutMode::Split,
+            hardware_enabled: true,
+            wireless_enabled: true,
+            ..AppConfig::default()
+        };
+        cfg.hardware_zone.anchor = AnchorEdge::Left;
+        cfg.hardware_zone.offset_x = 8192; // Extreme offset
+        cfg.devices_zone.anchor = AnchorEdge::Right;
+        cfg.devices_zone.offset_x = 8192;
+
+        let mut snap = MonitorSnapshot::new(cfg);
+        for i in 0..8 {
+            snap.devices.push(WirelessDevice {
+                id: format!("d{i}"),
+                name: format!("Dev{i}"),
+                kind: DeviceKind::Mouse,
+                transport: Transport::Wireless24G,
+                battery_pct: Some(75),
+                charging: false,
+                sub_batteries: None,
+                online: true,
+                last_seen: Instant::now(),
+                detail_note: None,
+            });
+        }
+
+        // Narrow screen with Start button [0..48] and Tray [460..600] at 150% DPI.
+        let geom = TaskbarGeometry {
+            taskbar_hwnd: HWND::default(),
+            taskbar_rect: RECT {
+                left: 0,
+                top: 1000,
+                right: 600,
+                bottom: 1060,
+            },
+            start_rect: Some(RECT {
+                left: 0,
+                top: 1000,
+                right: 48,
+                bottom: 1060,
+            }),
+            tray_rect: Some(RECT {
+                left: 460,
+                top: 1000,
+                right: 600,
+                bottom: 1060,
+            }),
+            dpi: 144,
+            taskbar_hidden: false,
+        };
+
+        let (hw_rect, dev_rect) = plan_split_bar_rects(&geom, &snap);
+        let (hx, _, hw, _) = hw_rect.expect("hw bar should fit");
+        let (dx, _, dw, _) = dev_rect.expect("dev bar should fit");
+        assert!(hx >= 48, "hw bar {hx} overlapped Start [0..48]");
+        assert!(
+            dx + dw <= 460,
+            "dev bar {} overlapped Tray [460..600]",
+            dx + dw
+        );
+        assert!(
+            hx + hw < dx,
+            "hw bar [{hx}..{}] overlapped dev bar [{dx}..{}]",
+            hx + hw,
+            dx + dw
+        );
+    }
+
+    #[test]
+    fn compute_zone_rect_clamps_against_start_tray_and_max_dib_cap() {
+        let geom = TaskbarGeometry {
+            taskbar_hwnd: HWND::default(),
+            taskbar_rect: RECT {
+                left: 0,
+                top: 1000,
+                right: 3840,
+                bottom: 1048,
+            },
+            start_rect: Some(RECT {
+                left: 0,
+                top: 1000,
+                right: 60,
+                bottom: 1048,
+            }),
+            tray_rect: Some(RECT {
+                left: 3400,
+                top: 1000,
+                right: 3840,
+                bottom: 1048,
+            }),
+            dpi: 192, // 200% DPI
+            taskbar_hidden: false,
+        };
+        let zone = ZoneLayout {
+            anchor: AnchorEdge::Left,
+            offset_x: 8192,
+            visible: true,
+        };
+        let (x, _, w, _) = compute_zone_rect(&geom, &zone, 2000.0);
+        assert!(w <= MAX_BAR_DIB_WIDTH_PX);
+        assert!(x >= 60);
+        assert!(x + w <= 3400);
+    }
+
+    #[test]
+    fn dual_disabled_zones_hide_both_bars_and_clear_surfaces() {
+        use crate::config::AppConfig;
+        use std::sync::Arc;
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        };
+
+        unsafe {
+            let hinst = GetModuleHandleW(None).unwrap();
+            let parent = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("TestTaskbarDualOff"),
+                WS_POPUP,
+                0,
+                0,
+                1000,
+                48,
+                HWND::default(),
+                None,
+                hinst,
+                None,
+            )
+            .unwrap();
+            let _ = ShowWindow(parent, SW_SHOWNOACTIVATE);
+            let primary = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("TestPrimaryDualOff"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                HWND::default(),
+                None,
+                hinst,
+                None,
+            )
+            .unwrap();
+            let secondary = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("TestSecondaryDualOff"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                HWND::default(),
+                None,
+                hinst,
+                None,
+            )
+            .unwrap();
+
+            let mut mgr = TaskbarManager::new(primary, secondary).unwrap();
+            let geom = TaskbarGeometry {
+                taskbar_hwnd: parent,
+                taskbar_rect: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1000,
+                    bottom: 48,
+                },
+                tray_rect: Some(RECT {
+                    left: 850,
+                    top: 0,
+                    right: 1000,
+                    bottom: 48,
+                }),
+                start_rect: None,
+                dpi: 96,
+                taskbar_hidden: false,
+            };
+
+            let mut cfg = AppConfig::default();
+            let vs_on = VersionedSnapshot {
+                snapshot: Arc::new(MonitorSnapshot::new(cfg.clone())),
+                hw_rev: 1,
+                wireless_rev: 1,
+                config_rev: 1,
+            };
+            mgr.apply_bars_with_geom(&vs_on, &geom, false);
+            assert!(IsWindowVisible(primary).as_bool());
+            assert_eq!(mgr.bar_commits, 1);
+
+            cfg.set_hardware_enabled(false);
+            cfg.set_wireless_enabled(false);
+            assert_eq!(cfg.effective_layout_mode(), None);
+            let vs_off = VersionedSnapshot {
+                snapshot: Arc::new(MonitorSnapshot::new(cfg)),
+                hw_rev: 2,
+                wireless_rev: 2,
+                config_rev: 2,
+            };
+            mgr.apply_bars_with_geom(&vs_off, &geom, false);
+            assert!(!IsWindowVisible(primary).as_bool());
+            assert!(!IsWindowVisible(secondary).as_bool());
 
             let _ = DestroyWindow(secondary);
             let _ = DestroyWindow(primary);

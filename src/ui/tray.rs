@@ -26,7 +26,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
     NIIF_RESPECT_QUIET_TIME, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
     NINF_KEY, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4, NOTIFY_ICON_INFOTIP_FLAGS,
 };
@@ -67,6 +67,8 @@ const ID_AUTOSTART: u32 = 1202;
 const ID_OPEN_CONFIG: u32 = 1203;
 const ID_QUIT: u32 = 1204;
 const ID_ABOUT: u32 = 1205;
+const ID_TOGGLE_HARDWARE_ENABLED: u32 = 1206;
+const ID_TOGGLE_WIRELESS_ENABLED: u32 = 1207;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
@@ -126,6 +128,8 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
                 if del_res.is_err() && del_res != ERROR_FILE_NOT_FOUND {
                     return Err(format!("RegDeleteValueW failed: {:?}", del_res));
                 }
+            } else if res != ERROR_FILE_NOT_FOUND {
+                return Err(format!("RegOpenKeyExW failed: {:?}", res));
             }
         }
         Ok(())
@@ -142,15 +146,19 @@ pub fn open_config_in_editor(snapshot: &MonitorSnapshot) -> Result<(), String> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    unsafe {
-        let _ = ShellExecuteW(
+    let ret = unsafe {
+        ShellExecuteW(
             None,
             w!("open"),
             PCWSTR(wide.as_ptr()),
             None,
             None,
             SW_SHOWNORMAL,
-        );
+        )
+    };
+    let code = ret.0 as isize;
+    if code <= 32 {
+        return Err(format!("打开配置文件失败 (ShellExecuteW 错误 {code})"));
     }
     Ok(())
 }
@@ -458,7 +466,7 @@ impl TrayManager {
             &self.last_tip
         };
         let mut nid = self.base_nid();
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         nid.uCallbackMessage = WM_APP_TRAY_CALLBACK;
         nid.hIcon = self.hicon;
         write_wide_buf(&mut nid.szTip, tip);
@@ -469,6 +477,12 @@ impl TrayManager {
                 self.retry_count = 0;
                 nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
                 self.v4_active = Shell_NotifyIconW(NIM_SETVERSION, &nid).as_bool();
+                if self.v4_active {
+                    let mut tip_nid = self.base_nid();
+                    tip_nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+                    write_wide_buf(&mut tip_nid.szTip, tip);
+                    let _ = Shell_NotifyIconW(NIM_MODIFY, &tip_nid);
+                }
                 return true;
             }
         }
@@ -579,7 +593,11 @@ impl TrayManager {
         }
 
         let mut nid = self.base_nid();
-        nid.uFlags = NIF_TIP;
+        nid.uFlags = if self.v4_active {
+            NIF_TIP | NIF_SHOWTIP
+        } else {
+            NIF_TIP
+        };
         write_wide_buf(&mut nid.szTip, &self.tip_scratch);
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -589,7 +607,7 @@ impl TrayManager {
     }
 
     pub fn check_low_battery_alerts(&mut self, snapshot: &MonitorSnapshot) {
-        if !self.added {
+        if !self.added || !snapshot.config.wireless_enabled {
             return;
         }
         let threshold = snapshot.config.low_battery_threshold;
@@ -644,11 +662,31 @@ impl Drop for TrayManager {
 
 pub(crate) fn format_tooltip_into(out: &mut String, snapshot: &MonitorSnapshot) {
     out.clear();
-    let _ = write!(
-        out,
-        "AirMonitor | CPU {:.0}% MEM {:.0}%",
-        snapshot.hw.cpu_usage_pct, snapshot.hw.mem_usage_pct
-    );
+    if !snapshot.config.hardware_enabled && !snapshot.config.wireless_enabled {
+        out.push_str("AirMonitor (监测已暂停)");
+        return;
+    }
+
+    out.push_str("AirMonitor");
+    if snapshot.config.hardware_enabled {
+        out.push_str(" | ");
+        if snapshot.hw.cpu_usage_valid && snapshot.hw.cpu_usage_pct.is_finite() {
+            let _ = write!(out, "CPU {:.0}%", snapshot.hw.cpu_usage_pct);
+        } else {
+            out.push_str("CPU N/A");
+        }
+        out.push(' ');
+        if snapshot.hw.mem_valid && snapshot.hw.mem_usage_pct.is_finite() {
+            let _ = write!(out, "MEM {:.0}%", snapshot.hw.mem_usage_pct);
+        } else {
+            out.push_str("MEM N/A");
+        }
+    }
+
+    if !snapshot.config.wireless_enabled {
+        return;
+    }
+
     for dev in snapshot
         .devices
         .iter()
@@ -705,13 +743,28 @@ pub(crate) fn track_context_menu(
             return None;
         };
 
-        let is_comb_dev = cfg.layout_mode == LayoutMode::Combined
+        let effective_mode = cfg.effective_layout_mode();
+        let is_comb_dev = effective_mode == Some(LayoutMode::Combined)
             && cfg.combined_order == CombinedOrder::DevicesFirst;
-        let is_comb_hw = cfg.layout_mode == LayoutMode::Combined
+        let is_comb_hw = effective_mode == Some(LayoutMode::Combined)
             && cfg.combined_order == CombinedOrder::HardwareFirst;
-        let is_split = cfg.layout_mode == LayoutMode::Split;
-        let is_hw_only = cfg.layout_mode == LayoutMode::HardwareOnly;
-        let is_dev_only = cfg.layout_mode == LayoutMode::DevicesOnly;
+        let is_split = effective_mode == Some(LayoutMode::Split);
+        let is_hw_only = effective_mode == Some(LayoutMode::HardwareOnly);
+        let is_dev_only = effective_mode == Some(LayoutMode::DevicesOnly);
+
+        append_checked(
+            hmenu,
+            ID_TOGGLE_HARDWARE_ENABLED,
+            "启用硬件监测",
+            cfg.hardware_enabled,
+        );
+        append_checked(
+            hmenu,
+            ID_TOGGLE_WIRELESS_ENABLED,
+            "启用无线设备监测",
+            cfg.wireless_enabled,
+        );
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
 
         append_checked(
             hmenu,
@@ -731,8 +784,8 @@ pub(crate) fn track_context_menu(
 
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
 
-        match cfg.layout_mode {
-            LayoutMode::Combined => {
+        match effective_mode {
+            Some(LayoutMode::Combined) => {
                 append_checked(
                     hmenu,
                     ID_ANCHOR_COMBINED_LEFT,
@@ -746,7 +799,7 @@ pub(crate) fn track_context_menu(
                     cfg.combined_zone.anchor == AnchorEdge::Right,
                 );
             }
-            LayoutMode::HardwareOnly => {
+            Some(LayoutMode::HardwareOnly) => {
                 append_checked(
                     hmenu,
                     ID_ANCHOR_HW_LEFT,
@@ -760,7 +813,7 @@ pub(crate) fn track_context_menu(
                     cfg.hardware_zone.anchor == AnchorEdge::Right,
                 );
             }
-            LayoutMode::DevicesOnly => {
+            Some(LayoutMode::DevicesOnly) => {
                 append_checked(
                     hmenu,
                     ID_ANCHOR_DEV_LEFT,
@@ -774,7 +827,7 @@ pub(crate) fn track_context_menu(
                     cfg.devices_zone.anchor == AnchorEdge::Right,
                 );
             }
-            LayoutMode::Split => {
+            Some(LayoutMode::Split) => {
                 if let Ok(hw_anchor_menu) = CreatePopupMenu() {
                     append_checked(
                         hw_anchor_menu,
@@ -806,6 +859,7 @@ pub(crate) fn track_context_menu(
                     append_submenu(hmenu, dev_anchor_menu, "设备区锚定");
                 }
             }
+            None => {}
         }
 
         if let Ok(metrics_menu) = CreatePopupMenu() {
@@ -871,27 +925,45 @@ pub(crate) fn apply_menu_command(
         }
         _ => {
             let (changed, save_err) = state.update_and_save_config(|cfg| match cmd_id {
+                ID_TOGGLE_HARDWARE_ENABLED => {
+                    cfg.set_hardware_enabled(!cfg.hardware_enabled);
+                    true
+                }
+                ID_TOGGLE_WIRELESS_ENABLED => {
+                    cfg.set_wireless_enabled(!cfg.wireless_enabled);
+                    true
+                }
                 ID_LAYOUT_COMBINED_DEV_FIRST => {
+                    cfg.set_hardware_enabled(true);
+                    cfg.set_wireless_enabled(true);
                     cfg.layout_mode = LayoutMode::Combined;
                     cfg.combined_order = CombinedOrder::DevicesFirst;
                     true
                 }
                 ID_LAYOUT_COMBINED_HW_FIRST => {
+                    cfg.set_hardware_enabled(true);
+                    cfg.set_wireless_enabled(true);
                     cfg.layout_mode = LayoutMode::Combined;
                     cfg.combined_order = CombinedOrder::HardwareFirst;
                     true
                 }
                 ID_LAYOUT_SPLIT => {
+                    cfg.set_hardware_enabled(true);
+                    cfg.set_wireless_enabled(true);
                     cfg.layout_mode = LayoutMode::Split;
                     cfg.ensure_split_anchors_distinct();
                     true
                 }
                 ID_LAYOUT_HARDWARE_ONLY => {
                     cfg.layout_mode = LayoutMode::HardwareOnly;
+                    cfg.set_hardware_enabled(true);
+                    cfg.set_wireless_enabled(false);
                     true
                 }
                 ID_LAYOUT_DEVICES_ONLY => {
                     cfg.layout_mode = LayoutMode::DevicesOnly;
+                    cfg.set_hardware_enabled(false);
+                    cfg.set_wireless_enabled(true);
                     true
                 }
                 ID_ANCHOR_COMBINED_LEFT => {
@@ -1060,5 +1132,70 @@ mod tests {
         let (action, save_err) = apply_menu_command(ID_ABOUT, &store);
         assert_eq!(action, MenuAction::OpenAbout);
         assert!(save_err.is_none());
+    }
+
+    #[test]
+    fn tooltip_reflects_zone_toggles_and_metric_validity() {
+        let mut snap = MonitorSnapshot::new(AppConfig::default());
+        snap.hw.cpu_usage_pct = 20.0;
+        snap.hw.mem_usage_pct = 40.0;
+        snap.devices.push(WirelessDevice {
+            id: "d1".into(),
+            name: "VT3".into(),
+            kind: DeviceKind::Mouse,
+            transport: Transport::Wireless24G,
+            battery_pct: Some(85),
+            charging: false,
+            sub_batteries: None,
+            online: true,
+            last_seen: Instant::now(),
+            detail_note: None,
+        });
+
+        let mut buf = String::new();
+        // Invalid CPU/MEM -> N/A
+        snap.hw.cpu_usage_valid = false;
+        snap.hw.mem_valid = false;
+        format_tooltip_into(&mut buf, &snap);
+        assert_eq!(buf, "AirMonitor | CPU N/A MEM N/A | VT3 85%");
+
+        // Hardware off -> no CPU/MEM section
+        snap.config.hardware_enabled = false;
+        format_tooltip_into(&mut buf, &snap);
+        assert_eq!(buf, "AirMonitor | VT3 85%");
+
+        // Hardware on, wireless off -> no wireless devices
+        snap.hw.cpu_usage_valid = true;
+        snap.hw.mem_valid = true;
+        snap.config.hardware_enabled = true;
+        snap.config.wireless_enabled = false;
+        format_tooltip_into(&mut buf, &snap);
+        assert_eq!(buf, "AirMonitor | CPU 20% MEM 40%");
+
+        // Both off -> paused message
+        snap.config.hardware_enabled = false;
+        snap.config.wireless_enabled = false;
+        format_tooltip_into(&mut buf, &snap);
+        assert_eq!(buf, "AirMonitor (监测已暂停)");
+    }
+
+    #[test]
+    fn tray_menu_independent_toggles_update_config() {
+        crate::config::set_read_only_mode(true);
+        let store = SnapshotStore::new(AppConfig::default());
+
+        let (act1, err1) = apply_menu_command(ID_TOGGLE_HARDWARE_ENABLED, &store);
+        assert_eq!(act1, MenuAction::ConfigChanged);
+        assert!(err1.is_none());
+        assert!(!store.read_snapshot().unwrap().config.hardware_enabled);
+        assert!(store.read_snapshot().unwrap().config.wireless_enabled);
+
+        let (act2, err2) = apply_menu_command(ID_TOGGLE_WIRELESS_ENABLED, &store);
+        assert_eq!(act2, MenuAction::ConfigChanged);
+        assert!(err2.is_none());
+        let snap = store.read_snapshot().unwrap();
+        assert!(!snap.config.hardware_enabled);
+        assert!(!snap.config.wireless_enabled);
+        assert_eq!(snap.config.effective_layout_mode(), None);
     }
 }

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,14 +52,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::{AnchorEdge, AppConfig, LayoutMode};
 use crate::hw::{HardwareCollector, HardwareDemand};
-use crate::state::{HardwareMetrics, MonitorSnapshot, WirelessDevice};
+use crate::state::{HardwareMetrics, MonitorSnapshot, SubBatteries, WirelessDevice};
 use crate::wireless::WirelessManager;
 use popup::layout::PopupTab;
 use popup::{
     register_popup_class, PopupManager, WM_APP_CONFIG_CHANGED, WM_APP_REFRESH_WIRELESS,
     WM_APP_UPDATE_RESTART, WM_APP_UPDATE_STATUS,
 };
-use taskbar::{find_taskbar_geometry, DragState, TaskbarManager};
+use taskbar::{
+    execute_bar_window_ops, find_taskbar_geometry, BarWindowOp, DragState, TaskbarManager,
+};
 use tray::{MenuAction, TrayManager, NIN_KEYSELECT, WM_APP_TRAY_CALLBACK};
 
 const WM_APP_HW_UPDATE: u32 = WM_APP + 1;
@@ -69,6 +71,8 @@ const WM_APP_DEFERRED_REFRESH_BARS: u32 = WM_APP + 11;
 const WM_APP_DEFERRED_ZORDER_CHECK: u32 = WM_APP + 12;
 const WM_APP_DEFERRED_SMOKE_TEST: u32 = WM_APP + 13;
 const WM_APP_DEFERRED_QUIT: u32 = WM_APP + 14;
+const WM_APP_CONFIG_SAVE_ERROR: u32 = WM_APP + 15;
+const WM_APP_DEVICE_CHANGE_WIRELESS: u32 = WM_APP + 16;
 
 // Win32 MK_CONTROL modifier flag in mouse message wParam.
 const MK_CONTROL: usize = 0x0008;
@@ -101,12 +105,226 @@ pub(crate) struct VersionedSnapshot {
     pub config_rev: u64,
 }
 
+#[inline]
+fn f32_eq(a: f32, b: f32) -> bool {
+    a.to_bits() == b.to_bits()
+}
+
+#[inline]
+fn f64_eq(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits()
+}
+
+#[inline]
+fn opt_f32_eq(a: Option<f32>, b: Option<f32>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => f32_eq(x, y),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[inline]
+fn opt_f64_eq(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => f64_eq(x, y),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn hw_metrics_eq(a: &HardwareMetrics, b: &HardwareMetrics) -> bool {
+    f32_eq(a.cpu_usage_pct, b.cpu_usage_pct)
+        && a.cpu_usage_valid == b.cpu_usage_valid
+        && opt_f32_eq(a.cpu_freq_ghz, b.cpu_freq_ghz)
+        && opt_f32_eq(a.cpu_temp_c, b.cpu_temp_c)
+        && opt_f32_eq(a.acpi_temp_c, b.acpi_temp_c)
+        && opt_f32_eq(a.cpu_power_w, b.cpu_power_w)
+        && a.cpu_fan_rpm == b.cpu_fan_rpm
+        && f32_eq(a.mem_usage_pct, b.mem_usage_pct)
+        && f32_eq(a.mem_used_gb, b.mem_used_gb)
+        && f32_eq(a.mem_total_gb, b.mem_total_gb)
+        && a.mem_valid == b.mem_valid
+        && f64_eq(a.net_up_bps, b.net_up_bps)
+        && f64_eq(a.net_down_bps, b.net_down_bps)
+        && a.net_adapter_name == b.net_adapter_name
+        && a.net_valid == b.net_valid
+        && opt_f64_eq(a.disk_read_bps, b.disk_read_bps)
+        && opt_f64_eq(a.disk_write_bps, b.disk_write_bps)
+        && opt_f32_eq(a.disk_temp_c, b.disk_temp_c)
+        && a.sys_battery_pct == b.sys_battery_pct
+        && a.sys_battery_charging == b.sys_battery_charging
+        && a.gpu_name == b.gpu_name
+        && opt_f32_eq(a.gpu_usage_pct, b.gpu_usage_pct)
+        && opt_f32_eq(a.gpu_temp_c, b.gpu_temp_c)
+        && opt_f32_eq(a.gpu_hotspot_c, b.gpu_hotspot_c)
+        && opt_f32_eq(a.gpu_power_w, b.gpu_power_w)
+        && a.gpu_fan_rpm == b.gpu_fan_rpm
+        && a.gpu_fan_pct == b.gpu_fan_pct
+        && opt_f32_eq(a.gpu_vram_used_gb, b.gpu_vram_used_gb)
+        && opt_f32_eq(a.gpu_vram_total_gb, b.gpu_vram_total_gb)
+        && a.gpu_provider == b.gpu_provider
+        && a.sensor_provider == b.sensor_provider
+}
+
+fn sub_batteries_eq(a: Option<SubBatteries>, b: Option<SubBatteries>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            x.left_pct == y.left_pct
+                && x.left_charging == y.left_charging
+                && x.right_pct == y.right_pct
+                && x.right_charging == y.right_charging
+                && x.case_pct == y.case_pct
+                && x.case_charging == y.case_charging
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn wireless_devices_eq(a: &[WirelessDevice], b: &[WirelessDevice]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.id == y.id
+                && x.name == y.name
+                && x.kind == y.kind
+                && x.transport == y.transport
+                && x.battery_pct == y.battery_pct
+                && x.charging == y.charging
+                && sub_batteries_eq(x.sub_batteries, y.sub_batteries)
+                && x.online == y.online
+                && x.detail_note == y.detail_note
+        })
+}
+
+#[derive(Default)]
+struct SaveQueueInner {
+    pending: Option<AppConfig>,
+    stop: bool,
+    active: bool,
+    notify_hwnd: isize,
+}
+
+struct ConfigSaveQueue {
+    signal: Arc<(Mutex<SaveQueueInner>, Condvar)>,
+    last_error: Arc<Mutex<Option<String>>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl ConfigSaveQueue {
+    fn new() -> Self {
+        Self {
+            signal: Arc::new((Mutex::new(SaveQueueInner::default()), Condvar::new())),
+            last_error: Arc::new(Mutex::new(None)),
+            worker: Mutex::new(None),
+        }
+    }
+
+    fn start(&self, notify_hwnd: isize) {
+        if crate::config::is_read_only_mode() {
+            return;
+        }
+        let mut handle_guard = self.worker.lock().unwrap_or_else(|e| e.into_inner());
+        if handle_guard.is_some() {
+            return;
+        }
+        if let Ok(mut inner) = self.signal.0.lock() {
+            inner.stop = false;
+            inner.active = true;
+            inner.notify_hwnd = notify_hwnd;
+        }
+        let signal = Arc::clone(&self.signal);
+        let last_error = Arc::clone(&self.last_error);
+        match thread::Builder::new()
+            .name("config-saver".to_string())
+            .spawn(move || loop {
+                let (cfg, notify_hwnd) = {
+                    let (lock, cvar) = &*signal;
+                    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while st.pending.is_none() && !st.stop {
+                        st = cvar.wait(st).unwrap_or_else(|e| e.into_inner());
+                    }
+                    let next = st.pending.take();
+                    if next.is_none() && st.stop {
+                        st.active = false;
+                        break;
+                    }
+                    (next, st.notify_hwnd)
+                };
+
+                if let Some(cfg) = cfg {
+                    if let Err(err) = cfg.save() {
+                        if let Ok(mut err_guard) = last_error.lock() {
+                            *err_guard = Some(err);
+                        }
+                        if notify_hwnd != 0 {
+                            unsafe {
+                                let hwnd = HWND(notify_hwnd as *mut c_void);
+                                if !hwnd.0.is_null() {
+                                    let _ = PostMessageW(
+                                        hwnd,
+                                        WM_APP_CONFIG_SAVE_ERROR,
+                                        WPARAM(0),
+                                        LPARAM(0),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }) {
+            Ok(h) => *handle_guard = Some(h),
+            Err(err) => {
+                eprintln!("AirMonitor: failed to spawn config-saver thread: {err}");
+                if let Ok(mut inner) = self.signal.0.lock() {
+                    inner.active = false;
+                }
+            }
+        }
+    }
+
+    fn enqueue(&self, cfg: AppConfig) -> Option<String> {
+        let (lock, cvar) = &*self.signal;
+        if let Ok(mut inner) = lock.lock() {
+            if inner.active && !inner.stop {
+                inner.pending = Some(cfg);
+                cvar.notify_one();
+                return None;
+            }
+        }
+        cfg.save().err()
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
+
+    fn shutdown(&self) {
+        {
+            let (lock, cvar) = &*self.signal;
+            if let Ok(mut inner) = lock.lock() {
+                inner.stop = true;
+                cvar.notify_all();
+            }
+        }
+        if let Ok(mut handle_guard) = self.worker.lock() {
+            if let Some(h) = handle_guard.take() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
 /// Lock-light shared snapshot store: writers construct a new `Arc<MonitorSnapshot>`
 /// under a brief write lock and never perform IO or rendering inside any lock;
 /// readers clone the `Arc` and immediately release the read lock.
 #[derive(Clone)]
 pub(crate) struct SnapshotStore {
     inner: Arc<RwLock<VersionedSnapshot>>,
+    saver: Arc<ConfigSaveQueue>,
 }
 
 impl SnapshotStore {
@@ -118,7 +336,24 @@ impl SnapshotStore {
                 wireless_rev: 0,
                 config_rev: 0,
             })),
+            saver: Arc::new(ConfigSaveQueue::new()),
         }
+    }
+
+    pub fn enable_async_saver(&self, notify_hwnd: isize) {
+        self.saver.start(notify_hwnd);
+    }
+
+    pub fn shutdown_saver(&self) {
+        self.saver.shutdown();
+    }
+
+    pub fn enqueue_save(&self, cfg: AppConfig) -> Option<String> {
+        self.saver.enqueue(cfg)
+    }
+
+    pub fn take_save_error(&self) -> Option<String> {
+        self.saver.take_error()
     }
 
     pub fn read_versioned(&self) -> Option<VersionedSnapshot> {
@@ -132,28 +367,38 @@ impl SnapshotStore {
             .map(|guard| Arc::clone(&guard.snapshot))
     }
 
-    pub fn update_hw(&self, hw: HardwareMetrics) {
+    pub fn update_hw(&self, hw: HardwareMetrics) -> bool {
         if let Ok(mut guard) = self.inner.write() {
             let cur = &guard.snapshot;
+            if hw_metrics_eq(&cur.hw, &hw) {
+                return false;
+            }
             guard.snapshot = Arc::new(MonitorSnapshot {
                 hw,
                 devices: cur.devices.clone(),
                 config: cur.config.clone(),
             });
             guard.hw_rev = guard.hw_rev.wrapping_add(1);
+            return true;
         }
+        false
     }
 
-    pub fn update_devices(&self, devices: Vec<WirelessDevice>) {
+    pub fn update_devices(&self, devices: Vec<WirelessDevice>) -> bool {
         if let Ok(mut guard) = self.inner.write() {
             let cur = &guard.snapshot;
+            if wireless_devices_eq(&cur.devices, &devices) {
+                return false;
+            }
             guard.snapshot = Arc::new(MonitorSnapshot {
                 hw: cur.hw.clone(),
                 devices,
                 config: cur.config.clone(),
             });
             guard.wireless_rev = guard.wireless_rev.wrapping_add(1);
+            return true;
         }
+        false
     }
 
     /// Updates `AppConfig` purely in memory under the write lock and returns the
@@ -166,7 +411,7 @@ impl SnapshotStore {
         if let Ok(mut guard) = self.inner.write() {
             let cur = &guard.snapshot;
             let mut next_cfg = cur.config.clone();
-            if f(&mut next_cfg) {
+            if f(&mut next_cfg) && next_cfg != cur.config {
                 guard.snapshot = Arc::new(MonitorSnapshot {
                     hw: cur.hw.clone(),
                     devices: cur.devices.clone(),
@@ -179,14 +424,15 @@ impl SnapshotStore {
         updated
     }
 
-    /// Updates `AppConfig` under the write lock, drops the lock, and then saves
-    /// `config.toml` to disk outside any lock.
+    /// Updates `AppConfig` under the write lock, drops the lock, and then enqueues
+    /// `config.toml` persistence to the serial background queue (or synchronous
+    /// fallback when no async saver is active).
     pub fn update_and_save_config<F>(&self, f: F) -> (bool, Option<String>)
     where
         F: FnOnce(&mut AppConfig) -> bool,
     {
         if let Some(cfg) = self.update_config(f) {
-            (true, cfg.save().err())
+            (true, self.saver.enqueue(cfg))
         } else {
             (false, None)
         }
@@ -230,6 +476,21 @@ impl HwWakeSignal {
             sig.stop = true;
             cvar.notify_all();
         }
+    }
+
+    /// Waits indefinitely until woken or stopped (0 wakeups, 0 CPU when idle).
+    /// Returns `true` if woken, or `false` if stopped.
+    pub fn wait_indefinite(&self) -> bool {
+        let (lock, cvar) = &*self.0;
+        let mut sig = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !sig.stop && !sig.wake {
+            sig = cvar.wait(sig).unwrap_or_else(|e| e.into_inner());
+        }
+        if sig.stop {
+            return false;
+        }
+        sig.wake = false;
+        true
     }
 
     /// Waits up to `dur` for a wake or stop signal.
@@ -309,10 +570,28 @@ impl Drop for ComApartmentGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum WirelessWakeMode {
+    #[default]
+    Normal,
+    DeviceChange,
+    Force,
+}
+
+impl WirelessWakeMode {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Force, _) | (_, Self::Force) => Self::Force,
+            (Self::DeviceChange, _) | (_, Self::DeviceChange) => Self::DeviceChange,
+            (Self::Normal, Self::Normal) => Self::Normal,
+        }
+    }
+}
+
 #[derive(Default)]
 struct WirelessWakeState {
     woken: bool,
-    force_refresh: bool,
+    mode: WirelessWakeMode,
 }
 
 struct UiApp {
@@ -328,8 +607,13 @@ struct UiApp {
     stop_flag: Arc<AtomicBool>,
     hdevnotify: HDEVNOTIFY,
     smoke_test: bool,
-    smoke_steady_start: Option<(Instant, u64)>,
+    smoke_steady_start: Option<(Instant, Option<u64>)>,
     smoke_report: Arc<Mutex<Option<String>>>,
+    hw_worker_ok: bool,
+    wireless_worker_ok: bool,
+    hw_samples: Arc<AtomicU64>,
+    last_wireless_enabled: bool,
+    last_hid_poll_secs: u64,
     geom_settle_timer_active: bool,
 }
 
@@ -363,12 +647,15 @@ impl UiApp {
         }
     }
 
-    fn refresh_bars(&mut self) {
+    fn refresh_bars(&mut self) -> Vec<BarWindowOp> {
         self.ensure_bars_alive();
-        if let Some(vs) = self.state.read_versioned() {
-            self.taskbar.update_bars(&vs, self.host_hwnd);
-        }
+        let ops = if let Some(vs) = self.state.read_versioned() {
+            self.taskbar.update_bars(&vs, self.host_hwnd)
+        } else {
+            Vec::new()
+        };
         self.sync_geom_settle_timer();
+        ops
     }
 
     fn sync_geom_settle_timer(&mut self) {
@@ -386,13 +673,32 @@ impl UiApp {
         }
     }
 
-    fn wake_wireless_worker(&self, force_refresh: bool) {
+    fn is_wireless_enabled(&self) -> bool {
+        self.state
+            .read_snapshot()
+            .is_some_and(|s| s.config.wireless_enabled)
+    }
+
+    fn sync_workers_on_config_change(&mut self) {
+        self.hw_signal.wake();
+        if let Some(snap) = self.state.read_snapshot() {
+            let wl_enabled = snap.config.wireless_enabled;
+            let poll_secs = snap.config.hid_poll_interval_secs;
+            if wl_enabled != self.last_wireless_enabled
+                || (wl_enabled && poll_secs != self.last_hid_poll_secs)
+            {
+                self.last_wireless_enabled = wl_enabled;
+                self.last_hid_poll_secs = poll_secs;
+                self.wake_wireless_worker(WirelessWakeMode::Normal);
+            }
+        }
+    }
+
+    fn wake_wireless_worker(&self, mode: WirelessWakeMode) {
         let (lock, cvar) = &*self.wireless_wake;
         if let Ok(mut st) = lock.lock() {
             st.woken = true;
-            if force_refresh {
-                st.force_refresh = true;
-            }
+            st.mode = st.mode.merge(mode);
             cvar.notify_all();
         }
     }
@@ -412,7 +718,7 @@ impl UiApp {
         }
         self.stop_flag.store(true, Ordering::Release);
         self.hw_signal.stop();
-        self.wake_wireless_worker(false);
+        self.wake_wireless_worker(WirelessWakeMode::Normal);
         unsafe {
             let _ = KillTimer(self.host_hwnd, TIMER_ZORDER_CHECK);
             let _ = KillTimer(self.host_hwnd, TIMER_DEVICE_DEBOUNCE);
@@ -456,11 +762,15 @@ pub fn run(smoke_test: bool) -> i32 {
         config.autostart = reg_autostart;
     }
 
+    let initial_wireless_enabled = config.wireless_enabled;
+    let initial_hid_poll_secs = config.hid_poll_interval_secs;
     let shared_state = SnapshotStore::new(config);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let hw_signal = HwWakeSignal::new();
     let popup_open = Arc::new(AtomicBool::new(false));
+    let popup_overview_open = Arc::new(AtomicBool::new(false));
     let wireless_wake = Arc::new((Mutex::new(WirelessWakeState::default()), Condvar::new()));
+    let hw_samples = Arc::new(AtomicU64::new(0));
 
     let hinstance: HINSTANCE = unsafe {
         match GetModuleHandleW(None) {
@@ -502,11 +812,12 @@ pub fn run(smoke_test: bool) -> i32 {
         }
     };
 
-    let popup = match PopupManager::new(
+    let popup = match PopupManager::new_with_overview(
         hinstance,
         host_hwnd,
         shared_state.clone(),
         Arc::clone(&popup_open),
+        Arc::clone(&popup_overview_open),
         hw_signal.clone(),
     ) {
         Ok(p) => p,
@@ -540,16 +851,33 @@ pub fn run(smoke_test: bool) -> i32 {
         smoke_test,
         smoke_steady_start: None,
         smoke_report: Arc::clone(&smoke_report),
+        hw_worker_ok: false,
+        wireless_worker_ok: false,
+        hw_samples: Arc::clone(&hw_samples),
+        last_wireless_enabled: initial_wireless_enabled,
+        last_hid_poll_secs: initial_hid_poll_secs,
         geom_settle_timer_active: false,
     }));
 
     let app_cell_ptr: *const RefCell<UiApp> = &*app;
-    {
+    let init_ops = {
         let mut guard = app.borrow_mut();
         guard.self_cell_ptr = app_cell_ptr as isize;
-        guard.refresh_bars();
-    }
+        let ops = guard.refresh_bars();
+        if let Some(snap) = guard.state.read_snapshot() {
+            guard.tray.update_tooltip(&snap);
+        }
+        ops
+    };
+    execute_bar_window_ops(&init_ops);
     trim_working_set();
+
+    // Post-update staged file cleanup runs only after acquiring the single-instance mutex
+    // and completing host/tray/taskbar/popup initialization.
+    if !smoke_test {
+        crate::updater::cleanup_post_update_files();
+        shared_state.enable_async_saver(host_hwnd.0 as isize);
+    }
 
     unsafe {
         SetWindowLongPtrW(host_hwnd, GWLP_USERDATA, app_cell_ptr as isize);
@@ -560,19 +888,71 @@ pub fn run(smoke_test: bool) -> i32 {
         let _ = SetTimer(host_hwnd, TIMER_STARTUP_TRIM, STARTUP_TRIM_MS, None);
     }
 
-    let hw_thread = spawn_hw_worker(
+    let hw_thread = match spawn_hw_worker(
         shared_state.clone(),
         Arc::clone(&stop_flag),
         hw_signal.clone(),
-        Arc::clone(&popup_open),
+        Arc::clone(&popup_overview_open),
+        Arc::clone(&hw_samples),
         host_hwnd.0 as isize,
-    );
-    let wireless_thread = spawn_wireless_worker(
+    ) {
+        Ok(h) => {
+            app.borrow_mut().hw_worker_ok = true;
+            Some(h)
+        }
+        Err(err) => {
+            eprintln!("AirMonitor: failed to spawn hw-worker: {err}");
+            None
+        }
+    };
+    let wireless_thread = match spawn_wireless_worker(
         shared_state.clone(),
         Arc::clone(&stop_flag),
         Arc::clone(&wireless_wake),
         host_hwnd.0 as isize,
-    );
+    ) {
+        Ok(h) => {
+            app.borrow_mut().wireless_worker_ok = true;
+            Some(h)
+        }
+        Err(err) => {
+            eprintln!("AirMonitor: failed to spawn wireless-worker: {err}");
+            None
+        }
+    };
+
+    if hw_thread.is_none() || wireless_thread.is_none() {
+        stop_flag.store(true, Ordering::Release);
+        hw_signal.stop();
+        {
+            let (lock, cvar) = &*wireless_wake;
+            if let Ok(mut st) = lock.lock() {
+                st.woken = true;
+                cvar.notify_all();
+            }
+        }
+        join_workers_with_timeout(hw_thread, wireless_thread, Duration::from_millis(1500));
+        shared_state.shutdown_saver();
+        let popup_rc = {
+            let mut guard = app.borrow_mut();
+            guard.prepare_quit()
+        };
+        PopupManager::destroy(&popup_rc);
+        unsafe {
+            SetWindowLongPtrW(host_hwnd, GWLP_USERDATA, 0);
+            for bar_hwnd in [primary_hwnd, secondary_hwnd] {
+                if !bar_hwnd.0.is_null() && IsWindow(bar_hwnd).as_bool() {
+                    SetWindowLongPtrW(bar_hwnd, GWLP_USERDATA, 0);
+                    let _ = DestroyWindow(bar_hwnd);
+                }
+            }
+            if !host_hwnd.0.is_null() && IsWindow(host_hwnd).as_bool() {
+                let _ = DestroyWindow(host_hwnd);
+            }
+        }
+        drop(app);
+        return 1;
+    }
 
     unsafe {
         let mut msg = MSG::default();
@@ -593,6 +973,7 @@ pub fn run(smoke_test: bool) -> i32 {
     }
 
     join_workers_with_timeout(hw_thread, wireless_thread, Duration::from_millis(1500));
+    shared_state.shutdown_saver();
 
     let (cur_primary, cur_secondary, popup_rc) = {
         let guard = app.borrow();
@@ -661,62 +1042,92 @@ fn join_workers_with_timeout(
     }
 }
 
+fn read_hw_demand(state: &SnapshotStore, is_overview_open: bool) -> (u64, HardwareDemand) {
+    state
+        .read_snapshot()
+        .map(|s| {
+            (
+                s.config.hw_poll_interval_ms.clamp(500, 5000),
+                HardwareDemand::from_config_with_mode(
+                    &s.config,
+                    s.config.hardware_enabled,
+                    is_overview_open,
+                ),
+            )
+        })
+        .unwrap_or_else(|| {
+            let fallback_cfg = AppConfig::default();
+            (
+                fallback_cfg.hw_poll_interval_ms.clamp(500, 5000),
+                HardwareDemand::from_config_with_mode(
+                    &fallback_cfg,
+                    fallback_cfg.hardware_enabled,
+                    is_overview_open,
+                ),
+            )
+        })
+}
+
 fn spawn_hw_worker(
     state: SnapshotStore,
     stop_flag: Arc<AtomicBool>,
     hw_signal: HwWakeSignal,
-    popup_open: Arc<AtomicBool>,
+    popup_overview_open: Arc<AtomicBool>,
+    hw_samples: Arc<AtomicU64>,
     host_hwnd_raw: isize,
-) -> Option<thread::JoinHandle<()>> {
+) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("hw-worker".to_string())
         .spawn(move || {
             let mut collector = HardwareCollector::new_lazy();
-            let sample_once = |collector: &mut HardwareCollector| {
-                let is_popup_open = popup_open.load(Ordering::Acquire);
-                let (poll_ms, demand) = state
-                    .read_snapshot()
-                    .map(|s| {
-                        (
-                            s.config.hw_poll_interval_ms.clamp(500, 5000),
-                            HardwareDemand::from_config(&s.config, is_popup_open),
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        let fallback_cfg = AppConfig::default();
-                        (
-                            fallback_cfg.hw_poll_interval_ms.clamp(500, 5000),
-                            HardwareDemand::from_config(&fallback_cfg, is_popup_open),
-                        )
-                    });
+            let mut was_idle = true;
+
+            while !stop_flag.load(Ordering::Acquire) {
+                let is_overview_open = popup_overview_open.load(Ordering::Acquire);
+                let (poll_ms, demand) = read_hw_demand(&state, is_overview_open);
+
+                if demand.is_empty() {
+                    let released = collector.release_all();
+                    let published = state.update_hw(HardwareMetrics::unavailable());
+                    if published {
+                        post_hw_update(host_hwnd_raw);
+                    }
+                    if released || published || !was_idle {
+                        trim_working_set();
+                    }
+                    was_idle = true;
+                    if !hw_signal.wait_indefinite() {
+                        break;
+                    }
+                    continue;
+                }
 
                 let (sample, released_idle) = collector.sample_with_demand(demand);
-                state.update_hw(sample);
-                post_hw_update(host_hwnd_raw);
+                hw_samples.fetch_add(1, Ordering::Relaxed);
+                if state.update_hw(sample) {
+                    post_hw_update(host_hwnd_raw);
+                }
                 if released_idle {
                     trim_working_set();
                 }
-                poll_ms
-            };
 
-            // Warm up initial delta sample, then wait 350ms for a clean initial reading
-            // (waking immediately if the popup opens or config changes, or exiting if stopped).
-            let _ = sample_once(&mut collector);
-            if !hw_signal.wait_timeout(Duration::from_millis(350)) {
-                return;
-            }
-
-            while !stop_flag.load(Ordering::Acquire) {
-                let poll_ms = sample_once(&mut collector);
                 if stop_flag.load(Ordering::Acquire) {
                     break;
                 }
-                if !hw_signal.wait_timeout(Duration::from_millis(poll_ms)) {
+
+                let wait_dur = if was_idle {
+                    // Warm up initial delta sample cleanly after startup or idle wake.
+                    was_idle = false;
+                    Duration::from_millis(350.min(poll_ms))
+                } else {
+                    Duration::from_millis(poll_ms)
+                };
+                if !hw_signal.wait_timeout(wait_dur) {
                     break;
                 }
             }
+            let _ = collector.release_all();
         })
-        .ok()
 }
 
 fn has_pending_passive_telemetry(devices: &[crate::state::WirelessDevice]) -> bool {
@@ -734,28 +1145,64 @@ fn spawn_wireless_worker(
     stop_flag: Arc<AtomicBool>,
     wake_sig: Arc<(Mutex<WirelessWakeState>, Condvar)>,
     host_hwnd_raw: isize,
-) -> Option<thread::JoinHandle<()>> {
+) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("wireless-worker".to_string())
         .spawn(move || {
-            let mut mgr = WirelessManager::with_stop_flag(Arc::clone(&stop_flag));
+            let mut mgr: Option<WirelessManager> = None;
             let mut passive_fast_retries: u8 = 0;
-            let mut next_force = false;
-            while !stop_flag.load(Ordering::Relaxed) {
-                let devices = if next_force {
-                    mgr.poll_once_force()
-                } else {
-                    mgr.poll_once()
-                };
-                next_force = false;
-                let awaiting_passive = has_pending_passive_telemetry(&devices);
-                state.update_devices(devices);
-                post_wireless_update(host_hwnd_raw);
+            let mut next_mode = WirelessWakeMode::Normal;
+            let mut was_disabled = false;
 
-                let poll_secs = state
+            while !stop_flag.load(Ordering::Relaxed) {
+                let (wireless_enabled, poll_secs) = state
                     .read_snapshot()
-                    .map(|s| s.config.hid_poll_interval_secs.clamp(10, 600))
-                    .unwrap_or(45);
+                    .map(|s| {
+                        (
+                            s.config.wireless_enabled,
+                            s.config.hid_poll_interval_secs.clamp(10, 600),
+                        )
+                    })
+                    .unwrap_or((true, 45));
+
+                if !wireless_enabled {
+                    let dropped = mgr.take().is_some();
+                    passive_fast_retries = 0;
+                    next_mode = WirelessWakeMode::Normal;
+                    let cleared = state.update_devices(Vec::new());
+                    if cleared {
+                        post_wireless_update(host_hwnd_raw);
+                    }
+                    if dropped || cleared || !was_disabled {
+                        trim_working_set();
+                    }
+                    was_disabled = true;
+
+                    let (lock, cvar) = &*wake_sig;
+                    if let Ok(mut st) = lock.lock() {
+                        while !st.woken && !stop_flag.load(Ordering::Relaxed) {
+                            st = cvar.wait(st).unwrap_or_else(|e| e.into_inner());
+                        }
+                        next_mode = st.mode;
+                        st.woken = false;
+                        st.mode = WirelessWakeMode::Normal;
+                    }
+                    continue;
+                }
+
+                was_disabled = false;
+                let active_mgr = mgr
+                    .get_or_insert_with(|| WirelessManager::with_stop_flag(Arc::clone(&stop_flag)));
+                let devices = match next_mode {
+                    WirelessWakeMode::Normal => active_mgr.poll_once(),
+                    WirelessWakeMode::DeviceChange => active_mgr.poll_once_device_change(),
+                    WirelessWakeMode::Force => active_mgr.poll_once_force(),
+                };
+                next_mode = WirelessWakeMode::Normal;
+                let awaiting_passive = has_pending_passive_telemetry(&devices);
+                if state.update_devices(devices) {
+                    post_wireless_update(host_hwnd_raw);
+                }
 
                 let wait_secs =
                     if awaiting_passive && passive_fast_retries < MAX_PASSIVE_FAST_RETRIES {
@@ -776,13 +1223,13 @@ fn spawn_wireless_worker(
                             .unwrap_or_else(|e| e.into_inner());
                         st = guard;
                     }
-                    next_force = st.force_refresh;
+                    next_mode = st.mode;
                     st.woken = false;
-                    st.force_refresh = false;
+                    st.mode = WirelessWakeMode::Normal;
                 }
             }
+            drop(mgr);
         })
-        .ok()
 }
 
 fn post_hw_update(host_hwnd_raw: isize) {
@@ -941,13 +1388,17 @@ unsafe fn run_context_menu(
         MenuAction::None => {}
         MenuAction::ConfigChanged => {
             if let Ok(mut app) = app_cell.try_borrow_mut() {
-                app.hw_signal.wake();
-                app.refresh_bars();
+                app.sync_workers_on_config_change();
+                let bar_ops = app.refresh_bars();
                 if let Some(vs) = app.state.read_versioned() {
                     app.tray.update_tooltip(&vs.snapshot);
                     let popup = Rc::clone(&app.popup);
                     drop(app);
+                    execute_bar_window_ops(&bar_ops);
                     PopupManager::refresh_if_visible(&popup, &vs);
+                } else {
+                    drop(app);
+                    execute_bar_window_ops(&bar_ops);
                 }
             } else {
                 let _ = PostMessageW(host_hwnd, WM_APP_CONFIG_CHANGED, WPARAM(0), LPARAM(0));
@@ -955,7 +1406,9 @@ unsafe fn run_context_menu(
         }
         MenuAction::RefreshWireless => {
             if let Ok(app) = app_cell.try_borrow() {
-                app.wake_wireless_worker(true);
+                if app.is_wireless_enabled() {
+                    app.wake_wireless_worker(WirelessWakeMode::Force);
+                }
             } else {
                 let _ = PostMessageW(host_hwnd, WM_APP_REFRESH_WIRELESS, WPARAM(0), LPARAM(0));
             }
@@ -990,6 +1443,17 @@ unsafe fn run_context_menu(
     }
 }
 
+unsafe fn host_is_wireless_enabled(hwnd: HWND) -> bool {
+    let Some(app_cell) = get_app_cell(hwnd) else {
+        return true;
+    };
+    if let Ok(app) = app_cell.try_borrow() {
+        app.is_wireless_enabled()
+    } else {
+        true
+    }
+}
+
 unsafe extern "system" fn host_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -998,9 +1462,10 @@ unsafe extern "system" fn host_wnd_proc(
 ) -> LRESULT {
     if msg == WM_DEVICECHANGE {
         let evt = wparam.0 as u32;
-        if evt == DBT_DEVICEARRIVAL
+        if (evt == DBT_DEVICEARRIVAL
             || evt == DBT_DEVICEREMOVECOMPLETE
-            || evt == DBT_DEVNODES_CHANGED
+            || evt == DBT_DEVNODES_CHANGED)
+            && host_is_wireless_enabled(hwnd)
         {
             let _ = SetTimer(hwnd, TIMER_DEVICE_DEBOUNCE, DEVICE_DEBOUNCE_MS, None);
         }
@@ -1008,7 +1473,9 @@ unsafe extern "system" fn host_wnd_proc(
     }
     if msg == WM_POWERBROADCAST {
         let evt = wparam.0 as u32;
-        if evt == PBT_APMRESUMEAUTOMATIC || evt == PBT_APMRESUMESUSPEND {
+        if (evt == PBT_APMRESUMEAUTOMATIC || evt == PBT_APMRESUMESUSPEND)
+            && host_is_wireless_enabled(hwnd)
+        {
             let _ = SetTimer(hwnd, TIMER_DEVICE_DEBOUNCE, DEVICE_DEBOUNCE_MS, None);
         }
         return LRESULT(1);
@@ -1044,6 +1511,8 @@ unsafe extern "system" fn host_wnd_proc(
                 | WM_APP_WIRELESS_UPDATE
                 | WM_APP_CONFIG_CHANGED
                 | WM_APP_REFRESH_WIRELESS
+                | WM_APP_DEVICE_CHANGE_WIRELESS
+                | WM_APP_CONFIG_SAVE_ERROR
                 | WM_APP_UPDATE_STATUS
                 | WM_APP_UPDATE_RESTART
                 | WM_APP_DEFERRED_SETTINGCHANGE
@@ -1076,13 +1545,21 @@ unsafe extern "system" fn host_wnd_proc(
                         TIMER_DEVICE_DEBOUNCE => {
                             let _ = KillTimer(hwnd, TIMER_DEVICE_DEBOUNCE);
                             let _ = SetTimer(hwnd, TIMER_DEVICE_FOLLOWUP, DEVICE_FOLLOWUP_MS, None);
-                            let _ =
-                                PostMessageW(hwnd, WM_APP_REFRESH_WIRELESS, WPARAM(0), LPARAM(0));
+                            let _ = PostMessageW(
+                                hwnd,
+                                WM_APP_DEVICE_CHANGE_WIRELESS,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
                         }
                         TIMER_DEVICE_FOLLOWUP => {
                             let _ = KillTimer(hwnd, TIMER_DEVICE_FOLLOWUP);
-                            let _ =
-                                PostMessageW(hwnd, WM_APP_REFRESH_WIRELESS, WPARAM(0), LPARAM(0));
+                            let _ = PostMessageW(
+                                hwnd,
+                                WM_APP_DEVICE_CHANGE_WIRELESS,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
                         }
                         TIMER_SMOKE_TEST => {
                             let _ = KillTimer(hwnd, TIMER_SMOKE_TEST);
@@ -1109,7 +1586,7 @@ unsafe extern "system" fn host_wnd_proc(
 
     if is_taskbar_created {
         app.ensure_bars_alive();
-        app.refresh_bars();
+        let bar_ops = app.refresh_bars();
         if let Some(geom) = find_taskbar_geometry() {
             app.tray.refresh_icon_for_dpi(geom.dpi);
         }
@@ -1119,6 +1596,8 @@ unsafe extern "system" fn host_wnd_proc(
                 app.tray.update_tooltip(&snap);
             }
         }
+        drop(app_guard);
+        execute_bar_window_ops(&bar_ops);
         return LRESULT(0);
     }
 
@@ -1126,11 +1605,12 @@ unsafe extern "system" fn host_wnd_proc(
         WM_APP_HW_UPDATE => {
             app.ensure_bars_alive();
             if let Some(vs) = app.state.read_versioned() {
-                app.taskbar.update_bars(&vs, app.host_hwnd);
+                let bar_ops = app.taskbar.update_bars(&vs, app.host_hwnd);
                 app.sync_geom_settle_timer();
                 app.tray.update_tooltip(&vs.snapshot);
                 let popup = Rc::clone(&app.popup);
                 drop(app_guard);
+                execute_bar_window_ops(&bar_ops);
                 PopupManager::refresh_if_visible(&popup, &vs);
             }
             return LRESULT(0);
@@ -1138,32 +1618,51 @@ unsafe extern "system" fn host_wnd_proc(
         WM_APP_WIRELESS_UPDATE => {
             app.ensure_bars_alive();
             if let Some(vs) = app.state.read_versioned() {
-                app.taskbar.update_bars(&vs, app.host_hwnd);
+                let bar_ops = app.taskbar.update_bars(&vs, app.host_hwnd);
                 app.sync_geom_settle_timer();
                 app.tray.update_tooltip(&vs.snapshot);
                 app.tray.check_low_battery_alerts(&vs.snapshot);
                 let popup = Rc::clone(&app.popup);
                 drop(app_guard);
+                execute_bar_window_ops(&bar_ops);
                 PopupManager::refresh_if_visible(&popup, &vs);
             }
             return LRESULT(0);
         }
         WM_APP_CONFIG_CHANGED => {
-            app.hw_signal.wake();
+            app.sync_workers_on_config_change();
             let popup = Rc::clone(&app.popup);
             if let Some(err) = PopupManager::take_save_error(&popup) {
                 app.tray.notify_save_error(&err);
             }
-            app.refresh_bars();
+            let bar_ops = app.refresh_bars();
             if let Some(vs) = app.state.read_versioned() {
                 app.tray.update_tooltip(&vs.snapshot);
                 drop(app_guard);
+                execute_bar_window_ops(&bar_ops);
                 PopupManager::refresh_if_visible(&popup, &vs);
+            } else {
+                drop(app_guard);
+                execute_bar_window_ops(&bar_ops);
+            }
+            return LRESULT(0);
+        }
+        WM_APP_CONFIG_SAVE_ERROR => {
+            if let Some(err) = app.state.take_save_error() {
+                app.tray.notify_save_error(&err);
             }
             return LRESULT(0);
         }
         WM_APP_REFRESH_WIRELESS => {
-            app.wake_wireless_worker(true);
+            if app.is_wireless_enabled() {
+                app.wake_wireless_worker(WirelessWakeMode::Force);
+            }
+            return LRESULT(0);
+        }
+        WM_APP_DEVICE_CHANGE_WIRELESS => {
+            if app.is_wireless_enabled() {
+                app.wake_wireless_worker(WirelessWakeMode::DeviceChange);
+            }
             return LRESULT(0);
         }
         WM_APP_UPDATE_STATUS => {
@@ -1235,10 +1734,11 @@ unsafe extern "system" fn host_wnd_proc(
         }
         WM_SETTINGCHANGE | WM_APP_DEFERRED_SETTINGCHANGE => {
             app.taskbar.refresh_theme();
-            app.refresh_bars();
+            let bar_ops = app.refresh_bars();
             let vs = app.state.read_versioned();
             let popup = Rc::clone(&app.popup);
             drop(app_guard);
+            execute_bar_window_ops(&bar_ops);
             PopupManager::refresh_theme(&popup, vs.as_ref());
             return LRESULT(0);
         }
@@ -1251,7 +1751,9 @@ unsafe extern "system" fn host_wnd_proc(
             if dpi > 0 {
                 app.tray.refresh_icon_for_dpi(dpi);
             }
-            app.refresh_bars();
+            let bar_ops = app.refresh_bars();
+            drop(app_guard);
+            execute_bar_window_ops(&bar_ops);
             return LRESULT(0);
         }
         WM_APP_DEFERRED_ZORDER_CHECK => {
@@ -1261,12 +1763,15 @@ unsafe extern "system" fn host_wnd_proc(
                 }
             }
             app.ensure_bars_alive();
-            if let Some(vs) = app.state.read_versioned() {
-                app.taskbar.check_tick(&vs, app.host_hwnd);
-            }
+            let bar_ops = if let Some(vs) = app.state.read_versioned() {
+                app.taskbar.check_tick(&vs, app.host_hwnd)
+            } else {
+                Vec::new()
+            };
             app.sync_geom_settle_timer();
             let popup = Rc::clone(&app.popup);
             drop(app_guard);
+            execute_bar_window_ops(&bar_ops);
             PopupManager::hide_if_lost_focus(&popup);
             return LRESULT(0);
         }
@@ -1274,6 +1779,9 @@ unsafe extern "system" fn host_wnd_proc(
             let line = build_smoke_report(
                 &app.state,
                 app.smoke_steady_start,
+                app.hw_worker_ok,
+                app.wireless_worker_ok,
+                app.hw_samples.load(Ordering::Relaxed),
                 &app.taskbar.bar_diagnostic_summary(),
             );
             if let Ok(mut guard) = app.smoke_report.lock() {
@@ -1293,21 +1801,28 @@ unsafe extern "system" fn host_wnd_proc(
                         }
                     }
                     app.ensure_bars_alive();
-                    if let Some(vs) = app.state.read_versioned() {
-                        app.taskbar.check_tick(&vs, app.host_hwnd);
-                    }
+                    let bar_ops = if let Some(vs) = app.state.read_versioned() {
+                        app.taskbar.check_tick(&vs, app.host_hwnd)
+                    } else {
+                        Vec::new()
+                    };
                     app.sync_geom_settle_timer();
                     let popup = Rc::clone(&app.popup);
                     drop(app_guard);
+                    execute_bar_window_ops(&bar_ops);
                     PopupManager::hide_if_lost_focus(&popup);
                     return LRESULT(0);
                 }
                 TIMER_GEOM_SETTLE => {
                     app.ensure_bars_alive();
-                    if let Some(vs) = app.state.read_versioned() {
-                        app.taskbar.check_tick(&vs, app.host_hwnd);
-                    }
+                    let bar_ops = if let Some(vs) = app.state.read_versioned() {
+                        app.taskbar.check_tick(&vs, app.host_hwnd)
+                    } else {
+                        Vec::new()
+                    };
                     app.sync_geom_settle_timer();
+                    drop(app_guard);
+                    execute_bar_window_ops(&bar_ops);
                     return LRESULT(0);
                 }
                 TIMER_STARTUP_TRIM => {
@@ -1320,18 +1835,25 @@ unsafe extern "system" fn host_wnd_proc(
                 }
                 TIMER_DEVICE_DEBOUNCE => {
                     let _ = KillTimer(hwnd, TIMER_DEVICE_DEBOUNCE);
-                    let _ = SetTimer(hwnd, TIMER_DEVICE_FOLLOWUP, DEVICE_FOLLOWUP_MS, None);
-                    app.wake_wireless_worker(true);
+                    if app.is_wireless_enabled() {
+                        let _ = SetTimer(hwnd, TIMER_DEVICE_FOLLOWUP, DEVICE_FOLLOWUP_MS, None);
+                        app.wake_wireless_worker(WirelessWakeMode::DeviceChange);
+                    }
                 }
                 TIMER_DEVICE_FOLLOWUP => {
                     let _ = KillTimer(hwnd, TIMER_DEVICE_FOLLOWUP);
-                    app.wake_wireless_worker(true);
+                    if app.is_wireless_enabled() {
+                        app.wake_wireless_worker(WirelessWakeMode::DeviceChange);
+                    }
                 }
                 TIMER_SMOKE_TEST => {
                     let _ = KillTimer(hwnd, TIMER_SMOKE_TEST);
                     let line = build_smoke_report(
                         &app.state,
                         app.smoke_steady_start,
+                        app.hw_worker_ok,
+                        app.wireless_worker_ok,
+                        app.hw_samples.load(Ordering::Relaxed),
                         &app.taskbar.bar_diagnostic_summary(),
                     );
                     if let Ok(mut guard) = app.smoke_report.lock() {
@@ -1400,12 +1922,15 @@ unsafe extern "system" fn bar_wnd_proc(
             if (wparam.0 & MK_CONTROL) != 0 {
                 let snap = app.state.read_snapshot();
                 if let Some(s) = snap {
-                    let is_devices_zone = match s.config.layout_mode {
+                    let Some(eff_mode) = s.config.effective_layout_mode() else {
+                        return LRESULT(0);
+                    };
+                    let is_devices_zone = match eff_mode {
                         LayoutMode::Combined | LayoutMode::HardwareOnly => false,
                         LayoutMode::DevicesOnly => true,
                         LayoutMode::Split => hwnd == app.taskbar.secondary_hwnd,
                     };
-                    let zone = match (s.config.layout_mode, is_devices_zone) {
+                    let zone = match (eff_mode, is_devices_zone) {
                         (LayoutMode::Combined, _) => &s.config.combined_zone,
                         (LayoutMode::HardwareOnly, _) | (LayoutMode::Split, false) => {
                             &s.config.hardware_zone
@@ -1451,7 +1976,10 @@ unsafe extern "system" fn bar_wnd_proc(
                                 .clamp(0, crate::config::MAX_OFFSET_X),
                         };
                         let changed = app.state.update_config(|cfg| {
-                            let target = match (cfg.layout_mode, drag.is_devices_zone) {
+                            let Some(eff_mode) = cfg.effective_layout_mode() else {
+                                return false;
+                            };
+                            let target = match (eff_mode, drag.is_devices_zone) {
                                 (LayoutMode::Combined, _) => &mut cfg.combined_zone.offset_x,
                                 (LayoutMode::HardwareOnly, _) | (LayoutMode::Split, false) => {
                                     &mut cfg.hardware_zone.offset_x
@@ -1468,7 +1996,9 @@ unsafe extern "system" fn bar_wnd_proc(
                             }
                         });
                         if changed.is_some() {
-                            app.refresh_bars();
+                            let bar_ops = app.refresh_bars();
+                            drop(app_guard);
+                            execute_bar_window_ops(&bar_ops);
                         }
                     }
                     return LRESULT(0);
@@ -1487,8 +2017,9 @@ unsafe extern "system" fn bar_wnd_proc(
                 } else {
                     app.taskbar.secondary_hovered = true;
                 }
-                app.refresh_bars();
+                let bar_ops = app.refresh_bars();
                 drop(app_guard);
+                execute_bar_window_ops(&bar_ops);
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -1512,7 +2043,9 @@ unsafe extern "system" fn bar_wnd_proc(
                 false
             };
             if changed {
-                app.refresh_bars();
+                let bar_ops = app.refresh_bars();
+                drop(app_guard);
+                execute_bar_window_ops(&bar_ops);
             }
             return LRESULT(0);
         }
@@ -1535,7 +2068,7 @@ unsafe extern "system" fn bar_wnd_proc(
                     let _ = ReleaseCapture();
                 }
                 if let Some(snap) = state.read_snapshot() {
-                    if let Err(err) = snap.config.save() {
+                    if let Some(err) = state.enqueue_save(snap.config.clone()) {
                         if let Ok(mut app) = app_cell.try_borrow_mut() {
                             app.tray.notify_save_error(&err);
                         }
@@ -1616,7 +2149,7 @@ fn filetime_to_u64(ft: FILETIME) -> u64 {
     ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
 }
 
-fn query_process_cpu_100ns() -> u64 {
+fn query_process_cpu_100ns() -> Option<u64> {
     unsafe {
         let mut creation = FILETIME::default();
         let mut exit = FILETIME::default();
@@ -1631,40 +2164,56 @@ fn query_process_cpu_100ns() -> u64 {
         )
         .is_ok()
         {
-            filetime_to_u64(kernel).saturating_add(filetime_to_u64(user))
+            Some(filetime_to_u64(kernel).saturating_add(filetime_to_u64(user)))
         } else {
-            0
+            None
         }
     }
 }
 
 fn build_smoke_report(
     state: &SnapshotStore,
-    steady_start: Option<(Instant, u64)>,
+    steady_start: Option<(Instant, Option<u64>)>,
+    hw_worker_ok: bool,
+    wireless_worker_ok: bool,
+    hw_samples: u64,
     bar_diag: &str,
 ) -> String {
     let mem_str = match query_process_memory_mb() {
-        Some((ws, priv_mb)) => format!("WorkingSet={:.2} MB | PrivateBytes={:.2} MB", ws, priv_mb),
-        None => "WorkingSet=N/A | PrivateBytes=N/A".to_string(),
+        Some((ws, priv_mb)) => format!(
+            "Memory=ok | WorkingSet={:.2} MB | PrivateBytes={:.2} MB",
+            ws, priv_mb
+        ),
+        None => "Memory=err | WorkingSet=N/A | PrivateBytes=N/A".to_string(),
     };
-    let cpu_idle_str = match steady_start {
-        Some((start_t, start_cpu)) => {
-            let elapsed = start_t.elapsed().as_secs_f64().max(0.001);
-            let end_cpu = query_process_cpu_100ns();
-            let delta_secs = end_cpu.saturating_sub(start_cpu) as f64 / 10_000_000.0;
-            let logical_cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1) as f64;
-            let pct = (delta_secs / (elapsed * logical_cpus)) * 100.0;
-            format!("{:.2}%", pct)
+    let (cpu_times_ok, cpu_idle_str) = match steady_start {
+        Some((start_t, Some(start_cpu))) => {
+            if let Some(end_cpu) = query_process_cpu_100ns() {
+                let elapsed = start_t.elapsed().as_secs_f64().max(0.001);
+                let delta_secs = end_cpu.saturating_sub(start_cpu) as f64 / 10_000_000.0;
+                let logical_cpus = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1) as f64;
+                let pct = (delta_secs / (elapsed * logical_cpus)) * 100.0;
+                (true, format!("{:.2}%", pct))
+            } else {
+                (false, "N/A".to_string())
+            }
         }
-        None => "N/A".to_string(),
+        _ => (false, "N/A".to_string()),
     };
+    let hw_w = if hw_worker_ok { "ok" } else { "err" };
+    let wl_w = if wireless_worker_ok { "ok" } else { "err" };
+    let cpu_t = if cpu_times_ok { "ok" } else { "err" };
     if let Some(snap) = state.read_snapshot() {
         format!(
-            "AirMonitor smoke test OK | {} | IdleCpuPct={} | CPU={:.1}% MEM={:.1}% | Devices={} | {}",
+            "AirMonitor smoke test OK | {} | CpuTimes={} | IdleCpuPct={} | HwWorker={} | WirelessWorker={} | HwSamples={} | CPU={:.1}% MEM={:.1}% | Devices={} | {}",
             mem_str,
+            cpu_t,
             cpu_idle_str,
+            hw_w,
+            wl_w,
+            hw_samples,
             snap.hw.cpu_usage_pct,
             snap.hw.mem_usage_pct,
             snap.devices.len(),
@@ -1672,8 +2221,8 @@ fn build_smoke_report(
         )
     } else {
         format!(
-            "AirMonitor smoke test OK | {} | IdleCpuPct={} | {}",
-            mem_str, cpu_idle_str, bar_diag
+            "AirMonitor smoke test OK | {} | CpuTimes={} | IdleCpuPct={} | HwWorker={} | WirelessWorker={} | HwSamples={} | {}",
+            mem_str, cpu_t, cpu_idle_str, hw_w, wl_w, hw_samples, bar_diag
         )
     }
 }
@@ -1801,5 +2350,78 @@ mod tests {
             true,
             Some("Rapoo (awaiting telemetry frame)"),
         )]));
+    }
+
+    #[test]
+    fn snapshot_store_skips_redundant_revisions_and_ignores_last_seen_only_changes() {
+        let store = SnapshotStore::new(AppConfig::default());
+        let hw1 = HardwareMetrics {
+            cpu_usage_pct: 15.0,
+            ..Default::default()
+        };
+        assert!(store.update_hw(hw1.clone()));
+        assert!(!store.update_hw(hw1));
+        assert_eq!(store.read_versioned().unwrap().hw_rev, 1);
+
+        let t0 = Instant::now();
+        let dev0 = WirelessDevice {
+            id: "d1".into(),
+            name: "Mouse".into(),
+            kind: DeviceKind::Mouse,
+            transport: Transport::Wireless24G,
+            battery_pct: Some(80),
+            charging: false,
+            sub_batteries: None,
+            online: true,
+            last_seen: t0,
+            detail_note: None,
+        };
+        assert!(store.update_devices(vec![dev0.clone()]));
+        let dev_later = WirelessDevice {
+            last_seen: t0 + Duration::from_secs(45),
+            ..dev0
+        };
+        assert!(!store.update_devices(vec![dev_later]));
+        assert_eq!(store.read_versioned().unwrap().wireless_rev, 1);
+
+        // No-op config mutation returning true without actual field change must not bump rev.
+        assert!(store.update_config(|_| true).is_none());
+        assert_eq!(store.read_versioned().unwrap().config_rev, 0);
+    }
+
+    #[test]
+    fn hw_wake_signal_wait_indefinite_wakes_and_stops() {
+        let sig = HwWakeSignal::new();
+        let sig_waker = sig.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            sig_waker.wake();
+        });
+        assert!(sig.wait_indefinite());
+        let _ = handle.join();
+
+        let sig_stopper = sig.clone();
+        let handle2 = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            sig_stopper.stop();
+        });
+        assert!(!sig.wait_indefinite());
+        let _ = handle2.join();
+    }
+
+    #[test]
+    fn wireless_wake_mode_merge_preserves_highest_priority() {
+        assert_eq!(
+            WirelessWakeMode::Normal.merge(WirelessWakeMode::DeviceChange),
+            WirelessWakeMode::DeviceChange
+        );
+        assert_eq!(
+            WirelessWakeMode::DeviceChange.merge(WirelessWakeMode::Force),
+            WirelessWakeMode::Force
+        );
+        assert_eq!(
+            WirelessWakeMode::Force.merge(WirelessWakeMode::Normal),
+            WirelessWakeMode::Force
+        );
     }
 }

@@ -116,13 +116,21 @@ struct SmokeMetrics {
     working_set_mb: f64,
     private_bytes_mb: Option<f64>,
     idle_cpu_pct: f64,
+    hw_samples: u64,
+    bar_commits: Option<u64>,
+}
+
+fn parse_smoke_field<'a>(report: &'a str, key: &str) -> Option<&'a str> {
+    report
+        .split('|')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix(key).map(str::trim))
 }
 
 fn parse_smoke_metric(report: &str, key: &str, suffix: &str) -> Option<f64> {
-    let start = report.find(key)? + key.len();
-    let rest = &report[start..];
-    let end = rest.find(suffix)?;
-    let val: f64 = rest[..end].trim().parse().ok()?;
+    let raw = parse_smoke_field(report, key)?;
+    let num_str = raw.strip_suffix(suffix)?.trim();
+    let val: f64 = num_str.parse().ok()?;
     val.is_finite().then_some(val)
 }
 
@@ -134,9 +142,47 @@ fn validate_smoke_report(
     if !report.contains("AirMonitor smoke test OK") {
         return Err("missing 'AirMonitor smoke test OK' line in smoke output".to_string());
     }
-    let working_set_mb = parse_smoke_metric(report, "WorkingSet=", " MB")
+    if parse_smoke_field(report, "HwWorker=") != Some("ok") {
+        return Err("hw-worker did not start cleanly (HwWorker != ok)".to_string());
+    }
+    if parse_smoke_field(report, "WirelessWorker=") != Some("ok") {
+        return Err("wireless-worker did not start cleanly (WirelessWorker != ok)".to_string());
+    }
+    let hw_samples: u64 = parse_smoke_field(report, "HwSamples=")
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| "missing or invalid HwSamples metric".to_string())?;
+    if hw_samples < 2 {
+        return Err(format!(
+            "insufficient hardware samples: HwSamples={hw_samples} (expected >= 2)"
+        ));
+    }
+
+    let bar_commits = match parse_smoke_field(report, "BarCommits=") {
+        Some("headless_skip") => None,
+        Some(raw) => {
+            let commits: u64 = raw
+                .parse()
+                .map_err(|_| format!("invalid BarCommits metric: {raw}"))?;
+            if commits < 1 {
+                return Err("no taskbar render commits recorded (BarCommits=0)".to_string());
+            }
+            if parse_smoke_field(report, "ChildAttached=") != Some("true")
+                || parse_smoke_field(report, "BarVisible=") != Some("true")
+                || parse_smoke_field(report, "InTaskbarRect=") != Some("true")
+            {
+                return Err("taskbar child attachment/visibility/bounds check failed".to_string());
+            }
+            Some(commits)
+        }
+        None => return Err("missing BarCommits metric".to_string()),
+    };
+
+    if parse_smoke_field(report, "CpuTimes=") != Some("ok") {
+        return Err("process CPU timing API failed (CpuTimes != ok)".to_string());
+    }
+    let working_set_mb = parse_smoke_metric(report, "WorkingSet=", "MB")
         .ok_or_else(|| "missing or invalid WorkingSet metric".to_string())?;
-    let private_bytes_mb = parse_smoke_metric(report, "PrivateBytes=", " MB");
+    let private_bytes_mb = parse_smoke_metric(report, "PrivateBytes=", "MB");
     let idle_cpu_pct = parse_smoke_metric(report, "IdleCpuPct=", "%")
         .ok_or_else(|| "missing or invalid IdleCpuPct metric".to_string())?;
 
@@ -157,6 +203,8 @@ fn validate_smoke_report(
         working_set_mb,
         private_bytes_mb,
         idle_cpu_pct,
+        hw_samples,
+        bar_commits,
     })
 }
 
@@ -196,7 +244,7 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        airmonitor::updater::handle_post_update_startup();
+        airmonitor::updater::wait_for_old_pid_if_needed();
     }
 
     let capture = if smoke_test {
@@ -237,8 +285,12 @@ fn main() {
                 } else {
                     gpu_umds.join(",")
                 };
+                let bar_str = metrics
+                    .bar_commits
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "headless_skip".to_string());
                 println!(
-                    "AirMonitor smoke budget PASSED | WorkingSet={:.2}/{:.2} MB | PrivateBytes={} | IdleCpuPct={:.2}%/{:.2}% | GpuUmd=[{}]",
+                    "AirMonitor smoke budget PASSED | WorkingSet={:.2}/{:.2} MB | PrivateBytes={} | IdleCpuPct={:.2}%/{:.2}% | HwSamples={} | BarCommits={} | GpuUmd=[{}]",
                     metrics.working_set_mb,
                     MAX_WORKING_SET_MB,
                     metrics
@@ -247,6 +299,8 @@ fn main() {
                         .unwrap_or_else(|| "N/A".to_string()),
                     metrics.idle_cpu_pct,
                     MAX_IDLE_CPU_PCT,
+                    metrics.hw_samples,
+                    bar_str,
                     umd_str
                 );
                 let _ = std::io::stdout().flush();
@@ -265,32 +319,54 @@ mod tests {
 
     #[test]
     fn smoke_budget_passes_when_within_limits() {
-        let line = "AirMonitor smoke test OK | WorkingSet=9.42 MB | PrivateBytes=18.10 MB | IdleCpuPct=0.11% | CPU=2.0% MEM=45.0% | Devices=1 | ok";
+        let line = "AirMonitor smoke test OK | Memory=ok | WorkingSet=9.42 MB | PrivateBytes=18.10 MB | CpuTimes=ok | IdleCpuPct=0.11% | HwWorker=ok | WirelessWorker=ok | HwSamples=5 | CPU=2.0% MEM=45.0% | Devices=1 | BarCommits=2 | ChildAttached=true | BarVisible=true | InTaskbarRect=true";
         let m = validate_smoke_report(line, 15.0, 0.50).expect("should pass budget");
         assert!((m.working_set_mb - 9.42).abs() < 1e-6);
         assert_eq!(m.private_bytes_mb, Some(18.10));
         assert!((m.idle_cpu_pct - 0.11).abs() < 1e-6);
+        assert_eq!(m.hw_samples, 5);
+        assert_eq!(m.bar_commits, Some(2));
+    }
+
+    #[test]
+    fn smoke_budget_allows_headless_skip_for_shell_tray() {
+        let line = "AirMonitor smoke test OK | Memory=ok | WorkingSet=9.42 MB | PrivateBytes=18.10 MB | CpuTimes=ok | IdleCpuPct=0.11% | HwWorker=ok | WirelessWorker=ok | HwSamples=3 | BarCommits=headless_skip | ChildAttached=headless_skip | BarVisible=headless_skip | InTaskbarRect=headless_skip";
+        let m = validate_smoke_report(line, 15.0, 0.50).expect("headless skip should pass");
+        assert_eq!(m.hw_samples, 3);
+        assert_eq!(m.bar_commits, None);
     }
 
     #[test]
     fn smoke_budget_rejects_excess_working_set() {
-        let line = "AirMonitor smoke test OK | WorkingSet=16.70 MB | PrivateBytes=71.70 MB | IdleCpuPct=0.12%";
+        let line = "AirMonitor smoke test OK | Memory=ok | WorkingSet=16.70 MB | PrivateBytes=71.70 MB | CpuTimes=ok | IdleCpuPct=0.12% | HwWorker=ok | WirelessWorker=ok | HwSamples=3 | BarCommits=1 | ChildAttached=true | BarVisible=true | InTaskbarRect=true";
         let err = validate_smoke_report(line, 15.0, 0.50).unwrap_err();
         assert!(err.contains("WorkingSet"));
     }
 
     #[test]
     fn smoke_budget_rejects_excess_idle_cpu() {
-        let line = "AirMonitor smoke test OK | WorkingSet=10.00 MB | PrivateBytes=20.00 MB | IdleCpuPct=0.85%";
+        let line = "AirMonitor smoke test OK | Memory=ok | WorkingSet=10.00 MB | PrivateBytes=20.00 MB | CpuTimes=ok | IdleCpuPct=0.85% | HwWorker=ok | WirelessWorker=ok | HwSamples=3 | BarCommits=1 | ChildAttached=true | BarVisible=true | InTaskbarRect=true";
         let err = validate_smoke_report(line, 15.0, 0.50).unwrap_err();
         assert!(err.contains("IdleCpuPct"));
     }
 
     #[test]
-    fn smoke_budget_rejects_missing_or_na_metrics() {
+    fn smoke_budget_rejects_missing_or_failed_structured_checks() {
         let na_line =
-            "AirMonitor smoke test OK | WorkingSet=N/A | PrivateBytes=N/A | IdleCpuPct=N/A";
+            "AirMonitor smoke test OK | Memory=err | WorkingSet=N/A | PrivateBytes=N/A | CpuTimes=err | IdleCpuPct=N/A | HwWorker=ok | WirelessWorker=ok | HwSamples=2 | BarCommits=headless_skip";
         assert!(validate_smoke_report(na_line, 15.0, 0.50).is_err());
         assert!(validate_smoke_report("", 15.0, 0.50).is_err());
+
+        let one_sample = "AirMonitor smoke test OK | Memory=ok | WorkingSet=9.00 MB | CpuTimes=ok | IdleCpuPct=0.10% | HwWorker=ok | WirelessWorker=ok | HwSamples=1 | BarCommits=1 | ChildAttached=true | BarVisible=true | InTaskbarRect=true";
+        assert!(validate_smoke_report(one_sample, 15.0, 0.50).is_err());
+
+        let zero_commits = "AirMonitor smoke test OK | Memory=ok | WorkingSet=9.00 MB | CpuTimes=ok | IdleCpuPct=0.10% | HwWorker=ok | WirelessWorker=ok | HwSamples=3 | BarCommits=0 | ChildAttached=true | BarVisible=true | InTaskbarRect=true";
+        assert!(validate_smoke_report(zero_commits, 15.0, 0.50).is_err());
+
+        let bad_attach = "AirMonitor smoke test OK | Memory=ok | WorkingSet=9.00 MB | CpuTimes=ok | IdleCpuPct=0.10% | HwWorker=ok | WirelessWorker=ok | HwSamples=3 | BarCommits=1 | ChildAttached=false | BarVisible=true | InTaskbarRect=true";
+        assert!(validate_smoke_report(bad_attach, 15.0, 0.50).is_err());
+
+        let bad_worker = "AirMonitor smoke test OK | Memory=ok | WorkingSet=9.00 MB | CpuTimes=ok | IdleCpuPct=0.10% | HwWorker=err | WirelessWorker=ok | HwSamples=3 | BarCommits=headless_skip";
+        assert!(validate_smoke_report(bad_worker, 15.0, 0.50).is_err());
     }
 }

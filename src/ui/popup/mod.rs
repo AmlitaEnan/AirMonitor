@@ -94,6 +94,7 @@ pub struct PopupManager {
     host_hwnd: HWND,
     state: SnapshotStore,
     popup_open: Arc<AtomicBool>,
+    popup_overview_open: Arc<AtomicBool>,
     hw_signal: HwWakeSignal,
     cached_snapshot: Option<Arc<MonitorSnapshot>>,
     last_rendered_rev: Option<(u64, u64, u64)>,
@@ -144,11 +145,30 @@ enum PostBorrowAction {
 }
 
 impl PopupManager {
+    #[allow(dead_code)]
     pub(crate) fn new(
         hinstance: HINSTANCE,
         host_hwnd: HWND,
         state: SnapshotStore,
         popup_open: Arc<AtomicBool>,
+        hw_signal: HwWakeSignal,
+    ) -> windows::core::Result<Rc<RefCell<Self>>> {
+        Self::new_with_overview(
+            hinstance,
+            host_hwnd,
+            state,
+            popup_open,
+            Arc::new(AtomicBool::new(false)),
+            hw_signal,
+        )
+    }
+
+    pub(crate) fn new_with_overview(
+        hinstance: HINSTANCE,
+        host_hwnd: HWND,
+        state: SnapshotStore,
+        popup_open: Arc<AtomicBool>,
+        popup_overview_open: Arc<AtomicBool>,
         hw_signal: HwWakeSignal,
     ) -> windows::core::Result<Rc<RefCell<Self>>> {
         unsafe {
@@ -194,6 +214,7 @@ impl PopupManager {
                 host_hwnd,
                 state,
                 popup_open,
+                popup_overview_open,
                 hw_signal,
                 cached_snapshot: None,
                 last_rendered_rev: None,
@@ -499,6 +520,7 @@ impl PopupManager {
             };
             p.prepare_hide();
             p.popup_open.store(false, Ordering::Release);
+            p.popup_overview_open.store(false, Ordering::Release);
             let h = p.hwnd;
             p.hwnd = HWND::default();
             h
@@ -520,8 +542,12 @@ impl PopupManager {
 
     fn sync_popup_open(&self, wake_if_open: bool) {
         let needs_hw_detail = self.visible && self.active_tab != PopupTab::About;
+        let overview_open = self.visible && self.active_tab == PopupTab::Overview;
         self.popup_open.store(needs_hw_detail, Ordering::Release);
-        if needs_hw_detail && wake_if_open {
+        let prev_overview = self
+            .popup_overview_open
+            .swap(overview_open, Ordering::AcqRel);
+        if wake_if_open && (overview_open || prev_overview != overview_open) {
             self.hw_signal.wake();
         }
     }
@@ -640,6 +666,10 @@ impl PopupManager {
 
     fn prepare_hide(&mut self) -> Option<HWND> {
         self.popup_open.store(false, Ordering::Release);
+        let was_overview = self.popup_overview_open.swap(false, Ordering::AcqRel);
+        if was_overview {
+            self.hw_signal.wake();
+        }
         if !self.visible {
             return None;
         }

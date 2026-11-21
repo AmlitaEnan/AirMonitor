@@ -163,6 +163,10 @@ impl Default for ZoneLayout {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    #[serde(default = "default_true")]
+    pub hardware_enabled: bool,
+    #[serde(default = "default_true")]
+    pub wireless_enabled: bool,
     #[serde(deserialize_with = "deserialize_enum_or_default")]
     pub layout_mode: LayoutMode,
     #[serde(deserialize_with = "deserialize_enum_or_default")]
@@ -211,6 +215,8 @@ fn default_hardware_items() -> Vec<HwMetric> {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            hardware_enabled: true,
+            wireless_enabled: true,
             layout_mode: LayoutMode::Combined,
             combined_order: CombinedOrder::DevicesFirst,
             combined_zone: ZoneLayout {
@@ -295,10 +301,92 @@ fn to_wide_null(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-fn backup_path_for(path: &Path) -> PathBuf {
+fn last_good_backup_path_for(path: &Path) -> PathBuf {
     let mut os: OsString = path.as_os_str().to_os_string();
-    os.push(".bak");
+    os.push(".last_good.bak");
     PathBuf::from(os)
+}
+
+fn corrupt_backup_path_for(path: &Path) -> PathBuf {
+    let mut os: OsString = path.as_os_str().to_os_string();
+    os.push(".corrupt.bak");
+    PathBuf::from(os)
+}
+
+fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create config directory: {e}"))?;
+        }
+    }
+    let tmp_path = temp_path_for(path);
+
+    let write_res = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("failed to create temp config {}: {e}", tmp_path.display()))?;
+        file.write_all(data)
+            .map_err(|e| format!("failed to write temp config: {e}"))?;
+        file.flush()
+            .map_err(|e| format!("failed to flush temp config: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to sync temp config: {e}"))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    let tmp_w = to_wide_null(&tmp_path);
+    let dst_w = to_wide_null(path);
+    let replace_res = unsafe {
+        MoveFileExW(
+            PCWSTR(tmp_w.as_ptr()),
+            PCWSTR(dst_w.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if let Err(err) = replace_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("atomic config replace failed: {err}"));
+    }
+    Ok(())
+}
+
+fn parse_config_str(text: &str) -> Result<AppConfig, toml::de::Error> {
+    let mut cfg = toml::from_str::<AppConfig>(text)?;
+    if let Ok(toml::Value::Table(table)) = toml::from_str::<toml::Value>(text) {
+        let has_hw_key = table.contains_key("hardware_enabled");
+        let has_wl_key = table.contains_key("wireless_enabled");
+        if !has_hw_key && !has_wl_key {
+            match cfg.layout_mode {
+                LayoutMode::DevicesOnly => {
+                    cfg.hardware_enabled = false;
+                    cfg.wireless_enabled = true;
+                }
+                LayoutMode::HardwareOnly => {
+                    cfg.hardware_enabled = true;
+                    cfg.wireless_enabled = false;
+                }
+                LayoutMode::Combined | LayoutMode::Split => {}
+            }
+        }
+    }
+    cfg.sanitize();
+    Ok(cfg)
+}
+
+fn load_valid_backup(path: &Path) -> Option<AppConfig> {
+    if !path.exists() {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    parse_config_str(&text).ok()
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -343,6 +431,47 @@ impl AppConfig {
                 .join("config.toml");
         }
         PathBuf::from("config.toml")
+    }
+
+    /// Returns the effective taskbar layout mode derived from `hardware_enabled`
+    /// and `wireless_enabled` together with the dual-zone `layout_mode` preference.
+    /// Returns `None` when both monitoring zones are disabled.
+    pub fn effective_layout_mode(&self) -> Option<LayoutMode> {
+        match (self.hardware_enabled, self.wireless_enabled) {
+            (false, false) => None,
+            (true, false) => Some(LayoutMode::HardwareOnly),
+            (false, true) => Some(LayoutMode::DevicesOnly),
+            (true, true) => match self.layout_mode {
+                LayoutMode::Split => Some(LayoutMode::Split),
+                _ => Some(LayoutMode::Combined),
+            },
+        }
+    }
+
+    pub fn set_hardware_enabled(&mut self, enabled: bool) {
+        self.hardware_enabled = enabled;
+        if self.hardware_enabled
+            && self.wireless_enabled
+            && matches!(
+                self.layout_mode,
+                LayoutMode::HardwareOnly | LayoutMode::DevicesOnly
+            )
+        {
+            self.layout_mode = LayoutMode::Combined;
+        }
+    }
+
+    pub fn set_wireless_enabled(&mut self, enabled: bool) {
+        self.wireless_enabled = enabled;
+        if self.hardware_enabled
+            && self.wireless_enabled
+            && matches!(
+                self.layout_mode,
+                LayoutMode::HardwareOnly | LayoutMode::DevicesOnly
+            )
+        {
+            self.layout_mode = LayoutMode::Combined;
+        }
     }
 
     /// In `Split` mode, hardware and wireless zones must stay on opposite edges
@@ -424,46 +553,74 @@ impl AppConfig {
         Self::load_from_path(&path, !is_read_only_mode())
     }
 
-    fn load_from_path(path: &Path, allow_backup: bool) -> Self {
+    fn load_from_path(path: &Path, allow_write: bool) -> Self {
         if !path.exists() {
-            return Self::default();
+            let mut cfg = Self::default();
+            cfg.sanitize();
+            if allow_write {
+                if let Err(err) = cfg.save_to_path(path) {
+                    eprintln!(
+                        "AirMonitor: failed to initialize default config {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+            return cfg;
         }
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(err) => {
                 eprintln!(
-                    "AirMonitor: failed to read config {}: {}; using defaults",
+                    "AirMonitor: failed to read config {}: {}",
                     path.display(),
                     err
                 );
+                if allow_write {
+                    let corrupt_path = corrupt_backup_path_for(path);
+                    let _ = fs::copy(path, &corrupt_path);
+                }
+                let last_good_path = last_good_backup_path_for(path);
+                if let Some(cfg) = load_valid_backup(&last_good_path) {
+                    eprintln!(
+                        "AirMonitor: recovered config from last good backup {}",
+                        last_good_path.display()
+                    );
+                    return cfg;
+                }
                 return Self::default();
             }
         };
-        match toml::from_str::<AppConfig>(&text) {
-            Ok(mut cfg) => {
-                cfg.sanitize();
-                cfg
-            }
+        match parse_config_str(&text) {
+            Ok(cfg) => cfg,
             Err(err) => {
                 eprintln!(
-                    "AirMonitor: failed to parse config {}: {}; using defaults",
+                    "AirMonitor: failed to parse config {}: {}",
                     path.display(),
                     err
                 );
-                if allow_backup {
-                    let bak_path = backup_path_for(path);
-                    if let Err(copy_err) = fs::copy(path, &bak_path) {
+                if allow_write {
+                    let corrupt_path = corrupt_backup_path_for(path);
+                    if let Err(copy_err) = fs::copy(path, &corrupt_path) {
                         eprintln!(
                             "AirMonitor: failed to backup corrupt config to {}: {}",
-                            bak_path.display(),
+                            corrupt_path.display(),
                             copy_err
                         );
                     } else {
                         eprintln!(
                             "AirMonitor: backed up corrupt config to {} without overwriting original",
-                            bak_path.display()
+                            corrupt_path.display()
                         );
                     }
+                }
+                let last_good_path = last_good_backup_path_for(path);
+                if let Some(cfg) = load_valid_backup(&last_good_path) {
+                    eprintln!(
+                        "AirMonitor: recovered config from last good backup {}",
+                        last_good_path.display()
+                    );
+                    return cfg;
                 }
                 Self::default()
             }
@@ -479,49 +636,22 @@ impl AppConfig {
     }
 
     fn save_to_path(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create config directory: {e}"))?;
+        let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        if path.exists() {
+            if let Ok(prev_text) = fs::read_to_string(path) {
+                if parse_config_str(&prev_text).is_ok() {
+                    let last_good_path = last_good_backup_path_for(path);
+                    if let Err(err) = atomic_write_bytes(&last_good_path, prev_text.as_bytes()) {
+                        eprintln!(
+                            "AirMonitor: failed to update last good config backup {}: {}",
+                            last_good_path.display(),
+                            err
+                        );
+                    }
+                }
             }
         }
-        let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let tmp_path = temp_path_for(path);
-
-        let write_res = (|| -> Result<(), String> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
-                .map_err(|e| format!("failed to create temp config {}: {e}", tmp_path.display()))?;
-            file.write_all(text.as_bytes())
-                .map_err(|e| format!("failed to write temp config: {e}"))?;
-            file.flush()
-                .map_err(|e| format!("failed to flush temp config: {e}"))?;
-            file.sync_all()
-                .map_err(|e| format!("failed to sync temp config: {e}"))?;
-            Ok(())
-        })();
-
-        if let Err(err) = write_res {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-
-        let tmp_w = to_wide_null(&tmp_path);
-        let dst_w = to_wide_null(path);
-        let replace_res = unsafe {
-            MoveFileExW(
-                PCWSTR(tmp_w.as_ptr()),
-                PCWSTR(dst_w.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if let Err(err) = replace_res {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!("atomic config replace failed: {err}"));
-        }
-        Ok(())
+        atomic_write_bytes(path, text.as_bytes())
     }
 }
 
@@ -642,14 +772,15 @@ foo = 42
             loaded.device_aliases.get("hid:keep").map(String::as_str),
             Some("Keyboard")
         );
-        assert!(!dir.path.join("config.toml.bak").exists());
+        assert!(!dir.path.join("config.toml.corrupt.bak").exists());
+        assert!(!dir.path.join("config.toml.last_good.bak").exists());
     }
 
     #[test]
-    fn parse_failure_creates_bak_without_overwriting_original() {
+    fn parse_failure_creates_corrupt_bak_without_overwriting_original() {
         let dir = TempDirGuard::new("corrupt_bak");
         let path = dir.path.join("config.toml");
-        let bak_path = dir.path.join("config.toml.bak");
+        let corrupt_bak_path = dir.path.join("config.toml.corrupt.bak");
 
         let corrupt = "layout_mode = [unclosed\n[device_aliases]\n\"k\" = \"v\"\n";
         fs::write(&path, corrupt).expect("write corrupt config");
@@ -657,11 +788,14 @@ foo = 42
         let loaded = AppConfig::load_from_path(&path, true);
         assert_eq!(loaded, AppConfig::default());
 
-        assert!(bak_path.exists(), "backup .bak file must be created");
+        assert!(
+            corrupt_bak_path.exists(),
+            "backup .corrupt.bak file must be created"
+        );
         assert_eq!(
-            fs::read_to_string(&bak_path).expect("read .bak"),
+            fs::read_to_string(&corrupt_bak_path).expect("read .corrupt.bak"),
             corrupt,
-            ".bak must contain the exact original corrupt content"
+            ".corrupt.bak must contain the exact original corrupt content"
         );
         assert_eq!(
             fs::read_to_string(&path).expect("read original"),
@@ -918,5 +1052,98 @@ hardware_items = ["cpu_temp", "cpu_power", "cpu_fan", "disk_read", "disk_write",
         cfg.ensure_split_anchors_distinct();
         assert_eq!(cfg.hardware_zone.anchor, AnchorEdge::Left);
         assert_eq!(cfg.devices_zone.anchor, AnchorEdge::Right);
+    }
+
+    #[test]
+    fn zone_enable_flags_migration_and_effective_layout_mode() {
+        let dir = TempDirGuard::new("zone_enable_migration");
+        let path = dir.path.join("config.toml");
+
+        // Legacy devices_only without explicit flags migrates to hardware=false, wireless=true.
+        fs::write(&path, "layout_mode = \"devices_only\"\n").expect("write legacy devices_only");
+        let loaded_dev = AppConfig::load_from_path(&path, true);
+        assert!(!loaded_dev.hardware_enabled);
+        assert!(loaded_dev.wireless_enabled);
+        assert_eq!(
+            loaded_dev.effective_layout_mode(),
+            Some(LayoutMode::DevicesOnly)
+        );
+
+        // Legacy hardware_only without explicit flags migrates to hardware=true, wireless=false.
+        fs::write(&path, "layout_mode = \"hardware_only\"\n").expect("write legacy hardware_only");
+        let loaded_hw = AppConfig::load_from_path(&path, true);
+        assert!(loaded_hw.hardware_enabled);
+        assert!(!loaded_hw.wireless_enabled);
+        assert_eq!(
+            loaded_hw.effective_layout_mode(),
+            Some(LayoutMode::HardwareOnly)
+        );
+
+        // Effective layout mode for all toggle combinations + Split preservation.
+        let mut cfg = AppConfig {
+            layout_mode: LayoutMode::Split,
+            ..AppConfig::default()
+        };
+        assert_eq!(cfg.effective_layout_mode(), Some(LayoutMode::Split));
+        cfg.set_hardware_enabled(false);
+        assert_eq!(cfg.effective_layout_mode(), Some(LayoutMode::DevicesOnly));
+        cfg.set_wireless_enabled(false);
+        assert_eq!(cfg.effective_layout_mode(), None);
+        cfg.set_hardware_enabled(true);
+        assert_eq!(cfg.effective_layout_mode(), Some(LayoutMode::HardwareOnly));
+        cfg.set_wireless_enabled(true);
+        assert_eq!(cfg.effective_layout_mode(), Some(LayoutMode::Split));
+
+        // Legacy HardwareOnly upgraded to dual-enabled normalizes to Combined.
+        let mut legacy_up = loaded_hw;
+        legacy_up.set_wireless_enabled(true);
+        assert_eq!(legacy_up.layout_mode, LayoutMode::Combined);
+        assert_eq!(
+            legacy_up.effective_layout_mode(),
+            Some(LayoutMode::Combined)
+        );
+    }
+
+    #[test]
+    fn initial_config_creation_and_last_good_backup_recovery() {
+        let dir = TempDirGuard::new("last_good_recovery");
+        let path = dir.path.join("config.toml");
+        let last_good = last_good_backup_path_for(&path);
+        let corrupt_bak = corrupt_backup_path_for(&path);
+
+        // Read-only mode must NOT create config.toml when missing.
+        let ro_cfg = AppConfig::load_from_path(&path, false);
+        assert_eq!(ro_cfg, AppConfig::default());
+        assert!(!path.exists());
+
+        // Normal mode creates default config.toml on first launch.
+        let init_cfg = AppConfig::load_from_path(&path, true);
+        assert_eq!(init_cfg, AppConfig::default());
+        assert!(path.exists());
+        assert!(!last_good.exists());
+
+        // Saving updated config maintains .last_good.bak with previous valid config.
+        let v1 = AppConfig {
+            low_battery_threshold: 17,
+            ..AppConfig::default()
+        };
+        v1.save_to_path(&path).expect("save v1");
+        assert!(last_good.exists());
+
+        let v2 = AppConfig {
+            low_battery_threshold: 29,
+            ..AppConfig::default()
+        };
+        v2.save_to_path(&path).expect("save v2");
+        let prev_good = load_valid_backup(&last_good).expect("valid last_good.bak");
+        assert_eq!(prev_good.low_battery_threshold, 17);
+
+        // Corrupting config.toml backs up corrupt original and recovers from .last_good.bak.
+        let corrupt = "layout_mode = [broken\n";
+        fs::write(&path, corrupt).expect("write corrupt");
+        let recovered = AppConfig::load_from_path(&path, true);
+        assert_eq!(recovered.low_battery_threshold, 17);
+        assert_eq!(fs::read_to_string(&corrupt_bak).unwrap(), corrupt);
+        assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
     }
 }
