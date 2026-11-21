@@ -46,6 +46,7 @@ const CONTINUITY_PROXIMITY_PAIRING: u8 = 0x07;
 const PROXIMITY_PAIRING_LEN_FIELD: u8 = 0x19;
 const AIRPODS_PACKET_LEN: usize = 27;
 const AIRPODS_STALE_SECS: u64 = 90;
+const AIRPODS_MAX_CACHE_ENTRIES: usize = 16;
 const AIRPODS_MIN_RSSI_DBM: i16 = -60;
 const WATCHER_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 const BT_OFFLINE_MISS_THRESHOLD: u32 = 3;
@@ -158,6 +159,7 @@ pub struct BluetoothMonitor {
     watcher_token: Option<EventRegistrationToken>,
     watcher_stopped_token: Option<EventRegistrationToken>,
     watcher_started: bool,
+    watcher_disposed: Arc<AtomicBool>,
     last_watcher_attempt: Option<Instant>,
     stop_flag: Arc<AtomicBool>,
 }
@@ -192,6 +194,7 @@ impl BluetoothMonitor {
             watcher_token: None,
             watcher_stopped_token: None,
             watcher_started: false,
+            watcher_disposed: Arc::new(AtomicBool::new(false)),
             last_watcher_attempt: None,
             stop_flag,
         }
@@ -218,9 +221,7 @@ impl BluetoothMonitor {
             if !radio_present {
                 guard.airpods.clear();
             } else {
-                guard.airpods.retain(|_, v| {
-                    now.saturating_duration_since(v.last_seen).as_secs() <= AIRPODS_STALE_SECS
-                });
+                prune_expired_airpods(&mut guard.airpods, now);
             }
             for entry in guard.airpods.values() {
                 out.push(WirelessDevice {
@@ -238,10 +239,15 @@ impl BluetoothMonitor {
             }
         }
 
+        out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         out
     }
 
     pub fn diagnostics(&mut self) -> String {
+        self.diagnostics_with_options(false)
+    }
+
+    pub fn diagnostics_with_options(&mut self, verbose: bool) -> String {
         let radio_present = has_present_bluetooth_radio();
         self.ensure_ble_watcher_with_radio(radio_present);
         let mut out = String::new();
@@ -256,21 +262,7 @@ impl BluetoothMonitor {
             out.push_str("  No paired Bluetooth PnP device nodes found.\n");
         } else {
             for r in &raw_nodes {
-                let state = if r.connected && r.is_present {
-                    "connected"
-                } else {
-                    "offline/cached"
-                };
-                out.push_str(&format!(
-                    "  - {} [{}] | mac={:?} | connected={} | present={} | battery={:?} | id={}\n",
-                    r.friendly,
-                    state,
-                    r.bt_mac,
-                    r.connected,
-                    r.is_present,
-                    r.battery_pct,
-                    r.instance_id
-                ));
+                out.push_str(&format_pnp_bt_diag_line(r, verbose));
             }
         }
 
@@ -301,20 +293,7 @@ impl BluetoothMonitor {
                 out.push_str("  No AirPods proximity advertisements captured during scan.\n");
             } else {
                 for entry in guard.airpods.values() {
-                    let sb = entry.sub_batteries;
-                    out.push_str(&format!(
-                        "  - {} [{}] L={:?}(chg={}) R={:?}(chg={}) Case={:?}(chg={}) RSSI={}dBm raw={}\n",
-                        entry.model_name,
-                        entry.id,
-                        sb.left_pct,
-                        sb.left_charging,
-                        sb.right_pct,
-                        sb.right_charging,
-                        sb.case_pct,
-                        sb.case_charging,
-                        entry.rssi,
-                        entry.raw_hex
-                    ));
+                    out.push_str(&format_airpods_diag_line(entry, verbose));
                 }
             }
         }
@@ -323,6 +302,7 @@ impl BluetoothMonitor {
     }
 
     fn stop_ble_watcher(&mut self) {
+        self.watcher_disposed.store(true, Ordering::Release);
         if let Some(watcher) = self.watcher.take() {
             if self.watcher_started {
                 let _ = watcher.Stop();
@@ -421,11 +401,19 @@ impl BluetoothMonitor {
 
         apply_apple_proximity_filter(&watcher);
 
+        let disposed_flag = Arc::new(AtomicBool::new(false));
+        self.watcher_disposed = Arc::clone(&disposed_flag);
+
         let state_ref = Arc::clone(&self.ble_state);
+        let stop_ref = Arc::clone(&self.stop_flag);
+        let rx_disposed = Arc::clone(&disposed_flag);
         let rx_handler = TypedEventHandler::<
             BluetoothLEAdvertisementWatcher,
             BluetoothLEAdvertisementReceivedEventArgs,
         >::new(move |_sender, args| {
+            if rx_disposed.load(Ordering::Acquire) || stop_ref.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let Some(args) = args.as_ref() else {
                 return Ok(());
             };
@@ -474,7 +462,7 @@ impl BluetoothMonitor {
                     guard.apple_packets_seen += 1;
                     if let Some(parsed) = parse_apple_proximity_pairing(&data, bt_addr, rssi) {
                         guard.proximity_packets_seen += 1;
-                        guard.airpods.insert(parsed.id.clone(), parsed);
+                        insert_airpods_cache(&mut guard.airpods, parsed, Instant::now());
                     }
                 }
             }
@@ -482,10 +470,14 @@ impl BluetoothMonitor {
         });
 
         let stop_state_ref = Arc::clone(&self.ble_state);
+        let stop_handler_disposed = Arc::clone(&disposed_flag);
         let stopped_handler = TypedEventHandler::<
             BluetoothLEAdvertisementWatcher,
             BluetoothLEAdvertisementWatcherStoppedEventArgs,
         >::new(move |_sender, args| {
+            if stop_handler_disposed.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if let Ok(mut guard) = stop_state_ref.lock() {
                 guard.watcher_stopped = true;
                 let err_code = args.as_ref().and_then(|a| a.Error().ok());
@@ -530,6 +522,10 @@ impl BluetoothMonitor {
 impl Drop for BluetoothMonitor {
     fn drop(&mut self) {
         self.stop_ble_watcher();
+        self.pnp_cache.clear();
+        if let Ok(mut guard) = self.ble_state.lock() {
+            guard.airpods.clear();
+        }
     }
 }
 
@@ -1216,10 +1212,141 @@ fn decode_airpods_proximity_fields(data: &[u8]) -> Option<AirPodsDecoded> {
     })
 }
 
+fn prune_expired_airpods(airpods: &mut HashMap<String, AirPodsCacheEntry>, now: Instant) {
+    airpods
+        .retain(|_, v| now.saturating_duration_since(v.last_seen).as_secs() <= AIRPODS_STALE_SECS);
+}
+
+fn insert_airpods_cache(
+    airpods: &mut HashMap<String, AirPodsCacheEntry>,
+    entry: AirPodsCacheEntry,
+    now: Instant,
+) {
+    prune_expired_airpods(airpods, now);
+    if !airpods.contains_key(&entry.id) && airpods.len() >= AIRPODS_MAX_CACHE_ENTRIES {
+        if let Some(oldest_key) = airpods
+            .iter()
+            .min_by_key(|(_, v)| v.last_seen)
+            .map(|(k, _)| k.clone())
+        {
+            airpods.remove(&oldest_key);
+        }
+    }
+    airpods.insert(entry.id.clone(), entry);
+}
+
+fn mask_bt_mac(mac: &str) -> String {
+    let trimmed = mac.trim();
+    if trimmed.len() >= 8 {
+        format!(
+            "{}****{}",
+            &trimmed[..2],
+            &trimmed[trimmed.len().saturating_sub(2)..]
+        )
+    } else {
+        "****".to_string()
+    }
+}
+
+fn mask_bt_instance_id(instance_id: &str) -> String {
+    let mut parts: Vec<String> = instance_id
+        .split('\\')
+        .enumerate()
+        .map(|(idx, seg)| {
+            if idx == 0 {
+                seg.to_string()
+            } else if idx == 1 {
+                if let Some(rest) = seg.strip_prefix("DEV_") {
+                    format!("DEV_{}", mask_bt_mac(rest))
+                } else if let Some(rest) = seg.strip_prefix("dev_") {
+                    format!("DEV_{}", mask_bt_mac(rest))
+                } else if seg.contains('{') {
+                    // Preserve service/profile GUID class while redacting any trailing VID/PID/serial
+                    let guid_end = seg.find('}').map(|i| i + 1).unwrap_or(seg.len());
+                    format!("{}_<redacted>", &seg[..guid_end])
+                } else {
+                    "<redacted>".to_string()
+                }
+            } else {
+                "<redacted>".to_string()
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        "<redacted>".to_string()
+    } else {
+        // Ensure at least the instance segment is masked
+        if parts.len() == 1 {
+            parts[0] = "<redacted>".to_string();
+        }
+        parts.join("\\")
+    }
+}
+
+fn mask_ble_id(id: &str) -> String {
+    // e.g. ble:apple:1420:112233445566 -> ble:apple:1420:11****66
+    if let Some((prefix, addr)) = id.rsplit_once(':') {
+        if addr != "addr0" && addr.len() >= 8 {
+            return format!("{}:{}", prefix, mask_bt_mac(addr));
+        }
+    }
+    id.to_string()
+}
+
+fn format_pnp_bt_diag_line(r: &RawPnpBtNode, verbose: bool) -> String {
+    let state = if r.connected && r.is_present {
+        "connected"
+    } else {
+        "offline/cached"
+    };
+    let mac_disp = if verbose {
+        r.bt_mac.clone()
+    } else {
+        r.bt_mac.as_deref().map(mask_bt_mac)
+    };
+    let id_disp = if verbose {
+        r.instance_id.clone()
+    } else {
+        mask_bt_instance_id(&r.instance_id)
+    };
+    format!(
+        "  - {} [{}] | mac={:?} | connected={} | present={} | battery={:?} | id={}\n",
+        r.friendly, state, mac_disp, r.connected, r.is_present, r.battery_pct, id_disp
+    )
+}
+
+fn format_airpods_diag_line(entry: &AirPodsCacheEntry, verbose: bool) -> String {
+    let sb = entry.sub_batteries;
+    let id_disp = if verbose {
+        entry.id.clone()
+    } else {
+        mask_ble_id(&entry.id)
+    };
+    let raw_disp = if verbose {
+        entry.raw_hex.clone()
+    } else {
+        let byte_count = entry.raw_hex.split_whitespace().count();
+        format!("<redacted {}B>", byte_count)
+    };
+    format!(
+        "  - {} [{}] L={:?}(chg={}) R={:?}(chg={}) Case={:?}(chg={}) RSSI={}dBm raw={}\n",
+        entry.model_name,
+        id_disp,
+        sb.left_pct,
+        sb.left_charging,
+        sb.right_pct,
+        sb.right_charging,
+        sb.case_pct,
+        sb.case_charging,
+        entry.rssi,
+        raw_disp
+    )
+}
+
 /// Parse Apple Continuity Proximity Pairing advertisement (`0x07 0x19`, 27 bytes) with RSSI threshold.
 fn parse_apple_proximity_pairing(
     data: &[u8],
-    _bt_addr: u64,
+    bt_addr: u64,
     rssi: i16,
 ) -> Option<AirPodsCacheEntry> {
     if rssi < AIRPODS_MIN_RSSI_DBM {
@@ -1233,8 +1360,14 @@ fn parse_apple_proximity_pairing(
         .collect::<Vec<_>>()
         .join(" ");
 
+    let addr_key = if bt_addr != 0 {
+        format!("{:012X}", bt_addr & 0xFFFF_FFFF_FFFF)
+    } else {
+        "addr0".to_string()
+    };
+
     Some(AirPodsCacheEntry {
-        id: format!("ble:apple:{:04X}", decoded.model_id),
+        id: format!("ble:apple:{:04X}:{}", decoded.model_id, addr_key),
         model_name: decoded.model_name.to_string(),
         sub_batteries: decoded.sub_batteries,
         overall_pct: decoded.overall_pct,
@@ -1608,5 +1741,112 @@ mod tests {
         });
         assert!(out1.is_empty());
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_airpods_cache_distinguishes_two_same_model_pairs_by_bt_addr_and_expires() {
+        let mut pkt1 = vec![0u8; 27];
+        pkt1[0] = 0x07;
+        pkt1[1] = 0x19;
+        pkt1[3] = 0x14;
+        pkt1[4] = 0x20; // AirPods Pro 2
+        pkt1[5] = 0x20;
+        pkt1[6] = 0x98; // L=85%, R=95%
+        pkt1[7] = 0x0A;
+
+        let mut pkt2 = pkt1.clone();
+        pkt2[6] = 0x43; // L=35%, R=45%
+
+        let mut e1 = parse_apple_proximity_pairing(&pkt1, 0x1122_3344_5566, -50).unwrap();
+        let mut e2 = parse_apple_proximity_pairing(&pkt2, 0xAABB_CCDD_EEFF, -52).unwrap();
+        assert_ne!(e1.id, e2.id);
+
+        let t0 = Instant::now();
+        e1.last_seen = t0;
+        e2.last_seen = t0 + Duration::from_secs(60);
+
+        let mut cache = HashMap::new();
+        insert_airpods_cache(&mut cache, e1.clone(), t0);
+        insert_airpods_cache(&mut cache, e2.clone(), t0 + Duration::from_secs(60));
+        assert_eq!(cache.len(), 2);
+
+        // After AIRPODS_STALE_SECS (90s), e1 expires while e2 remains
+        prune_expired_airpods(
+            &mut cache,
+            t0 + Duration::from_secs(AIRPODS_STALE_SECS + 10),
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&e2.id));
+        assert!(!cache.contains_key(&e1.id));
+    }
+
+    #[test]
+    fn test_bluetooth_diagnostics_redacts_sensitive_fields_unless_verbose() {
+        let node = RawPnpBtNode {
+            instance_id: r"BTHENUM\DEV_001122334455\8&1234567&0&BLUETOOTHDEVICE_001122334455"
+                .into(),
+            friendly: "WH-1000XM5".into(),
+            bt_mac: Some("001122334455".into()),
+            battery_pct: Some(80),
+            connected: true,
+            is_present: true,
+            is_primary_node: true,
+        };
+        let pnp_redacted = format_pnp_bt_diag_line(&node, false);
+        assert!(!pnp_redacted.contains("001122334455"));
+        assert!(!pnp_redacted.contains("BLUETOOTHDEVICE_001122334455"));
+        assert!(pnp_redacted.contains("00****55"));
+
+        let pnp_verbose = format_pnp_bt_diag_line(&node, true);
+        assert!(pnp_verbose.contains("001122334455"));
+        assert!(pnp_verbose.contains("BLUETOOTHDEVICE_001122334455"));
+
+        let mut pkt = vec![0u8; 27];
+        pkt[0] = 0x07;
+        pkt[1] = 0x19;
+        pkt[3] = 0x14;
+        pkt[4] = 0x20;
+        pkt[5] = 0x20;
+        pkt[6] = 0x98;
+        pkt[7] = 0x0A;
+        let entry = parse_apple_proximity_pairing(&pkt, 0x1122_3344_5566, -50).unwrap();
+
+        let ble_redacted = format_airpods_diag_line(&entry, false);
+        assert!(!ble_redacted.contains("112233445566"));
+        assert!(!ble_redacted.contains(&entry.raw_hex));
+        assert!(ble_redacted.contains("<redacted 27B>"));
+
+        let ble_verbose = format_airpods_diag_line(&entry, true);
+        assert!(ble_verbose.contains("112233445566"));
+        assert!(ble_verbose.contains(&entry.raw_hex));
+    }
+
+    #[test]
+    fn test_bluetooth_monitor_drop_clears_caches_and_preserves_caller_stop_flag() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let disposed_ref;
+        let ble_state_ref;
+        {
+            let mon = BluetoothMonitor::new_unstarted(Arc::clone(&stop));
+            disposed_ref = Arc::clone(&mon.watcher_disposed);
+            ble_state_ref = Arc::clone(&mon.ble_state);
+            let mut pkt = vec![0u8; 27];
+            pkt[0] = 0x07;
+            pkt[1] = 0x19;
+            pkt[3] = 0x14;
+            pkt[4] = 0x20;
+            pkt[5] = 0x20;
+            pkt[6] = 0x98;
+            pkt[7] = 0x0A;
+            let entry = parse_apple_proximity_pairing(&pkt, 0x1122_3344_5566, -50).unwrap();
+            mon.ble_state
+                .lock()
+                .unwrap()
+                .airpods
+                .insert(entry.id.clone(), entry);
+        }
+        assert!(disposed_ref.load(Ordering::Acquire));
+        assert!(ble_state_ref.lock().unwrap().airpods.is_empty());
+        assert!(!stop.load(Ordering::Relaxed));
     }
 }

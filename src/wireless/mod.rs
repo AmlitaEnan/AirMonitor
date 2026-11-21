@@ -11,6 +11,13 @@ use bluetooth::BluetoothMonitor;
 use hid::HidMonitor;
 use xinput::XInputMonitor;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WirelessPollMode {
+    Normal,
+    DeviceChange,
+    Force,
+}
+
 pub struct WirelessManager {
     xinput: XInputMonitor,
     bluetooth: BluetoothMonitor,
@@ -21,6 +28,14 @@ pub struct WirelessManager {
 impl Default for WirelessManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for WirelessManager {
+    fn drop(&mut self) {
+        // Sub-monitors implement Drop to stop the BLE watcher, close persistent HID
+        // handles / shut down I/O reclaim, and FreeLibrary(xinput*.dll) without mutating
+        // the caller's shared stop_flag.
     }
 }
 
@@ -39,14 +54,18 @@ impl WirelessManager {
     }
 
     pub fn poll_once(&mut self) -> Vec<WirelessDevice> {
-        self.poll_once_internal(false)
+        self.poll_once_internal(WirelessPollMode::Normal)
+    }
+
+    pub fn poll_once_device_change(&mut self) -> Vec<WirelessDevice> {
+        self.poll_once_internal(WirelessPollMode::DeviceChange)
     }
 
     pub fn poll_once_force(&mut self) -> Vec<WirelessDevice> {
-        self.poll_once_internal(true)
+        self.poll_once_internal(WirelessPollMode::Force)
     }
 
-    fn poll_once_internal(&mut self, force_refresh: bool) -> Vec<WirelessDevice> {
+    fn poll_once_internal(&mut self, mode: WirelessPollMode) -> Vec<WirelessDevice> {
         if self.stop_flag.load(Ordering::Relaxed) {
             return Vec::new();
         }
@@ -59,25 +78,29 @@ impl WirelessManager {
         if self.stop_flag.load(Ordering::Relaxed) {
             return deduplicate_wireless_devices(devices);
         }
-        if force_refresh {
-            devices.extend(self.hid.poll_force());
-        } else {
-            devices.extend(self.hid.poll());
+        match mode {
+            WirelessPollMode::Normal => devices.extend(self.hid.poll()),
+            WirelessPollMode::DeviceChange => devices.extend(self.hid.poll_device_change()),
+            WirelessPollMode::Force => devices.extend(self.hid.poll_force()),
         }
         deduplicate_wireless_devices(devices)
     }
 
     pub fn probe_diagnostics(&mut self) -> String {
+        self.probe_diagnostics_with_options(false)
+    }
+
+    pub fn probe_diagnostics_with_options(&mut self, verbose: bool) -> String {
         let mut report = String::new();
         report.push_str("=== AirMonitor Wireless Diagnostics ===\n\n");
 
         report.push_str(&self.xinput.diagnostics());
         report.push('\n');
 
-        report.push_str(&self.bluetooth.diagnostics());
+        report.push_str(&self.bluetooth.diagnostics_with_options(verbose));
         report.push('\n');
 
-        report.push_str(&self.hid.diagnostics());
+        report.push_str(&self.hid.diagnostics_with_options(verbose));
         report.push('\n');
 
         let devices = self.poll_once();
@@ -130,9 +153,36 @@ fn is_wired_xinput(dev: &WirelessDevice) -> bool {
         .unwrap_or(false)
 }
 
+fn verified_identity_token(dev: &WirelessDevice) -> Option<String> {
+    let raw = dev.id.trim();
+    let suffix = raw
+        .strip_prefix("bt:")
+        .or_else(|| raw.strip_prefix("xinput:mac:"))?;
+    let hex: String = suffix
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if hex.len() == 12 && hex != "000000000000" {
+        Some(hex)
+    } else {
+        None
+    }
+}
+
+fn merge_bt_and_xinput(devices: &mut [WirelessDevice], bt_idx: usize, xi_idx: usize) {
+    devices[bt_idx].online |= devices[xi_idx].online;
+    if devices[bt_idx].battery_pct.is_none() && devices[xi_idx].battery_pct.is_some() {
+        devices[bt_idx].battery_pct = devices[xi_idx].battery_pct;
+        devices[bt_idx].charging = devices[xi_idx].charging;
+        devices[bt_idx].detail_note = devices[xi_idx].detail_note.clone();
+    }
+}
+
 /// Deduplicate Xbox controllers reported simultaneously by XInput and Bluetooth PnP.
-/// Keeps the Bluetooth entry (preserving MAC ID & model name) and merges XInput's
-/// battery level/note if Bluetooth PnP lacked a percentage. Wired XInput slots are kept separate.
+/// Only merges when there is a 1-to-1 correspondence (single BT Xbox + single wireless XInput)
+/// or an explicitly verified matching identity token. Multi-controller setups are preserved
+/// unmerged rather than mis-pairing distinct controllers by array index.
 pub fn deduplicate_wireless_devices(mut devices: Vec<WirelessDevice>) -> Vec<WirelessDevice> {
     let bt_xbox_indices: Vec<usize> = devices
         .iter()
@@ -152,15 +202,30 @@ pub fn deduplicate_wireless_devices(mut devices: Vec<WirelessDevice>) -> Vec<Wir
         })
         .collect();
 
+    if xinput_wireless_indices.is_empty() {
+        return devices;
+    }
+
     let mut drop_indices = vec![false; devices.len()];
-    for (&bt_idx, &xi_idx) in bt_xbox_indices.iter().zip(xinput_wireless_indices.iter()) {
-        devices[bt_idx].online |= devices[xi_idx].online;
-        if devices[bt_idx].battery_pct.is_none() && devices[xi_idx].battery_pct.is_some() {
-            devices[bt_idx].battery_pct = devices[xi_idx].battery_pct;
-            devices[bt_idx].charging = devices[xi_idx].charging;
-            devices[bt_idx].detail_note = devices[xi_idx].detail_note.clone();
-        }
+    if bt_xbox_indices.len() == 1 && xinput_wireless_indices.len() == 1 {
+        let bt_idx = bt_xbox_indices[0];
+        let xi_idx = xinput_wireless_indices[0];
+        merge_bt_and_xinput(&mut devices, bt_idx, xi_idx);
         drop_indices[xi_idx] = true;
+    } else {
+        let mut matched_bt = vec![false; bt_xbox_indices.len()];
+        for &xi_idx in &xinput_wireless_indices {
+            let Some(xi_tok) = verified_identity_token(&devices[xi_idx]) else {
+                continue;
+            };
+            if let Some((pos, &bt_idx)) = bt_xbox_indices.iter().enumerate().find(|(pos, &bi)| {
+                !matched_bt[*pos] && verified_identity_token(&devices[bi]).as_ref() == Some(&xi_tok)
+            }) {
+                matched_bt[pos] = true;
+                merge_bt_and_xinput(&mut devices, bt_idx, xi_idx);
+                drop_indices[xi_idx] = true;
+            }
+        }
     }
 
     devices
@@ -286,5 +351,137 @@ mod tests {
         ];
         let out = deduplicate_wireless_devices(input);
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn test_dedup_does_not_blindly_zip_multiple_controllers() {
+        // 2 BT Xbox + 2 XInput wireless without verified MAC identity -> must keep all 4
+        let input = vec![
+            mk_dev(
+                "xinput:slot0",
+                "Xbox Controller #1",
+                DeviceKind::Gamepad,
+                Transport::XboxWireless,
+                Some(65),
+                Some("Alkaline (Level: Medium, approx.)"),
+            ),
+            mk_dev(
+                "xinput:slot1",
+                "Xbox Controller #2",
+                DeviceKind::Gamepad,
+                Transport::XboxWireless,
+                Some(25),
+                Some("Alkaline (Level: Low, approx.)"),
+            ),
+            mk_dev(
+                "bt:112233445566",
+                "Xbox Wireless Controller",
+                DeviceKind::Gamepad,
+                Transport::Bluetooth,
+                None,
+                None,
+            ),
+            mk_dev(
+                "bt:AABBCCDDEEFF",
+                "Xbox Wireless Controller",
+                DeviceKind::Gamepad,
+                Transport::Bluetooth,
+                Some(90),
+                None,
+            ),
+        ];
+        let out = deduplicate_wireless_devices(input);
+        assert_eq!(out.len(), 4);
+
+        // 2 BT Xbox + 1 XInput wireless (mixed setup) -> must not guess which BT matches XInput
+        let mixed = vec![
+            mk_dev(
+                "xinput:slot0",
+                "Xbox Controller #1",
+                DeviceKind::Gamepad,
+                Transport::XboxWireless,
+                Some(65),
+                Some("Alkaline (Level: Medium, approx.)"),
+            ),
+            mk_dev(
+                "bt:112233445566",
+                "Xbox Wireless Controller",
+                DeviceKind::Gamepad,
+                Transport::Bluetooth,
+                None,
+                None,
+            ),
+            mk_dev(
+                "bt:AABBCCDDEEFF",
+                "Xbox Wireless Controller",
+                DeviceKind::Gamepad,
+                Transport::Bluetooth,
+                Some(90),
+                None,
+            ),
+        ];
+        let out_mixed = deduplicate_wireless_devices(mixed);
+        assert_eq!(out_mixed.len(), 3);
+
+        // Multi-controller WITH verifiable identity token merges only the verified pair
+        let verified = vec![
+            mk_dev(
+                "xinput:mac:112233445566",
+                "Xbox Controller #1",
+                DeviceKind::Gamepad,
+                Transport::XboxWireless,
+                Some(65),
+                Some("Alkaline (Level: Medium, approx.)"),
+            ),
+            mk_dev(
+                "xinput:slot1",
+                "Xbox Controller #2",
+                DeviceKind::Gamepad,
+                Transport::XboxWireless,
+                Some(100),
+                Some("NiMH (Level: Full, approx.)"),
+            ),
+            mk_dev(
+                "bt:112233445566",
+                "Xbox Wireless Controller",
+                DeviceKind::Gamepad,
+                Transport::Bluetooth,
+                None,
+                None,
+            ),
+            mk_dev(
+                "bt:AABBCCDDEEFF",
+                "Xbox Wireless Controller",
+                DeviceKind::Gamepad,
+                Transport::Bluetooth,
+                Some(88),
+                None,
+            ),
+        ];
+        let out_verified = deduplicate_wireless_devices(verified);
+        assert_eq!(out_verified.len(), 3);
+        let merged_bt = out_verified
+            .iter()
+            .find(|d| d.id == "bt:112233445566")
+            .unwrap();
+        assert_eq!(merged_bt.battery_pct, Some(65));
+    }
+
+    #[test]
+    fn test_wireless_manager_drop_does_not_mutate_stop_flag_and_supports_device_change() {
+        let stop = Arc::new(AtomicBool::new(true));
+        {
+            let mut mgr = WirelessManager::with_stop_flag(Arc::clone(&stop));
+            assert!(mgr.poll_once().is_empty());
+            assert!(mgr.poll_once_device_change().is_empty());
+            assert!(mgr.poll_once_force().is_empty());
+        }
+        assert!(stop.load(Ordering::Relaxed));
+
+        let stop_live = Arc::new(AtomicBool::new(false));
+        {
+            let _mgr = WirelessManager::with_stop_flag(Arc::clone(&stop_live));
+        }
+        assert!(!stop_live.load(Ordering::Relaxed));
     }
 }

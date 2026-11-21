@@ -193,6 +193,9 @@ impl Drop for XInputMonitor {
             unsafe {
                 let _ = FreeLibrary(self.module);
             }
+            self.module = HMODULE::default();
+            self.get_state = None;
+            self.get_battery = None;
         }
     }
 }

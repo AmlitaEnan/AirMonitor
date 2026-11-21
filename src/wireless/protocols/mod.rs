@@ -96,6 +96,7 @@ pub struct DeviceMeta {
     pub kind: DeviceKind,
     pub protocol: ProtocolFamily,
     pub min_poll_secs: Option<u64>,
+    pub allow_active_tx: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +132,7 @@ struct VendorTomlEntry {
 
 pub struct DeviceRegistry {
     exact: HashMap<(u16, u16), DeviceMeta>,
+    builtin_exact_protocols: HashMap<(u16, u16), ProtocolFamily>,
     vendors: HashMap<u16, DeviceMeta>,
     custom_rules: Vec<CustomHidRule>,
     diagnostics: Vec<String>,
@@ -165,6 +167,7 @@ impl DeviceRegistry {
     fn from_toml_parts_labeled(builtin: &str, overrides: &[(&str, &str)]) -> Self {
         let mut reg = Self {
             exact: HashMap::new(),
+            builtin_exact_protocols: HashMap::new(),
             vendors: HashMap::new(),
             custom_rules: Vec::new(),
             diagnostics: Vec::new(),
@@ -210,7 +213,7 @@ impl DeviceRegistry {
                 continue;
             }
 
-            if is_override {
+            let allow_active_tx = if is_override {
                 let had_builtin = self.exact.contains_key(&(vid, pid))
                     || self
                         .custom_rules
@@ -218,16 +221,27 @@ impl DeviceRegistry {
                         .any(|r| r.vid == vid && r.pid == pid);
                 self.custom_rules
                     .retain(|r| !(r.vid == vid && r.pid == pid));
+                let same_builtin_proto =
+                    self.builtin_exact_protocols.get(&(vid, pid)).copied() == Some(protocol);
                 self.diagnostics.push(format!(
-                    "[EXT {}] {} [[device]] {:04X}:{:04X} ({}) -> {}",
+                    "[EXT {}] {} [[device]] {:04X}:{:04X} ({}) -> {} [{}]",
                     source_label,
                     if had_builtin { "OVERRIDDEN" } else { "LOADED" },
                     vid,
                     pid,
                     d.name,
-                    protocol.label()
+                    protocol.label(),
+                    if same_builtin_proto {
+                        "active-tx-preserved"
+                    } else {
+                        "read-only"
+                    }
                 ));
-            }
+                same_builtin_proto
+            } else {
+                self.builtin_exact_protocols.insert((vid, pid), protocol);
+                true
+            };
             self.exact.insert(
                 (vid, pid),
                 DeviceMeta {
@@ -235,6 +249,7 @@ impl DeviceRegistry {
                     kind: parse_kind(&d.kind),
                     protocol,
                     min_poll_secs: d.min_poll_secs,
+                    allow_active_tx,
                 },
             );
         }
@@ -261,7 +276,7 @@ impl DeviceRegistry {
             }
             if is_override {
                 self.diagnostics.push(format!(
-                    "[EXT {}] LOADED [[vendor]] {:04X} ({}) -> {}",
+                    "[EXT {}] LOADED [[vendor]] {:04X} ({}) -> {} [read-only]",
                     source_label,
                     vid,
                     v.name,
@@ -275,6 +290,7 @@ impl DeviceRegistry {
                     kind: parse_kind(&v.kind),
                     protocol,
                     min_poll_secs: v.min_poll_secs,
+                    allow_active_tx: false,
                 },
             );
         }
@@ -352,6 +368,7 @@ impl DeviceRegistry {
                 kind: rule.kind,
                 protocol: ProtocolFamily::CustomHid,
                 min_poll_secs: rule.min_poll_secs,
+                allow_active_tx: !rule.is_external || rule.allow_write,
             });
         }
         if let Some(m) = self.vendors.get(&info.vid) {
@@ -368,9 +385,28 @@ impl DeviceRegistry {
                 kind: DeviceKind::Other,
                 protocol: ProtocolFamily::Standard,
                 min_poll_secs: None,
+                allow_active_tx: false,
             });
         }
         None
+    }
+
+    pub fn allows_active_tx(&self, info: &HidInterfaceInfo, family: ProtocolFamily) -> bool {
+        match family {
+            ProtocolFamily::Standard | ProtocolFamily::Unknown => false,
+            ProtocolFamily::CustomHid => self
+                .matching_custom_rules(info)
+                .into_iter()
+                .any(|r| !r.is_external || r.allow_write),
+            ProtocolFamily::Rapoo
+            | ProtocolFamily::Sonix
+            | ProtocolFamily::Compx
+            | ProtocolFamily::Rongyuan
+            | ProtocolFamily::Hidpp => self
+                .exact
+                .get(&(info.vid, info.pid))
+                .is_some_and(|m| m.allow_active_tx && m.protocol == family),
+        }
     }
 
     pub fn is_vendor_fallback(&self, info: &HidInterfaceInfo) -> bool {
@@ -418,7 +454,7 @@ impl DeviceRegistry {
     }
 }
 
-struct ReadOnlyHidIo<'a>(&'a dyn HidIo);
+pub struct ReadOnlyHidIo<'a>(pub &'a dyn HidIo);
 
 impl<'a> HidIo for ReadOnlyHidIo<'a> {
     fn info(&self) -> &HidInterfaceInfo {
@@ -430,7 +466,7 @@ impl<'a> HidIo for ReadOnlyHidIo<'a> {
     }
 
     fn write_output(&self, _data: &[u8]) -> Result<(), String> {
-        Err("Read-only mode: vendor fallback blocks write_output".into())
+        Err("Read-only mode: unauthorized interface blocks write_output".into())
     }
 
     fn read_input(&self, timeout_ms: u32) -> Result<Vec<u8>, String> {
@@ -446,7 +482,7 @@ impl<'a> HidIo for ReadOnlyHidIo<'a> {
     }
 
     fn set_feature(&self, _data: &[u8]) -> Result<(), String> {
-        Err("Read-only mode: vendor fallback blocks set_feature".into())
+        Err("Read-only mode: unauthorized interface blocks set_feature".into())
     }
 }
 
@@ -456,18 +492,21 @@ pub fn probe_protocol(
     io: &dyn HidIo,
 ) -> Option<BatteryReading> {
     let info = io.info();
+    let ro_wrapper = ReadOnlyHidIo(io);
     if standard::matches(info) {
-        if let Some(reading) = standard::probe(io) {
+        if let Some(reading) = standard::probe(&ro_wrapper) {
             return Some(reading);
         }
     }
 
-    let vendor_ro = registry.is_vendor_fallback(info);
-    let ro_wrapper = ReadOnlyHidIo(io);
-    let effective_io: &dyn HidIo = if vendor_ro { &ro_wrapper } else { io };
+    let effective_io: &dyn HidIo = if registry.allows_active_tx(info, family) {
+        io
+    } else {
+        &ro_wrapper
+    };
 
     match family {
-        ProtocolFamily::Standard => standard::probe(effective_io),
+        ProtocolFamily::Standard => standard::probe(&ro_wrapper),
         ProtocolFamily::Rapoo => rapoo::probe(effective_io),
         ProtocolFamily::Sonix => sonix::probe(effective_io),
         ProtocolFamily::Compx => compx::probe(effective_io),
@@ -843,5 +882,136 @@ battery_max = 100
         let _ = probe_protocol(&reg, ProtocolFamily::Rongyuan, &ry_io);
         assert!(ry_io.writes.borrow().is_empty());
         assert!(ry_io.features_set.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_external_device_mapping_cannot_grant_active_tx_or_bypass_readonly() {
+        let builtin = include_str!("../../../devices.toml");
+        let ext = r#"
+# External [[device]] adding unverified VID:PID with sonix
+[[device]]
+vid = "1234"
+pid = "ABCD"
+name = "Unverified External Sonix"
+kind = "keyboard"
+protocol = "sonix"
+
+# External [[device]] trying to promote unknown PID under vendor 362D to exact sonix
+[[device]]
+vid = "362D"
+pid = "9999"
+name = "Unverified Vendor Override"
+kind = "keyboard"
+protocol = "sonix"
+
+# External [[device]] trying to assign hidpp to unverified VID:PID
+[[device]]
+vid = "046D"
+pid = "9999"
+name = "Unverified Logitech PID"
+kind = "mouse"
+protocol = "hidpp"
+
+# External [[device]] switching protocol on an existing built-in VID:PID (24AE:1412 rapoo -> compx)
+[[device]]
+vid = "24AE"
+pid = "1412"
+name = "Rapoo Switched Protocol"
+kind = "mouse"
+protocol = "compx"
+
+# External [[device]] overriding only name/min_poll_secs on existing built-in 362D:D101 with SAME protocol
+[[device]]
+vid = "362D"
+pid = "D101"
+name = "SKN Qinglong Renamed"
+kind = "keyboard"
+protocol = "sonix"
+min_poll_secs = 120
+"#;
+        let reg = DeviceRegistry::from_toml_parts(builtin, &[ext]);
+
+        // 1. Unverified external [[device]] (1234:ABCD -> sonix) must be read-only (0 TX)
+        let mut ext_sonix_info = mk_info(0x1234, 0xABCD, 0xFF60, 0x0061);
+        ext_sonix_info.input_len = 33;
+        ext_sonix_info.output_len = 33;
+        let meta1 = reg.lookup(&ext_sonix_info).unwrap();
+        assert!(!meta1.allow_active_tx);
+        assert!(!reg.allows_active_tx(&ext_sonix_info, ProtocolFamily::Sonix));
+        let io1 = RecordingHidIo::new(ext_sonix_info);
+        let _ = probe_protocol(&reg, ProtocolFamily::Sonix, &io1);
+        assert!(io1.writes.borrow().is_empty());
+        assert!(io1.features_set.borrow().is_empty());
+
+        // 2. External [[device]] overriding vendor fallback unknown PID (362D:9999) must stay read-only (0 TX)
+        let mut vendor_override_info = mk_info(0x362D, 0x9999, 0xFF60, 0x0061);
+        vendor_override_info.input_len = 33;
+        vendor_override_info.output_len = 33;
+        let meta2 = reg.lookup(&vendor_override_info).unwrap();
+        assert!(!meta2.allow_active_tx);
+        assert!(!reg.allows_active_tx(&vendor_override_info, ProtocolFamily::Sonix));
+        let io2 = RecordingHidIo::new(vendor_override_info);
+        let _ = probe_protocol(&reg, ProtocolFamily::Sonix, &io2);
+        assert!(io2.writes.borrow().is_empty());
+        assert!(io2.features_set.borrow().is_empty());
+
+        // 3. External [[device]] assigning hidpp to unverified PID (046D:9999) must stay read-only (0 TX)
+        let mut ext_hidpp_info = mk_info(0x046D, 0x9999, 0xFF00, 0x0002);
+        ext_hidpp_info.input_len = 20;
+        ext_hidpp_info.output_len = 20;
+        let meta3 = reg.lookup(&ext_hidpp_info).unwrap();
+        assert!(!meta3.allow_active_tx);
+        assert!(!reg.allows_active_tx(&ext_hidpp_info, ProtocolFamily::Hidpp));
+        let io3 = RecordingHidIo::new(ext_hidpp_info);
+        let _ = probe_protocol(&reg, ProtocolFamily::Hidpp, &io3);
+        assert!(io3.writes.borrow().is_empty());
+        assert!(io3.features_set.borrow().is_empty());
+
+        // 4. External [[device]] switching protocol of built-in VID:PID (24AE:1412 rapoo -> compx) must be read-only (0 TX)
+        let mut switched_info = mk_info(0x24AE, 0x1412, 0xFF02, 0x0002);
+        switched_info.input_len = 17;
+        switched_info.output_len = 17;
+        let meta4 = reg.lookup(&switched_info).unwrap();
+        assert!(!meta4.allow_active_tx);
+        let io4 = RecordingHidIo::new(switched_info);
+        let _ = probe_protocol(&reg, ProtocolFamily::Compx, &io4);
+        assert!(io4.writes.borrow().is_empty());
+        assert!(io4.features_set.borrow().is_empty());
+
+        // 5. Completely unknown interface (9999:9999) must produce 0 active writes for any protocol
+        for (proto, up, u, len) in [
+            (ProtocolFamily::Sonix, 0xFF60, 0x0061, 33),
+            (ProtocolFamily::Compx, 0xFF05, 0x0001, 64),
+            (ProtocolFamily::Rongyuan, 0xFFFF, 0x0002, 65),
+            (ProtocolFamily::Hidpp, 0xFF00, 0x0002, 20),
+        ] {
+            let mut unk = mk_info(0x9999, 0x9999, up, u);
+            unk.input_len = len;
+            unk.output_len = len;
+            unk.feature_len = len;
+            assert!(!reg.allows_active_tx(&unk, proto));
+            let io_unk = RecordingHidIo::new(unk);
+            let _ = probe_protocol(&reg, proto, &io_unk);
+            assert!(
+                io_unk.writes.borrow().is_empty(),
+                "unknown interface produced write_output for {:?}",
+                proto
+            );
+            assert!(
+                io_unk.features_set.borrow().is_empty(),
+                "unknown interface produced set_feature for {:?}",
+                proto
+            );
+        }
+
+        // 6. Metadata-only override on existing built-in 362D:D101 with SAME protocol retains allow_active_tx
+        let mut skn_info = mk_info(0x362D, 0xD101, 0xFF60, 0x0061);
+        skn_info.input_len = 33;
+        skn_info.output_len = 33;
+        let skn_meta = reg.lookup(&skn_info).unwrap();
+        assert_eq!(skn_meta.name, "SKN Qinglong Renamed");
+        assert_eq!(skn_meta.min_poll_secs, Some(120));
+        assert!(skn_meta.allow_active_tx);
+        assert!(reg.allows_active_tx(&skn_info, ProtocolFamily::Sonix));
     }
 }

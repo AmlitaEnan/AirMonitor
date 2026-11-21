@@ -86,6 +86,8 @@ pub struct CustomHidTomlEntry {
     #[serde(default)]
     pub allow_write: bool,
     #[serde(default)]
+    pub report_id: Option<u8>,
+    #[serde(default)]
     pub min_poll_secs: Option<u64>,
 }
 
@@ -116,6 +118,7 @@ pub struct CustomHidRule {
     pub charging_offset: Option<usize>,
     pub charging_mask: u8,
     pub allow_write: bool,
+    pub report_id: Option<u8>,
     pub min_poll_secs: Option<u64>,
     pub is_external: bool,
 }
@@ -170,6 +173,7 @@ impl CustomHidRule {
             charging_offset,
             charging_mask: entry.charging_mask,
             allow_write: entry.allow_write,
+            report_id: entry.report_id,
             min_poll_secs: entry.min_poll_secs,
             is_external,
         })
@@ -414,7 +418,11 @@ fn probe_single_rule(
     let info = io.info();
     match rule.report_type {
         CustomReportType::Feature => {
-            let rid = rule.tx_bytes.first().copied().unwrap_or(0);
+            let rid = if !rule.tx_bytes.is_empty() {
+                rule.tx_bytes[0]
+            } else {
+                rule.report_id.unwrap_or(0)
+            };
             if !rule.tx_bytes.is_empty() {
                 if let Err(reason) = check_rule_tx_safety(rule, info) {
                     raw_packets.push(format!("BLOCKED [{}]: {}", rule.name, reason));
@@ -700,6 +708,7 @@ mod tests {
             charging_offset: 3,
             charging_mask: 3,
             allow_write: false,
+            report_id: None,
             min_poll_secs: None,
         }
     }
@@ -708,6 +717,8 @@ mod tests {
         info: HidInterfaceInfo,
         writes: RefCell<Vec<Vec<u8>>>,
         features_set: RefCell<Vec<Vec<u8>>>,
+        feature_gets: RefCell<Vec<u8>>,
+        feature_responses: RefCell<std::collections::HashMap<u8, Vec<u8>>>,
         inputs: RefCell<Vec<Vec<u8>>>,
     }
 
@@ -717,6 +728,8 @@ mod tests {
                 info,
                 writes: RefCell::new(Vec::new()),
                 features_set: RefCell::new(Vec::new()),
+                feature_gets: RefCell::new(Vec::new()),
+                feature_responses: RefCell::new(std::collections::HashMap::new()),
                 inputs: RefCell::new(inputs),
             }
         }
@@ -741,8 +754,13 @@ mod tests {
                 Ok(q.remove(0))
             }
         }
-        fn get_feature(&self, _report_id: u8) -> Result<Vec<u8>, String> {
-            Err("unsupported".into())
+        fn get_feature(&self, report_id: u8) -> Result<Vec<u8>, String> {
+            self.feature_gets.borrow_mut().push(report_id);
+            self.feature_responses
+                .borrow()
+                .get(&report_id)
+                .cloned()
+                .ok_or_else(|| "unsupported".into())
         }
         fn get_input_report(&self, _report_id: u8) -> Result<Vec<u8>, String> {
             Err("unsupported".into())
@@ -798,6 +816,7 @@ mod tests {
             charging_offset: 12,
             charging_mask: 0xFF,
             allow_write: false,
+            report_id: None,
             min_poll_secs: None,
         };
         let rule = CustomHidRule::from_toml(&realtek_entry).unwrap();
@@ -837,6 +856,7 @@ mod tests {
             charging_offset: 40,
             charging_mask: 128,
             allow_write: false,
+            report_id: None,
             min_poll_secs: None,
         };
         let rule = CustomHidRule::from_toml(&glw).unwrap();
@@ -962,5 +982,50 @@ mod tests {
             .raw_packets
             .iter()
             .any(|p| p.contains("BLOCKED") && p.contains("exceeds HID output_len")));
+    }
+
+    #[test]
+    fn test_readonly_get_feature_uses_explicit_report_id_and_defaults_to_zero() {
+        let mut entry = base_entry();
+        entry.report_type = "get_feature".into();
+        entry.tx_hex = "".into();
+        entry.rx_prefix_hex = "07".into();
+        entry.battery_offset = 2;
+        entry.battery_max = 100;
+        entry.charging_offset = -1;
+        entry.report_id = Some(0x07);
+        entry.out_len = None;
+        entry.in_len = None;
+        entry.feat_len = Some(16);
+
+        let rule = CustomHidRule::from_toml_with_source(&entry, true).unwrap();
+        assert!(rule.is_read_only());
+        assert!(validate_external_rule(&entry, &rule).is_ok());
+
+        let mut info = sample_info();
+        info.feature_len = 16;
+        let io = MockHidIo::new(info.clone(), vec![]);
+        io.feature_responses
+            .borrow_mut()
+            .insert(0x07, vec![0x07, 0x01, 66, 0x00]);
+        let reading = probe_rules(&[&rule], &io).expect("get_feature(0x07) should succeed");
+        assert_eq!(reading.battery_pct, Some(66));
+        assert_eq!(*io.feature_gets.borrow(), vec![0x07]);
+        assert!(io.writes.borrow().is_empty());
+        assert!(io.features_set.borrow().is_empty());
+
+        // Legacy rule without report_id defaults to 0
+        entry.report_id = None;
+        entry.rx_prefix_hex = "".into();
+        let legacy_rule = CustomHidRule::from_toml_with_source(&entry, true).unwrap();
+        let io_legacy = MockHidIo::new(info, vec![]);
+        io_legacy
+            .feature_responses
+            .borrow_mut()
+            .insert(0x00, vec![0x00, 0x01, 52, 0x00]);
+        let legacy_reading =
+            probe_rules(&[&legacy_rule], &io_legacy).expect("legacy get_feature should use rid 0");
+        assert_eq!(legacy_reading.battery_pct, Some(52));
+        assert_eq!(*io_legacy.feature_gets.borrow(), vec![0x00]);
     }
 }

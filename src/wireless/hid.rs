@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::cell::UnsafeCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
@@ -18,7 +19,8 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
 };
 use windows::Win32::Devices::Properties::{DEVPKEY_Device_ContainerId, DEVPROP_TYPE_GUID};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -29,7 +31,7 @@ use windows::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResul
 
 use super::protocols::{
     format_hex, hidpp, probe_protocol, rapoo, BatteryReading, DeviceRegistry, HidInterfaceInfo,
-    HidIo, ProtocolFamily,
+    HidIo, ProtocolFamily, ReadOnlyHidIo,
 };
 use crate::state::{DeviceKind, Transport, WirelessDevice};
 
@@ -38,6 +40,9 @@ const HID_OFFLINE_FAIL_THRESHOLD: u32 = 3;
 const HID_POLL_BUDGET: Duration = Duration::from_millis(4500);
 const HID_IOCTL_TIMEOUT_MS: u32 = 300;
 const HID_WAIT_SLICE_MS: u32 = 50;
+const HID_CANCEL_WAIT_MS: u32 = 80;
+const HID_RECLAIM_QUEUE_CAP: usize = 64;
+const HID_QUARANTINE_SECS: u64 = 120;
 const HID_MAX_BACKOFF_SECS: u64 = 600;
 const HID_DEFAULT_POLL_BASE_SECS: u64 = 45;
 const HID_PASSIVE_MAX_BACKOFF_SECS: u64 = 45;
@@ -77,6 +82,9 @@ impl Drop for DevInfoGuard {
 
 struct HandleGuard(HANDLE);
 
+unsafe impl Send for HandleGuard {}
+unsafe impl Sync for HandleGuard {}
+
 impl Drop for HandleGuard {
     fn drop(&mut self) {
         if !self.0.is_invalid() && !self.0 .0.is_null() {
@@ -87,11 +95,368 @@ impl Drop for HandleGuard {
     }
 }
 
+trait ReclaimableIo: Send {
+    fn is_completed(&mut self) -> bool;
+}
+
+struct Win32PendingIo {
+    handle: Arc<HandleGuard>,
+    event: HandleGuard,
+    overlapped: Box<UnsafeCell<OVERLAPPED>>,
+    buffer: Box<[UnsafeCell<u8>]>,
+    completed: bool,
+}
+
+unsafe impl Send for Win32PendingIo {}
+
+impl Win32PendingIo {
+    fn new(handle: Arc<HandleGuard>, event: HandleGuard, buf_len: usize) -> Self {
+        let overlapped = Box::new(UnsafeCell::new(OVERLAPPED {
+            hEvent: event.0,
+            ..Default::default()
+        }));
+        let buffer: Box<[UnsafeCell<u8>]> = (0..buf_len)
+            .map(|_| UnsafeCell::new(0u8))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            handle,
+            event,
+            overlapped,
+            buffer,
+            completed: false,
+        }
+    }
+
+    fn overlapped_ptr(&self) -> *mut OVERLAPPED {
+        self.overlapped.get()
+    }
+
+    fn buffer_ptr(&self) -> *mut u8 {
+        self.buffer.as_ptr() as *mut u8
+    }
+
+    fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Safety: must only be called before the kernel owns the buffer (prior to I/O submission)
+    /// or after `self.completed == true`.
+    unsafe fn buffer_mut_slice(&mut self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.buffer_ptr(), self.buffer.len())
+    }
+
+    /// Safety: must only be called after `self.completed == true`.
+    unsafe fn copy_out(&self, len: usize) -> Vec<u8> {
+        let take = len.min(self.buffer.len());
+        let slice = std::slice::from_raw_parts(self.buffer.as_ptr() as *const u8, take);
+        slice.to_vec()
+    }
+
+    fn poll_completed(&mut self) -> bool {
+        if self.completed {
+            return true;
+        }
+        unsafe {
+            let mut transferred = 0u32;
+            match GetOverlappedResult(
+                self.handle.0,
+                self.overlapped.get(),
+                &mut transferred,
+                false,
+            ) {
+                Ok(()) => {
+                    self.completed = true;
+                    true
+                }
+                Err(e) if e.code() == ERROR_IO_INCOMPLETE.into() => false,
+                Err(_) => {
+                    self.completed = true;
+                    true
+                }
+            }
+        }
+    }
+}
+
+impl ReclaimableIo for Win32PendingIo {
+    fn is_completed(&mut self) -> bool {
+        self.poll_completed()
+    }
+}
+
+impl Drop for Win32PendingIo {
+    fn drop(&mut self) {
+        if !self.completed && !self.poll_completed() {
+            // Kernel IRP still holds raw pointers to OVERLAPPED, buffer, and event;
+            // retain those allocations rather than triggering a UAF on late driver completion.
+            let ov = std::mem::replace(
+                &mut self.overlapped,
+                Box::new(UnsafeCell::new(OVERLAPPED::default())),
+            );
+            let buf = std::mem::replace(&mut self.buffer, Vec::new().into_boxed_slice());
+            let ev = std::mem::replace(&mut self.event, HandleGuard(HANDLE::default()));
+            std::mem::forget(ov);
+            std::mem::forget(buf);
+            std::mem::forget(ev);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReclaimerInner {
+    pending: VecDeque<Box<dyn ReclaimableIo>>,
+    max_pending: usize,
+    quarantined_until: HashMap<String, Instant>,
+    reaper_running: bool,
+    evicted_uncompleted: u64,
+    reclaimed_total: u64,
+}
+
+struct IoReclaimer {
+    inner: Mutex<ReclaimerInner>,
+    wake_cvar: Condvar,
+    shutdown: AtomicBool,
+}
+
+impl IoReclaimer {
+    fn new(max_pending: usize) -> Self {
+        Self {
+            inner: Mutex::new(ReclaimerInner {
+                pending: VecDeque::new(),
+                max_pending: max_pending.max(1),
+                quarantined_until: HashMap::new(),
+                reaper_running: false,
+                evicted_uncompleted: 0,
+                reclaimed_total: 0,
+            }),
+            wake_cvar: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    fn reap_locked(inner: &mut ReclaimerInner) -> usize {
+        let before = inner.pending.len();
+        let mut idx = 0usize;
+        while idx < inner.pending.len() {
+            let done = inner
+                .pending
+                .get_mut(idx)
+                .is_some_and(|item| item.is_completed());
+            if done {
+                let _ = inner.pending.remove(idx);
+                inner.reclaimed_total = inner.reclaimed_total.saturating_add(1);
+            } else {
+                idx += 1;
+            }
+        }
+        before.saturating_sub(inner.pending.len())
+    }
+
+    fn reap_completed(&self) -> usize {
+        let Ok(mut inner) = self.inner.lock() else {
+            return 0;
+        };
+        Self::reap_locked(&mut inner)
+    }
+
+    fn is_saturated(&self) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        Self::reap_locked(&mut inner);
+        inner.pending.len() >= inner.max_pending
+    }
+
+    fn is_quarantined(&self, norm_path: &str, now: Instant) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        inner.quarantined_until.retain(|_, until| *until > now);
+        inner
+            .quarantined_until
+            .get(norm_path)
+            .is_some_and(|until| *until > now)
+    }
+
+    fn quarantine_path(&self, norm_path: &str, now: Instant, duration: Duration) {
+        if norm_path.is_empty() {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .quarantined_until
+                .insert(norm_path.to_string(), now + duration);
+        }
+    }
+
+    fn handoff(self: &Arc<Self>, item: Box<dyn ReclaimableIo>, spawn_reaper: bool) {
+        let should_spawn = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            Self::reap_locked(&mut inner);
+            while inner.pending.len() >= inner.max_pending {
+                let _ = inner.pending.pop_front();
+                inner.evicted_uncompleted = inner.evicted_uncompleted.saturating_add(1);
+            }
+            inner.pending.push_back(item);
+            if spawn_reaper && !inner.reaper_running && !self.shutdown.load(Ordering::Acquire) {
+                inner.reaper_running = true;
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_spawn {
+            let reclaimer = Arc::clone(self);
+            if std::thread::Builder::new()
+                .name("hid-io-reclaim".to_string())
+                .spawn(move || {
+                    while !reclaimer.shutdown.load(Ordering::Acquire) {
+                        let Ok(mut inner) = reclaimer.inner.lock() else {
+                            break;
+                        };
+                        Self::reap_locked(&mut inner);
+                        if inner.pending.is_empty() {
+                            inner.reaper_running = false;
+                            return;
+                        }
+                        let (guard, _) = reclaimer
+                            .wake_cvar
+                            .wait_timeout(inner, Duration::from_millis(40))
+                            .unwrap_or_else(|e| e.into_inner());
+                        drop(guard);
+                    }
+                    if let Ok(mut inner) = reclaimer.inner.lock() {
+                        Self::reap_locked(&mut inner);
+                        inner.reaper_running = false;
+                    }
+                })
+                .is_err()
+            {
+                if let Ok(mut inner) = self.inner.lock() {
+                    inner.reaper_running = false;
+                }
+            }
+        }
+    }
+
+    fn shutdown_and_reap(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.wake_cvar.notify_all();
+        let _ = self.reap_completed();
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.inner.lock().map(|g| g.pending.len()).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, u64, u64) {
+        self.inner
+            .lock()
+            .map(|g| (g.pending.len(), g.reclaimed_total, g.evicted_uncompleted))
+            .unwrap_or((0, 0, 0))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitSliceResult {
+    Signaled,
+    Timeout,
+    Failed,
+}
+
+#[derive(Debug)]
+enum OverlappedDriveError {
+    CompletedErr(String),
+    DeferredPending(String),
+}
+
+trait OverlappedOps {
+    fn wait_slice(&mut self, timeout_ms: u32) -> WaitSliceResult;
+    fn cancel_io(&mut self);
+    fn poll_completed(&mut self) -> bool;
+    fn read_result(&mut self) -> Result<u32, String>;
+}
+
+fn drive_overlapped_wait(
+    stop_flag: &AtomicBool,
+    timeout_ms: u32,
+    cancel_wait_ms: u32,
+    op_name: &str,
+    ops: &mut impl OverlappedOps,
+) -> Result<u32, OverlappedDriveError> {
+    let mut remaining = timeout_ms;
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            ops.cancel_io();
+            let _ = ops.wait_slice(cancel_wait_ms);
+            if ops.poll_completed() {
+                return Err(OverlappedDriveError::CompletedErr(format!(
+                    "{} cancelled",
+                    op_name
+                )));
+            }
+            return Err(OverlappedDriveError::DeferredPending(format!(
+                "{} cancelled (deferred reclaim)",
+                op_name
+            )));
+        }
+
+        let slice = remaining.min(HID_WAIT_SLICE_MS);
+        match ops.wait_slice(slice) {
+            WaitSliceResult::Signaled => {
+                let _ = ops.poll_completed();
+                return ops
+                    .read_result()
+                    .map_err(OverlappedDriveError::CompletedErr);
+            }
+            WaitSliceResult::Failed => {
+                ops.cancel_io();
+                let _ = ops.wait_slice(cancel_wait_ms);
+                if ops.poll_completed() {
+                    return Err(OverlappedDriveError::CompletedErr(format!(
+                        "{} wait failed",
+                        op_name
+                    )));
+                }
+                return Err(OverlappedDriveError::DeferredPending(format!(
+                    "{} wait failed (deferred reclaim)",
+                    op_name
+                )));
+            }
+            WaitSliceResult::Timeout => {
+                if remaining <= slice {
+                    ops.cancel_io();
+                    let _ = ops.wait_slice(cancel_wait_ms);
+                    if ops.poll_completed() {
+                        return Err(OverlappedDriveError::CompletedErr(format!(
+                            "{} timeout",
+                            op_name
+                        )));
+                    }
+                    return Err(OverlappedDriveError::DeferredPending(format!(
+                        "{} timeout (deferred reclaim)",
+                        op_name
+                    )));
+                }
+                remaining -= slice;
+            }
+        }
+    }
+}
+
 struct OpenHidDevice {
-    handle: HandleGuard,
+    handle: Arc<HandleGuard>,
+    norm_path: String,
     info: HidInterfaceInfo,
     can_rw: bool,
     stop_flag: Arc<AtomicBool>,
+    reclaimer: Arc<IoReclaimer>,
 }
 
 // Exclusive ownership via &mut HidMonitor; Win32 overlapped HANDLE may move across threads.
@@ -102,7 +467,7 @@ impl OpenHidDevice {
         path: &str,
         read_write: bool,
         stop_flag: &AtomicBool,
-    ) -> Option<(HandleGuard, bool)> {
+    ) -> Option<(Arc<HandleGuard>, bool)> {
         if stop_flag.load(Ordering::Relaxed) {
             return None;
         }
@@ -158,17 +523,24 @@ impl OpenHidDevice {
                 }
             }
         };
-        Some((HandleGuard(handle), can_rw))
+        Some((Arc::new(HandleGuard(handle)), can_rw))
     }
 
-    fn open(path: &str, read_write: bool, stop_flag: Arc<AtomicBool>) -> Option<Self> {
+    fn open(
+        path: &str,
+        read_write: bool,
+        stop_flag: Arc<AtomicBool>,
+        reclaimer: Arc<IoReclaimer>,
+    ) -> Option<Self> {
         let (guard, can_rw) = Self::open_handle(path, read_write, &stop_flag)?;
         let info = unsafe { read_hid_info(guard.0, path)? };
         Some(Self {
             handle: guard,
+            norm_path: normalize_hid_path(path),
             info,
             can_rw,
             stop_flag,
+            reclaimer,
         })
     }
 
@@ -176,83 +548,146 @@ impl OpenHidDevice {
         info: HidInterfaceInfo,
         read_write: bool,
         stop_flag: Arc<AtomicBool>,
+        reclaimer: Arc<IoReclaimer>,
     ) -> Option<Self> {
         let (guard, can_rw) = Self::open_handle(&info.path, read_write, &stop_flag)?;
+        let norm_path = normalize_hid_path(&info.path);
         Some(Self {
             handle: guard,
+            norm_path,
             info,
             can_rw,
             stop_flag,
+            reclaimer,
         })
     }
 
-    fn wait_overlapped(
+    fn run_overlapped<I, S>(
         &self,
-        overlapped: &mut OVERLAPPED,
-        event: HANDLE,
         timeout_ms: u32,
         op_name: &str,
-    ) -> Result<u32, String> {
-        let mut remaining = timeout_ms;
-        loop {
-            if self.stop_flag.load(Ordering::Relaxed) {
-                unsafe {
-                    let _ = CancelIoEx(self.handle.0, Some(overlapped));
-                    let mut dummy = 0u32;
-                    let _ = GetOverlappedResult(self.handle.0, overlapped, &mut dummy, true);
-                }
-                return Err(format!("{} cancelled", op_name));
-            }
-
-            let slice = remaining.min(HID_WAIT_SLICE_MS);
-            let wait = unsafe { WaitForSingleObject(event, slice) };
-            if wait == WAIT_OBJECT_0 {
-                let mut transferred = 0u32;
-                unsafe {
-                    GetOverlappedResult(self.handle.0, overlapped, &mut transferred, false)
-                        .map_err(|err| format!("{} overlapped failed: {}", op_name, err))?;
-                }
-                return Ok(transferred);
-            }
-            if wait != WAIT_TIMEOUT || remaining <= slice {
-                unsafe {
-                    let _ = CancelIoEx(self.handle.0, Some(overlapped));
-                    let mut dummy = 0u32;
-                    let _ = GetOverlappedResult(self.handle.0, overlapped, &mut dummy, true);
-                }
-                return Err(format!("{} timeout", op_name));
-            }
-            remaining -= slice;
-        }
-    }
-
-    fn run_overlapped<F>(&self, timeout_ms: u32, op_name: &str, submit: F) -> Result<u32, String>
+        buf_len: usize,
+        init_buf: I,
+        submit: S,
+    ) -> Result<Vec<u8>, String>
     where
-        F: FnOnce(&mut OVERLAPPED) -> windows::core::Result<()>,
+        I: FnOnce(&mut [u8]),
+        S: FnOnce(*mut u8, usize, *mut OVERLAPPED) -> windows::core::Result<()>,
     {
         if self.stop_flag.load(Ordering::Relaxed) {
             return Err(format!("{} cancelled", op_name));
         }
+        let now = Instant::now();
+        if self.reclaimer.is_quarantined(&self.norm_path, now) {
+            return Err(format!("{} skipped: device quarantined", op_name));
+        }
+        if self.reclaimer.is_saturated() {
+            return Err(format!("{} skipped: reclaim queue full", op_name));
+        }
+
         unsafe {
             let event = CreateEventW(None, true, false, None)
                 .map_err(|e| format!("CreateEventW failed: {}", e))?;
-            let _event_guard = HandleGuard(event);
-            let mut overlapped = OVERLAPPED {
-                hEvent: event,
-                ..Default::default()
-            };
+            let mut ctx = Box::new(Win32PendingIo::new(
+                Arc::clone(&self.handle),
+                HandleGuard(event),
+                buf_len,
+            ));
+            init_buf(ctx.buffer_mut_slice());
 
-            match submit(&mut overlapped) {
+            let ov_ptr = ctx.overlapped_ptr();
+            let buf_ptr = ctx.buffer_ptr();
+            let raw_len = ctx.buffer_len();
+
+            match submit(buf_ptr, raw_len, ov_ptr) {
                 Ok(()) => {
                     let mut transferred = 0u32;
-                    GetOverlappedResult(self.handle.0, &overlapped, &mut transferred, false)
-                        .map_err(|e| format!("{} GetOverlappedResult failed: {}", op_name, e))?;
-                    Ok(transferred)
+                    let res = GetOverlappedResult(self.handle.0, ov_ptr, &mut transferred, false);
+                    ctx.completed = true;
+                    res.map_err(|e| format!("{} GetOverlappedResult failed: {}", op_name, e))?;
+                    Ok(ctx.copy_out(transferred as usize))
                 }
                 Err(e) if e.code() == ERROR_IO_PENDING.into() => {
-                    self.wait_overlapped(&mut overlapped, event, timeout_ms, op_name)
+                    struct Win32WaitOps<'a> {
+                        file_handle: HANDLE,
+                        event_handle: HANDLE,
+                        ov_ptr: *mut OVERLAPPED,
+                        ctx: &'a mut Win32PendingIo,
+                        op_name: &'a str,
+                    }
+                    impl<'a> OverlappedOps for Win32WaitOps<'a> {
+                        fn wait_slice(&mut self, slice_ms: u32) -> WaitSliceResult {
+                            match unsafe { WaitForSingleObject(self.event_handle, slice_ms) } {
+                                WAIT_OBJECT_0 => WaitSliceResult::Signaled,
+                                WAIT_TIMEOUT => WaitSliceResult::Timeout,
+                                _ => WaitSliceResult::Failed,
+                            }
+                        }
+                        fn cancel_io(&mut self) {
+                            unsafe {
+                                let _ = CancelIoEx(self.file_handle, Some(self.ov_ptr));
+                            }
+                        }
+                        fn poll_completed(&mut self) -> bool {
+                            self.ctx.poll_completed()
+                        }
+                        fn read_result(&mut self) -> Result<u32, String> {
+                            let mut transferred = 0u32;
+                            unsafe {
+                                GetOverlappedResult(
+                                    self.file_handle,
+                                    self.ov_ptr,
+                                    &mut transferred,
+                                    false,
+                                )
+                                .map(|()| transferred)
+                                .map_err(|err| {
+                                    format!("{} overlapped failed: {}", self.op_name, err)
+                                })
+                            }
+                        }
+                    }
+
+                    let event_handle = ctx.event.0;
+                    let file_handle = self.handle.0;
+                    let mut ops = Win32WaitOps {
+                        file_handle,
+                        event_handle,
+                        ov_ptr,
+                        ctx: &mut ctx,
+                        op_name,
+                    };
+                    let drive_res = drive_overlapped_wait(
+                        &self.stop_flag,
+                        timeout_ms,
+                        HID_CANCEL_WAIT_MS,
+                        op_name,
+                        &mut ops,
+                    );
+                    match drive_res {
+                        Ok(transferred) => {
+                            ctx.completed = true;
+                            Ok(ctx.copy_out(transferred as usize))
+                        }
+                        Err(OverlappedDriveError::CompletedErr(msg)) => {
+                            ctx.completed = true;
+                            Err(msg)
+                        }
+                        Err(OverlappedDriveError::DeferredPending(msg)) => {
+                            self.reclaimer.quarantine_path(
+                                &self.norm_path,
+                                Instant::now(),
+                                Duration::from_secs(HID_QUARANTINE_SECS),
+                            );
+                            self.reclaimer.handoff(ctx, true);
+                            Err(msg)
+                        }
+                    }
                 }
-                Err(e) => Err(format!("{} error: {}", op_name, e)),
+                Err(e) => {
+                    ctx.completed = true;
+                    Err(format!("{} error: {}", op_name, e))
+                }
             }
         }
     }
@@ -272,13 +707,19 @@ impl HidIo for OpenHidDevice {
             return Err("HID interface not writable".into());
         }
         let len = self.info.output_len as usize;
-        let mut buf = vec![0u8; len];
-        let copy_len = data.len().min(len);
-        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-
-        self.run_overlapped(300, "WriteFile", |overlapped| unsafe {
-            WriteFile(self.handle.0, Some(&buf), None, Some(overlapped))
-        })?;
+        let _ = self.run_overlapped(
+            300,
+            "WriteFile",
+            len,
+            |buf| {
+                let copy_len = data.len().min(buf.len());
+                buf[..copy_len].copy_from_slice(&data[..copy_len]);
+            },
+            |buf_ptr, buf_len, ov_ptr| unsafe {
+                let slice = std::slice::from_raw_parts(buf_ptr, buf_len);
+                WriteFile(self.handle.0, Some(slice), None, Some(ov_ptr))
+            },
+        )?;
         Ok(())
     }
 
@@ -287,42 +728,48 @@ impl HidIo for OpenHidDevice {
             return Err("HID interface not readable".into());
         }
         let len = self.info.input_len as usize;
-        let mut buf = vec![0u8; len];
-
-        let transferred =
-            self.run_overlapped(timeout_ms.clamp(20, 500), "ReadFile", |overlapped| unsafe {
-                ReadFile(self.handle.0, Some(&mut buf), None, Some(overlapped))
-            })?;
-        buf.truncate((transferred as usize).min(buf.len()));
-        Ok(buf)
+        self.run_overlapped(
+            timeout_ms.clamp(20, 500),
+            "ReadFile",
+            len,
+            |_| {},
+            |buf_ptr, buf_len, ov_ptr| unsafe {
+                let slice = std::slice::from_raw_parts_mut(buf_ptr, buf_len);
+                ReadFile(self.handle.0, Some(slice), None, Some(ov_ptr))
+            },
+        )
     }
 
     fn get_feature(&self, report_id: u8) -> Result<Vec<u8>, String> {
         if self.info.feature_len == 0 {
             return Err("No feature report support".into());
         }
-        let mut buf = vec![0u8; self.info.feature_len as usize];
-        buf[0] = report_id;
-
+        let len = self.info.feature_len as usize;
         // IOCTL_HID_GET_FEATURE uses METHOD_OUT_DIRECT: Report ID is placed at output buffer byte 0.
-        let transferred = self.run_overlapped(
+        let mut buf = self.run_overlapped(
             HID_IOCTL_TIMEOUT_MS,
             "IOCTL_HID_GET_FEATURE",
-            |overlapped| unsafe {
+            len,
+            |b| {
+                if !b.is_empty() {
+                    b[0] = report_id;
+                }
+            },
+            |buf_ptr, buf_len, ov_ptr| unsafe {
                 DeviceIoControl(
                     self.handle.0,
                     IOCTL_HID_GET_FEATURE,
                     None,
                     0,
-                    Some(buf.as_mut_ptr() as *mut c_void),
-                    buf.len() as u32,
+                    Some(buf_ptr as *mut c_void),
+                    buf_len as u32,
                     None,
-                    Some(overlapped),
+                    Some(ov_ptr),
                 )
             },
         )?;
-        if transferred > 0 && (transferred as usize) < buf.len() {
-            buf.truncate(transferred as usize);
+        if buf.is_empty() {
+            buf.resize(len, 0);
         }
         Ok(buf)
     }
@@ -331,28 +778,32 @@ impl HidIo for OpenHidDevice {
         if self.info.input_len == 0 {
             return Err("No input report support".into());
         }
-        let mut buf = vec![0u8; self.info.input_len as usize];
-        buf[0] = report_id;
-
+        let len = self.info.input_len as usize;
         // IOCTL_HID_GET_INPUT_REPORT uses METHOD_OUT_DIRECT: Report ID is placed at output buffer byte 0.
-        let transferred = self.run_overlapped(
+        let mut buf = self.run_overlapped(
             HID_IOCTL_TIMEOUT_MS,
             "IOCTL_HID_GET_INPUT_REPORT",
-            |overlapped| unsafe {
+            len,
+            |b| {
+                if !b.is_empty() {
+                    b[0] = report_id;
+                }
+            },
+            |buf_ptr, buf_len, ov_ptr| unsafe {
                 DeviceIoControl(
                     self.handle.0,
                     IOCTL_HID_GET_INPUT_REPORT,
                     None,
                     0,
-                    Some(buf.as_mut_ptr() as *mut c_void),
-                    buf.len() as u32,
+                    Some(buf_ptr as *mut c_void),
+                    buf_len as u32,
                     None,
-                    Some(overlapped),
+                    Some(ov_ptr),
                 )
             },
         )?;
-        if transferred > 0 && (transferred as usize) < buf.len() {
-            buf.truncate(transferred as usize);
+        if buf.is_empty() {
+            buf.resize(len, 0);
         }
         Ok(buf)
     }
@@ -361,24 +812,26 @@ impl HidIo for OpenHidDevice {
         if self.info.feature_len == 0 {
             return Err("No feature report support".into());
         }
-        let mut buf = vec![0u8; self.info.feature_len as usize];
-        let copy_len = data.len().min(buf.len());
-        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-
+        let len = self.info.feature_len as usize;
         // IOCTL_HID_SET_FEATURE uses METHOD_IN_DIRECT: hidclass reads report payload from lpInBuffer.
-        self.run_overlapped(
+        let _ = self.run_overlapped(
             HID_IOCTL_TIMEOUT_MS,
             "IOCTL_HID_SET_FEATURE",
-            |overlapped| unsafe {
+            len,
+            |b| {
+                let copy_len = data.len().min(b.len());
+                b[..copy_len].copy_from_slice(&data[..copy_len]);
+            },
+            |buf_ptr, buf_len, ov_ptr| unsafe {
                 DeviceIoControl(
                     self.handle.0,
                     IOCTL_HID_SET_FEATURE,
-                    Some(buf.as_ptr() as *const c_void),
-                    buf.len() as u32,
+                    Some(buf_ptr as *const c_void),
+                    buf_len as u32,
                     None,
                     0,
                     None,
-                    Some(overlapped),
+                    Some(ov_ptr),
                 )
             },
         )?;
@@ -401,6 +854,7 @@ struct EnumeratedHidPath {
     instance_tag: String,
 }
 
+#[derive(Clone)]
 struct PollCandidate {
     info: HidInterfaceInfo,
     meta: super::protocols::DeviceMeta,
@@ -429,19 +883,52 @@ fn normalize_hid_path(path: &str) -> String {
     path.trim().to_ascii_lowercase()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HidPollMode {
+    Normal,
+    DeviceChange,
+    Force,
+}
+
+#[derive(Debug, Clone)]
+struct HidppSlotCache {
+    group_key: String,
+    dev_idx: u8,
+    device: WirelessDevice,
+    base_detail_note: Option<String>,
+    last_battery_seen: Instant,
+    fail_streak: u32,
+}
+
 pub struct HidMonitor {
     registry: DeviceRegistry,
     interface_cache: HashMap<String, HidInterfaceInfo>,
     persistent_handles: HashMap<String, OpenHidDevice>,
     cached_readings: HashMap<String, (BatteryReading, Instant)>,
     cached_group_devices: HashMap<String, (Vec<WirelessDevice>, Instant)>,
+    hidpp_slots: HashMap<String, HidppSlotCache>,
+    known_group_paths: HashMap<String, HashSet<String>>,
     poll_states: HashMap<String, DevicePollState>,
     stop_flag: Arc<AtomicBool>,
+    reclaimer: Arc<IoReclaimer>,
 }
 
 impl Default for HidMonitor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for HidMonitor {
+    fn drop(&mut self) {
+        self.persistent_handles.clear();
+        self.interface_cache.clear();
+        self.cached_readings.clear();
+        self.cached_group_devices.clear();
+        self.hidpp_slots.clear();
+        self.known_group_paths.clear();
+        self.poll_states.clear();
+        self.reclaimer.shutdown_and_reap();
     }
 }
 
@@ -457,8 +944,11 @@ impl HidMonitor {
             persistent_handles: HashMap::new(),
             cached_readings: HashMap::new(),
             cached_group_devices: HashMap::new(),
+            hidpp_slots: HashMap::new(),
+            known_group_paths: HashMap::new(),
             poll_states: HashMap::new(),
             stop_flag,
+            reclaimer: Arc::new(IoReclaimer::new(HID_RECLAIM_QUEUE_CAP)),
         };
         // Pre-open passive telemetry endpoints (e.g., Rapoo 54L 0xFF00:0x0002) so Windows HID
         // buffers incoming unsolicited 0x07 heartbeats between polls.
@@ -475,13 +965,19 @@ impl HidMonitor {
         if let Some(cached) = self.interface_cache.get(&key) {
             return Some(cached.clone());
         }
-        let dev = OpenHidDevice::open(path, false, Arc::clone(&self.stop_flag))?;
+        let dev = OpenHidDevice::open(
+            path,
+            false,
+            Arc::clone(&self.stop_flag),
+            Arc::clone(&self.reclaimer),
+        )?;
         self.interface_cache.insert(key, dev.info.clone());
         Some(dev.info)
     }
 
     fn warm_passive_handles(&mut self) {
-        for item in enumerate_hid_interfaces() {
+        let (enumerated, _) = enumerate_hid_interfaces_until(None);
+        for item in enumerated {
             if self.is_stopped() {
                 break;
             }
@@ -496,9 +992,12 @@ impl HidMonitor {
                 && info.usage == 0x0002
             {
                 let norm_key = normalize_hid_path(&info.path);
-                if let Some(rw) =
-                    OpenHidDevice::open_with_info(info, true, Arc::clone(&self.stop_flag))
-                {
+                if let Some(rw) = OpenHidDevice::open_with_info(
+                    info,
+                    true,
+                    Arc::clone(&self.stop_flag),
+                    Arc::clone(&self.reclaimer),
+                ) {
                     self.persistent_handles.insert(norm_key, rw);
                 }
             }
@@ -506,26 +1005,36 @@ impl HidMonitor {
     }
 
     pub fn poll(&mut self) -> Vec<WirelessDevice> {
-        self.poll_internal(false)
+        self.poll_internal(HidPollMode::Normal)
+    }
+
+    pub fn poll_device_change(&mut self) -> Vec<WirelessDevice> {
+        self.poll_internal(HidPollMode::DeviceChange)
     }
 
     pub fn poll_force(&mut self) -> Vec<WirelessDevice> {
-        self.poll_internal(true)
+        self.poll_internal(HidPollMode::Force)
     }
 
-    fn poll_internal(&mut self, force_refresh: bool) -> Vec<WirelessDevice> {
+    fn poll_internal(&mut self, mode: HidPollMode) -> Vec<WirelessDevice> {
         if self.is_stopped() {
             return Vec::new();
         }
-        let enumerated = enumerate_hid_interfaces();
+        let _ = self.reclaimer.reap_completed();
+        let poll_start = Instant::now();
+        let deadline = poll_start + HID_POLL_BUDGET;
+
+        let (enumerated, mut enum_complete) = enumerate_hid_interfaces_until(Some(deadline));
         let present_norm_paths: HashSet<String> = enumerated
             .iter()
             .map(|e| normalize_hid_path(&e.path))
             .collect();
-        self.persistent_handles
-            .retain(|p, _| present_norm_paths.contains(p));
-        self.interface_cache
-            .retain(|p, _| present_norm_paths.contains(p));
+        if enum_complete {
+            self.persistent_handles
+                .retain(|p, _| present_norm_paths.contains(p));
+            self.interface_cache
+                .retain(|p, _| present_norm_paths.contains(p));
+        }
 
         // Collect candidate interfaces and map each path to its physical device group key.
         let mut candidates: Vec<PollCandidate> = Vec::new();
@@ -533,6 +1042,10 @@ impl HidMonitor {
         for item in enumerated {
             if self.is_stopped() {
                 return Vec::new();
+            }
+            if Instant::now() >= deadline {
+                enum_complete = false;
+                break;
             }
             let Some(info) = self.get_or_read_interface_info(&item.path) else {
                 continue;
@@ -570,14 +1083,15 @@ impl HidMonitor {
         }
 
         let mut prober = RealCandidateProber {
-            poll_start: Instant::now(),
-            force_refresh,
+            deadline,
+            force_refresh: mode == HidPollMode::Force,
         };
-        self.poll_candidates_with_force(
+        self.poll_candidates_with_mode(
             candidates,
             &present_groups,
+            enum_complete,
             Instant::now(),
-            force_refresh,
+            mode,
             &mut prober,
         )
     }
@@ -590,29 +1104,85 @@ impl HidMonitor {
         now: Instant,
         prober: &mut impl CandidateProber,
     ) -> Vec<WirelessDevice> {
-        self.poll_candidates_with_force(candidates, present_groups, now, false, prober)
+        self.poll_candidates_with_mode(
+            candidates,
+            present_groups,
+            true,
+            now,
+            HidPollMode::Normal,
+            prober,
+        )
     }
 
+    #[cfg(test)]
     fn poll_candidates_with_force(
         &mut self,
-        mut candidates: Vec<PollCandidate>,
+        candidates: Vec<PollCandidate>,
         present_groups: &HashSet<String>,
         now: Instant,
         force_refresh: bool,
         prober: &mut impl CandidateProber,
     ) -> Vec<WirelessDevice> {
+        let mode = if force_refresh {
+            HidPollMode::Force
+        } else {
+            HidPollMode::Normal
+        };
+        self.poll_candidates_with_mode(candidates, present_groups, true, now, mode, prober)
+    }
+
+    fn poll_candidates_with_mode(
+        &mut self,
+        mut candidates: Vec<PollCandidate>,
+        present_groups: &HashSet<String>,
+        enum_complete: bool,
+        now: Instant,
+        mode: HidPollMode,
+        prober: &mut impl CandidateProber,
+    ) -> Vec<WirelessDevice> {
         let mut grouped: HashMap<String, WirelessDevice> = HashMap::new();
 
-        // Reset backoff/deferred/cached state when a device is unplugged.
-        self.poll_states.retain(|k, _| present_groups.contains(k));
+        // Only prune missing groups when full enumeration completed within budget.
+        if enum_complete {
+            self.poll_states.retain(|k, _| present_groups.contains(k));
+            self.known_group_paths
+                .retain(|k, _| present_groups.contains(k));
+        }
         self.cached_readings.retain(|k, (_, ts)| {
-            let group_present = present_groups.contains(k)
+            let group_present = !enum_complete
+                || present_groups.contains(k)
                 || k.rsplit_once(":slot")
                     .is_some_and(|(gk, _)| present_groups.contains(gk));
             group_present && is_within_cache_grace(*ts, now)
         });
-        self.cached_group_devices
-            .retain(|k, (_, ts)| present_groups.contains(k) && is_within_cache_grace(*ts, now));
+        self.cached_group_devices.retain(|k, (_, ts)| {
+            (!enum_complete || present_groups.contains(k)) && is_within_cache_grace(*ts, now)
+        });
+        self.hidpp_slots.retain(|_, slot| {
+            (!enum_complete || present_groups.contains(&slot.group_key))
+                && is_within_cache_grace(slot.last_battery_seen, now)
+        });
+
+        // Detect newly discovered groups or groups whose HID interface path set changed
+        // (for gentle DeviceChange refresh without waking unrelated sleeping devices).
+        let mut round_group_paths: HashMap<String, HashSet<String>> = HashMap::new();
+        for cand in &candidates {
+            round_group_paths
+                .entry(cand.group_key.clone())
+                .or_default()
+                .insert(normalize_hid_path(&cand.info.path));
+        }
+        let mut changed_groups: HashSet<String> = HashSet::new();
+        for (gk, paths) in &round_group_paths {
+            let changed = match self.known_group_paths.get(gk) {
+                Some(prev_paths) => prev_paths != paths,
+                None => true,
+            };
+            if changed {
+                changed_groups.insert(gk.clone());
+            }
+            self.known_group_paths.insert(gk.clone(), paths.clone());
+        }
 
         // Order deferred/least-recently-polled device groups first, then keep interface priorities
         // grouped by device key with zero allocations during sort.
@@ -620,9 +1190,13 @@ impl HidMonitor {
 
         let mut probed_groups_this_round: HashSet<String> = HashSet::new();
         let mut skipped_groups: HashSet<String> = HashSet::new();
+        let mut deferred_groups: HashSet<String> = HashSet::new();
         let mut group_had_success: HashMap<String, bool> = HashMap::new();
         let mut group_min_poll: HashMap<String, Option<u64>> = HashMap::new();
         let mut passive_push_groups: HashSet<String> = HashSet::new();
+        let mut hidpp_probed_groups: HashSet<String> = HashSet::new();
+        let mut hidpp_responded_slots: HashMap<String, HashSet<u8>> = HashMap::new();
+        let mut hidpp_hit_deadline_groups: HashSet<String> = HashSet::new();
 
         for cand in candidates {
             let PollCandidate {
@@ -666,12 +1240,24 @@ impl HidMonitor {
                 passive_push_groups.insert(group_key.clone());
             }
 
-            // Enforce per-device min_poll_secs / exponential backoff & overall poll budget
-            // once per device group per round (bypassed on explicit user/wake force refresh).
+            // Enforce per-device min_poll_secs / exponential backoff on group entry.
             if !probed_groups_this_round.contains(&group_key) {
-                if !force_refresh {
-                    if let Some(st) = self.poll_states.get(&group_key) {
-                        if now < st.next_probe_after {
+                if let Some(st) = self.poll_states.get(&group_key) {
+                    if now < st.next_probe_after {
+                        let bypass = match mode {
+                            HidPollMode::Force => true,
+                            HidPollMode::DeviceChange => {
+                                let group_changed = changed_groups.contains(&group_key);
+                                let within_min_poll = min_poll_secs.is_some_and(|secs| {
+                                    secs > 0
+                                        && now.saturating_duration_since(st.last_attempt).as_secs()
+                                            < secs
+                                });
+                                group_changed && !within_min_poll
+                            }
+                            HidPollMode::Normal => false,
+                        };
+                        if !bypass {
                             let cached_online = self.resolve_skipped_group_online(&group_key, now);
                             self.emit_cached_group_or_standby(
                                 &group_key,
@@ -686,35 +1272,27 @@ impl HidMonitor {
                         }
                     }
                 }
-
-                if prober.is_budget_exhausted() {
-                    let st = self
-                        .poll_states
-                        .entry(group_key.clone())
-                        .or_insert_with(|| DevicePollState {
-                            last_attempt: now,
-                            next_probe_after: now,
-                            fail_streak: 0,
-                            deferred: true,
-                            ever_had_battery: false,
-                        });
-                    st.deferred = true;
-                    let cached_online = self.resolve_skipped_group_online(&group_key, now);
-                    self.emit_cached_group_or_standby(
-                        &group_key,
-                        &info,
-                        &meta,
-                        cached_online,
-                        now,
-                        &mut grouped,
-                    );
-                    skipped_groups.insert(group_key);
-                    continue;
-                }
-
-                probed_groups_this_round.insert(group_key.clone());
-                group_had_success.entry(group_key.clone()).or_insert(false);
             }
+
+            // Check overall poll budget on EVERY candidate interface (including subsequent
+            // interfaces within the same device group) so budget cannot be exceeded mid-group.
+            if prober.is_budget_exhausted() {
+                deferred_groups.insert(group_key.clone());
+                let cached_online = self.resolve_skipped_group_online(&group_key, now);
+                self.emit_cached_group_or_standby(
+                    &group_key,
+                    &info,
+                    &meta,
+                    cached_online,
+                    now,
+                    &mut grouped,
+                );
+                skipped_groups.insert(group_key);
+                continue;
+            }
+
+            probed_groups_this_round.insert(group_key.clone());
+            group_had_success.entry(group_key.clone()).or_insert(false);
 
             let prev_state = self.poll_states.get(&group_key);
             let prev_streak = prev_state.map(|s| s.fail_streak).unwrap_or(0);
@@ -722,11 +1300,17 @@ impl HidMonitor {
             let tentative_fail_streak = prev_streak.saturating_add(1);
 
             if meta.protocol == ProtocolFamily::Hidpp {
-                let slot_results = prober.probe_hidpp(self, &info, &meta).unwrap_or_default();
-                if !slot_results.is_empty() {
+                hidpp_probed_groups.insert(group_key.clone());
+                let outcome = prober.probe_hidpp(self, &info, &meta).unwrap_or_default();
+                if outcome.hit_deadline {
+                    hidpp_hit_deadline_groups.insert(group_key.clone());
+                    deferred_groups.insert(group_key.clone());
+                }
+                if !outcome.slots.is_empty() {
                     group_had_success.insert(group_key.clone(), true);
-                    let mut group_devs = Vec::new();
-                    for (dev_idx, slot_name, slot_kind, reading) in slot_results {
+                    let responded_set = hidpp_responded_slots.entry(group_key.clone()).or_default();
+                    for (dev_idx, slot_name, slot_kind, reading) in outcome.slots {
+                        responded_set.insert(dev_idx);
                         let slot_key = if dev_idx == 0xFF {
                             group_key.clone()
                         } else {
@@ -734,6 +1318,7 @@ impl HidMonitor {
                         };
                         self.cached_readings
                             .insert(slot_key.clone(), (reading.clone(), now));
+                        let base_note = reading.detail_note.clone();
                         let entry = WirelessDevice {
                             id: slot_key.clone(),
                             name: slot_name,
@@ -746,36 +1331,19 @@ impl HidMonitor {
                             last_seen: now,
                             detail_note: reading.detail_note,
                         };
-                        group_devs.push(entry.clone());
-                        grouped.entry(slot_key).or_insert(entry);
+                        self.hidpp_slots.insert(
+                            slot_key.clone(),
+                            HidppSlotCache {
+                                group_key: group_key.clone(),
+                                dev_idx,
+                                device: entry.clone(),
+                                base_detail_note: base_note,
+                                last_battery_seen: now,
+                                fail_streak: 0,
+                            },
+                        );
+                        grouped.insert(slot_key, entry);
                     }
-                    self.cached_group_devices
-                        .insert(group_key.clone(), (group_devs, now));
-                } else if !group_had_success.get(&group_key).copied().unwrap_or(false) {
-                    let cached_ts = self.cached_group_devices.get(&group_key).map(|(_, ts)| *ts);
-                    let debounced_online = if ever_had_battery {
-                        tentative_fail_streak < HID_OFFLINE_FAIL_THRESHOLD
-                            && cached_ts.is_some_and(|ts| is_within_cache_grace(ts, now))
-                    } else {
-                        true
-                    };
-                    if !debounced_online {
-                        if let Some((cached_devs, _)) =
-                            self.cached_group_devices.get_mut(&group_key)
-                        {
-                            for d in cached_devs.iter_mut() {
-                                mark_device_cached_offline(d);
-                            }
-                        }
-                    }
-                    self.emit_cached_group_or_standby(
-                        &group_key,
-                        &info,
-                        &meta,
-                        debounced_online,
-                        now,
-                        &mut grouped,
-                    );
                 }
                 continue;
             }
@@ -870,6 +1438,66 @@ impl HidMonitor {
             }
         }
 
+        // Reconcile per-slot HID++ caches once per probed HID++ group so one awake slot never
+        // drops a sleeping sibling slot on the same receiver.
+        let mut expired_hidpp_keys = Vec::new();
+        for group_key in &hidpp_probed_groups {
+            let responded = hidpp_responded_slots.get(group_key);
+            let hit_deadline = hidpp_hit_deadline_groups.contains(group_key);
+            for (slot_key, slot) in self.hidpp_slots.iter_mut() {
+                if &slot.group_key != group_key {
+                    continue;
+                }
+                if responded.is_some_and(|set| set.contains(&slot.dev_idx)) {
+                    continue;
+                }
+                if !hit_deadline {
+                    slot.fail_streak = slot.fail_streak.saturating_add(1);
+                }
+                if !is_within_cache_grace(slot.last_battery_seen, now) {
+                    expired_hidpp_keys.push(slot_key.clone());
+                    continue;
+                }
+                let debounced_online = slot.fail_streak < HID_OFFLINE_FAIL_THRESHOLD;
+                let mut d = slot.device.clone();
+                d.online = debounced_online;
+                d.detail_note = slot.base_detail_note.clone();
+                if !debounced_online {
+                    mark_device_cached_offline(&mut d);
+                }
+                slot.device.online = debounced_online;
+                grouped.entry(slot_key.clone()).or_insert(d);
+            }
+        }
+        for key in expired_hidpp_keys {
+            self.hidpp_slots.remove(&key);
+        }
+
+        // If enumeration terminated early due to poll budget, emit cached devices for any
+        // unreached present groups and mark them deferred for priority next round.
+        if !enum_complete {
+            let mut deferred_cached_groups: HashSet<String> = HashSet::new();
+            for (gk, (devs, _)) in &self.cached_group_devices {
+                if !probed_groups_this_round.contains(gk) && !skipped_groups.contains(gk) {
+                    deferred_cached_groups.insert(gk.clone());
+                    for dev in devs {
+                        grouped.entry(dev.id.clone()).or_insert_with(|| dev.clone());
+                    }
+                }
+            }
+            for (slot_key, slot) in &self.hidpp_slots {
+                if !probed_groups_this_round.contains(&slot.group_key)
+                    && !skipped_groups.contains(&slot.group_key)
+                {
+                    deferred_cached_groups.insert(slot.group_key.clone());
+                    grouped
+                        .entry(slot_key.clone())
+                        .or_insert_with(|| slot.device.clone());
+                }
+            }
+            deferred_groups.extend(deferred_cached_groups);
+        }
+
         // Update poll scheduling & exponential backoff for every group probed this round.
         for group_key in probed_groups_this_round {
             let success = group_had_success.get(&group_key).copied().unwrap_or(false);
@@ -896,15 +1524,49 @@ impl HidMonitor {
                 }
             }
             next_state.ever_had_battery = prev_ever || success;
+            if deferred_groups.contains(&group_key) {
+                next_state.deferred = true;
+                // Keep next_probe_after <= now when deferred mid-group/slot due to budget
+                // so the next round prioritizes finishing deferred work.
+                if !success {
+                    next_state.fail_streak = prev_streak;
+                    next_state.next_probe_after = now;
+                }
+            }
             self.poll_states.insert(group_key, next_state);
         }
 
+        for group_key in deferred_groups {
+            let st = self
+                .poll_states
+                .entry(group_key)
+                .or_insert_with(|| DevicePollState {
+                    last_attempt: now,
+                    next_probe_after: now,
+                    fail_streak: 0,
+                    deferred: true,
+                    ever_had_battery: false,
+                });
+            st.deferred = true;
+        }
+
         let mut list: Vec<WirelessDevice> = grouped.into_values().collect();
-        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         list
     }
 
     fn resolve_skipped_group_online(&self, group_key: &str, now: Instant) -> bool {
+        let hidpp_slots: Vec<&HidppSlotCache> = self
+            .hidpp_slots
+            .values()
+            .filter(|s| s.group_key == group_key)
+            .collect();
+        if !hidpp_slots.is_empty() {
+            return hidpp_slots.iter().any(|s| {
+                s.fail_streak < HID_OFFLINE_FAIL_THRESHOLD
+                    && is_within_cache_grace(s.last_battery_seen, now)
+            });
+        }
         let Some(st) = self.poll_states.get(group_key) else {
             // Never probed yet (e.g. deferred on first poll by time budget): keep online.
             return true;
@@ -934,6 +1596,25 @@ impl HidMonitor {
         now: Instant,
         grouped: &mut HashMap<String, WirelessDevice>,
     ) {
+        let mut emitted_hidpp = false;
+        for (slot_key, slot) in &self.hidpp_slots {
+            if slot.group_key == group_key {
+                emitted_hidpp = true;
+                let slot_online = online
+                    && slot.fail_streak < HID_OFFLINE_FAIL_THRESHOLD
+                    && is_within_cache_grace(slot.last_battery_seen, now);
+                let mut d = slot.device.clone();
+                d.online = slot_online;
+                d.detail_note = slot.base_detail_note.clone();
+                if !slot_online {
+                    mark_device_cached_offline(&mut d);
+                }
+                grouped.entry(slot_key.clone()).or_insert(d);
+            }
+        }
+        if emitted_hidpp {
+            return;
+        }
         if let Some((cached_devs, _)) = self.cached_group_devices.get(group_key) {
             for dev in cached_devs {
                 let mut d = dev.clone();
@@ -969,6 +1650,10 @@ impl HidMonitor {
     }
 
     pub fn diagnostics(&mut self) -> String {
+        self.diagnostics_with_options(false)
+    }
+
+    pub fn diagnostics_with_options(&mut self, verbose: bool) -> String {
         let mut out = String::new();
         let reg_diags = self.registry.diagnostics();
         if !reg_diags.is_empty() {
@@ -981,7 +1666,7 @@ impl HidMonitor {
             out.push('\n');
         }
 
-        let enumerated = enumerate_hid_interfaces();
+        let (enumerated, _) = enumerate_hid_interfaces_until(None);
         let present_norm_paths: HashSet<String> = enumerated
             .iter()
             .map(|e| normalize_hid_path(&e.path))
@@ -1010,22 +1695,7 @@ impl HidMonitor {
                 .unwrap_or("Unmatched");
             let reg_name = matched.as_ref().map(|m| m.name.as_str()).unwrap_or("-");
 
-            out.push_str(&format!(
-                "  - {:04X}:{:04X} [{}] UP=0x{:04X} U=0x{:04X} len(I/O/F)=({}/{}/{}) | mfg='{}' prod='{}' sn='{}' | reg='{}' ({})\n",
-                info.vid,
-                info.pid,
-                if info.interface_tag.is_empty() { "-" } else { &info.interface_tag },
-                info.usage_page,
-                info.usage,
-                info.input_len,
-                info.output_len,
-                info.feature_len,
-                info.manufacturer,
-                info.product,
-                info.serial,
-                reg_name,
-                proto_label,
-            ));
+            out.push_str(&format_hid_diag_line(&info, reg_name, proto_label, verbose));
 
             let is_custom_match = matched
                 .as_ref()
@@ -1048,9 +1718,9 @@ impl HidMonitor {
                     .unwrap_or(ProtocolFamily::Unknown);
 
                 if family == ProtocolFamily::Hidpp {
-                    if self.registry.is_vendor_fallback(&info) {
+                    if !self.registry.allows_active_tx(&info, ProtocolFamily::Hidpp) {
                         out.push_str(
-                            "      -> Probe: skipped active HID++ write ([[vendor]] fallback read-only guard)\n",
+                            "      -> Probe: skipped active HID++ write (read-only guard)\n",
                         );
                         continue;
                     }
@@ -1062,15 +1732,28 @@ impl HidMonitor {
                         .as_ref()
                         .map(|m| m.kind)
                         .unwrap_or(DeviceKind::Other);
-                    if let Some(rw_dev) =
-                        OpenHidDevice::open_with_info(info, true, Arc::clone(&self.stop_flag))
-                    {
-                        let slots =
-                            probe_hidpp_multi_slot(&rw_dev, &base_name, kind, &self.stop_flag);
-                        if slots.is_empty() {
+                    if let Some(rw_dev) = OpenHidDevice::open_with_info(
+                        info,
+                        true,
+                        Arc::clone(&self.stop_flag),
+                        Arc::clone(&self.reclaimer),
+                    ) {
+                        let outcome = probe_hidpp_guarded(
+                            &self.registry,
+                            &rw_dev,
+                            &base_name,
+                            kind,
+                            &self.stop_flag,
+                            None,
+                        );
+                        if outcome.blocked_by_ro {
+                            out.push_str(
+                                "      -> Probe: skipped active HID++ write (read-only guard)\n",
+                            );
+                        } else if outcome.slots.is_empty() {
                             out.push_str("      -> Probe: no response\n");
                         } else {
-                            for (dev_idx, slot_name, _, reading) in slots {
+                            for (dev_idx, slot_name, _, reading) in outcome.slots {
                                 out.push_str(&format!(
                                     "      -> Probe[slot {} {}]: battery={:?}%, charging={}, online={}, note={:?}\n",
                                     dev_idx,
@@ -1096,14 +1779,17 @@ impl HidMonitor {
                             info.clone(),
                             true,
                             Arc::clone(&self.stop_flag),
+                            Arc::clone(&self.reclaimer),
                         ) {
                             self.persistent_handles.insert(norm_key.clone(), rw);
                         }
                     }
-                    let first = self
-                        .persistent_handles
-                        .get(&norm_key)
-                        .map(|io| rapoo::probe_detailed(io, 3200));
+                    let allow_tx = self.registry.allows_active_tx(&info, ProtocolFamily::Rapoo);
+                    let first = self.persistent_handles.get(&norm_key).map(|io| {
+                        let ro = ReadOnlyHidIo(io);
+                        let eff: &dyn HidIo = if allow_tx { io } else { &ro };
+                        rapoo::probe_detailed(eff, 3200)
+                    });
                     match first {
                         Some(res) if res.io_error => {
                             self.persistent_handles.remove(&norm_key);
@@ -1111,11 +1797,14 @@ impl HidMonitor {
                                 info,
                                 true,
                                 Arc::clone(&self.stop_flag),
+                                Arc::clone(&self.reclaimer),
                             ) {
                                 self.persistent_handles.insert(norm_key.clone(), rw);
-                                self.persistent_handles
-                                    .get(&norm_key)
-                                    .and_then(|io| rapoo::probe_diagnostics_listen(io))
+                                self.persistent_handles.get(&norm_key).and_then(|io| {
+                                    let ro = ReadOnlyHidIo(io);
+                                    let eff: &dyn HidIo = if allow_tx { io } else { &ro };
+                                    rapoo::probe_diagnostics_listen(eff)
+                                })
                             } else {
                                 res.reading
                             }
@@ -1124,8 +1813,13 @@ impl HidMonitor {
                         None => None,
                     }
                 } else {
-                    OpenHidDevice::open_with_info(info, true, Arc::clone(&self.stop_flag))
-                        .and_then(|rw_dev| probe_protocol(&self.registry, family, &rw_dev))
+                    OpenHidDevice::open_with_info(
+                        info,
+                        true,
+                        Arc::clone(&self.stop_flag),
+                        Arc::clone(&self.reclaimer),
+                    )
+                    .and_then(|rw_dev| probe_protocol(&self.registry, family, &rw_dev))
                 };
 
                 match probe_res {
@@ -1152,7 +1846,47 @@ impl HidMonitor {
     }
 }
 
+fn mask_hid_serial(serial: &str, verbose: bool) -> String {
+    if verbose || serial.is_empty() {
+        serial.to_string()
+    } else {
+        format!("<redacted:{}>", serial.len())
+    }
+}
+
+fn format_hid_diag_line(
+    info: &HidInterfaceInfo,
+    reg_name: &str,
+    proto_label: &str,
+    verbose: bool,
+) -> String {
+    let serial_disp = mask_hid_serial(&info.serial, verbose);
+    format!(
+        "  - {:04X}:{:04X} [{}] UP=0x{:04X} U=0x{:04X} len(I/O/F)=({}/{}/{}) | mfg='{}' prod='{}' sn='{}' | reg='{}' ({})\n",
+        info.vid,
+        info.pid,
+        if info.interface_tag.is_empty() { "-" } else { &info.interface_tag },
+        info.usage_page,
+        info.usage,
+        info.input_len,
+        info.output_len,
+        info.feature_len,
+        info.manufacturer,
+        info.product,
+        serial_disp,
+        reg_name,
+        proto_label,
+    )
+}
+
 type HidppSlotReading = (u8, String, DeviceKind, BatteryReading);
+
+#[derive(Default, Clone)]
+struct HidppProbeOutcome {
+    slots: Vec<HidppSlotReading>,
+    hit_deadline: bool,
+    blocked_by_ro: bool,
+}
 
 trait CandidateProber {
     fn is_budget_exhausted(&self) -> bool;
@@ -1161,7 +1895,7 @@ trait CandidateProber {
         monitor: &mut HidMonitor,
         info: &HidInterfaceInfo,
         meta: &super::protocols::DeviceMeta,
-    ) -> Option<Vec<HidppSlotReading>>;
+    ) -> Option<HidppProbeOutcome>;
     fn probe_standard_or_vendor(
         &mut self,
         monitor: &mut HidMonitor,
@@ -1172,13 +1906,21 @@ trait CandidateProber {
 }
 
 struct RealCandidateProber {
-    poll_start: Instant,
+    deadline: Instant,
     force_refresh: bool,
+}
+
+impl RealCandidateProber {
+    fn remaining_ms(&self) -> u64 {
+        self.deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64
+    }
 }
 
 impl CandidateProber for RealCandidateProber {
     fn is_budget_exhausted(&self) -> bool {
-        self.poll_start.elapsed() >= HID_POLL_BUDGET
+        Instant::now() >= self.deadline
     }
 
     fn probe_hidpp(
@@ -1186,19 +1928,35 @@ impl CandidateProber for RealCandidateProber {
         monitor: &mut HidMonitor,
         info: &HidInterfaceInfo,
         meta: &super::protocols::DeviceMeta,
-    ) -> Option<Vec<HidppSlotReading>> {
-        if monitor.registry.is_vendor_fallback(info) {
-            // Respect the [[vendor]] fallback read-only guard: never send active
-            // HID++ write_output queries to unknown PIDs.
-            return Some(Vec::new());
+    ) -> Option<HidppProbeOutcome> {
+        if !monitor
+            .registry
+            .allows_active_tx(info, ProtocolFamily::Hidpp)
+        {
+            return Some(HidppProbeOutcome {
+                slots: Vec::new(),
+                hit_deadline: false,
+                blocked_by_ro: true,
+            });
+        }
+        let norm_key = normalize_hid_path(&info.path);
+        if monitor.reclaimer.is_quarantined(&norm_key, Instant::now()) {
+            return Some(HidppProbeOutcome::default());
         }
         let base_name = resolve_hid_display_name(info, meta);
-        let io = OpenHidDevice::open_with_info(info.clone(), true, Arc::clone(&monitor.stop_flag))?;
-        Some(probe_hidpp_multi_slot(
+        let io = OpenHidDevice::open_with_info(
+            info.clone(),
+            true,
+            Arc::clone(&monitor.stop_flag),
+            Arc::clone(&monitor.reclaimer),
+        )?;
+        Some(probe_hidpp_guarded(
+            &monitor.registry,
             &io,
             &base_name,
             meta.kind,
             &monitor.stop_flag,
+            Some(self.deadline),
         ))
     }
 
@@ -1209,17 +1967,21 @@ impl CandidateProber for RealCandidateProber {
         meta: &super::protocols::DeviceMeta,
         group_key: &str,
     ) -> Option<BatteryReading> {
+        let norm_key = normalize_hid_path(&info.path);
+        if monitor.reclaimer.is_quarantined(&norm_key, Instant::now()) {
+            return None;
+        }
         if meta.protocol == ProtocolFamily::Rapoo
             && info.usage_page >= 0xFF00
             && info.usage == 0x0002
         {
-            let norm_key = normalize_hid_path(&info.path);
             let had_existing_handle = monitor.persistent_handles.contains_key(&norm_key);
             if !had_existing_handle {
                 if let Some(rw) = OpenHidDevice::open_with_info(
                     info.clone(),
                     true,
                     Arc::clone(&monitor.stop_flag),
+                    Arc::clone(&monitor.reclaimer),
                 ) {
                     monitor.persistent_handles.insert(norm_key.clone(), rw);
                 }
@@ -1236,11 +1998,10 @@ impl CandidateProber for RealCandidateProber {
 
             // Always read/drain the existing handle first so any already-buffered wake frame
             // is never discarded before deciding whether the handle needs to be reopened.
-            let first_listen_ms: u64 = if self.force_refresh {
+            let desired_listen_ms: u64 = if self.force_refresh {
                 if has_cached_pct {
                     400
                 } else if had_existing_handle {
-                    // Split budget across existing handle drain/listen and a reopened handle fallback.
                     1600
                 } else {
                     3600
@@ -1253,12 +2014,18 @@ impl CandidateProber for RealCandidateProber {
             } else {
                 3600
             };
+            let first_listen_ms = desired_listen_ms.min(self.remaining_ms());
+            let allow_tx = monitor
+                .registry
+                .allows_active_tx(info, ProtocolFamily::Rapoo);
 
             let first_res = monitor.persistent_handles.get(&norm_key).map(|io| {
+                let ro = ReadOnlyHidIo(io);
+                let eff: &dyn HidIo = if allow_tx { io } else { &ro };
                 if first_listen_ms == 0 {
-                    rapoo::probe_drain_only(io)
+                    rapoo::probe_drain_only(eff)
                 } else {
-                    rapoo::probe_detailed(io, first_listen_ms)
+                    rapoo::probe_detailed(eff, first_listen_ms)
                 }
             });
 
@@ -1269,13 +2036,14 @@ impl CandidateProber for RealCandidateProber {
                 .is_some();
             let first_io_err = first_res.as_ref().is_some_and(|r| r.io_error);
 
-            if first_io_err {
+            if first_io_err && self.remaining_ms() > 0 {
                 // Handle returned a non-timeout Win32 I/O error: close and reopen immediately.
                 monitor.persistent_handles.remove(&norm_key);
                 if let Some(rw) = OpenHidDevice::open_with_info(
                     info.clone(),
                     true,
                     Arc::clone(&monitor.stop_flag),
+                    Arc::clone(&monitor.reclaimer),
                 ) {
                     monitor.persistent_handles.insert(norm_key.clone(), rw);
                     if !first_has_pct {
@@ -1285,17 +2053,19 @@ impl CandidateProber for RealCandidateProber {
                             2000
                         } else {
                             first_listen_ms
-                        };
-                        return monitor
-                            .persistent_handles
-                            .get(&norm_key)
-                            .and_then(|io| rapoo::probe_detailed(io, retry_ms).reading);
+                        }
+                        .min(self.remaining_ms());
+                        return monitor.persistent_handles.get(&norm_key).and_then(|io| {
+                            let ro = ReadOnlyHidIo(io);
+                            let eff: &dyn HidIo = if allow_tx { io } else { &ro };
+                            rapoo::probe_detailed(eff, retry_ms).reading
+                        });
                     }
                 }
                 return first_res.and_then(|r| r.reading);
             }
 
-            if !first_has_pct && had_existing_handle {
+            if !first_has_pct && had_existing_handle && self.remaining_ms() > 0 {
                 // On manual force refresh while offline/no-battery, reopen once to recover from
                 // silent stale handles (USB suspend/driver quirk) and listen with remaining budget.
                 if self.force_refresh && (is_sleeping_offline || !has_cached_pct) {
@@ -1304,12 +2074,15 @@ impl CandidateProber for RealCandidateProber {
                         info.clone(),
                         true,
                         Arc::clone(&monitor.stop_flag),
+                        Arc::clone(&monitor.reclaimer),
                     ) {
                         monitor.persistent_handles.insert(norm_key.clone(), rw);
-                        return monitor
-                            .persistent_handles
-                            .get(&norm_key)
-                            .and_then(|io| rapoo::probe_detailed(io, 2000).reading);
+                        let retry_ms = 2000u64.min(self.remaining_ms());
+                        return monitor.persistent_handles.get(&norm_key).and_then(|io| {
+                            let ro = ReadOnlyHidIo(io);
+                            let eff: &dyn HidIo = if allow_tx { io } else { &ro };
+                            rapoo::probe_detailed(eff, retry_ms).reading
+                        });
                     }
                 } else if is_sleeping_offline
                     && prev_streak > 0
@@ -1322,6 +2095,7 @@ impl CandidateProber for RealCandidateProber {
                         info.clone(),
                         true,
                         Arc::clone(&monitor.stop_flag),
+                        Arc::clone(&monitor.reclaimer),
                     ) {
                         monitor.persistent_handles.insert(norm_key.clone(), rw);
                     }
@@ -1330,8 +2104,12 @@ impl CandidateProber for RealCandidateProber {
 
             first_res.and_then(|r| r.reading)
         } else {
-            let io =
-                OpenHidDevice::open_with_info(info.clone(), true, Arc::clone(&monitor.stop_flag))?;
+            let io = OpenHidDevice::open_with_info(
+                info.clone(),
+                true,
+                Arc::clone(&monitor.stop_flag),
+                Arc::clone(&monitor.reclaimer),
+            )?;
             probe_protocol(&monitor.registry, meta.protocol, &io)
         }
     }
@@ -1436,14 +2214,60 @@ fn update_poll_state(
     }
 }
 
+fn probe_hidpp_guarded(
+    registry: &DeviceRegistry,
+    io: &dyn HidIo,
+    base_name: &str,
+    default_kind: DeviceKind,
+    stop_flag: &AtomicBool,
+    deadline: Option<Instant>,
+) -> HidppProbeOutcome {
+    if !registry.allows_active_tx(io.info(), ProtocolFamily::Hidpp) {
+        return HidppProbeOutcome {
+            slots: Vec::new(),
+            hit_deadline: false,
+            blocked_by_ro: true,
+        };
+    }
+    let ro = ReadOnlyHidIo(io);
+    let effective_io: &dyn HidIo = if registry.allows_active_tx(io.info(), ProtocolFamily::Hidpp) {
+        io
+    } else {
+        &ro
+    };
+    let (slots, hit_deadline) = probe_hidpp_multi_slot_with_deadline(
+        effective_io,
+        base_name,
+        default_kind,
+        stop_flag,
+        deadline,
+    );
+    HidppProbeOutcome {
+        slots,
+        hit_deadline,
+        blocked_by_ro: false,
+    }
+}
+
 /// Probe Logitech HID++ 2.0 across direct device (`0xFF`) and receiver slots (`1..=6`),
 /// returning one entry per responsive wireless device rather than stopping at the first slot.
+#[cfg(test)]
 fn probe_hidpp_multi_slot(
     io: &dyn HidIo,
     base_name: &str,
     default_kind: DeviceKind,
     stop_flag: &AtomicBool,
 ) -> Vec<(u8, String, DeviceKind, BatteryReading)> {
+    probe_hidpp_multi_slot_with_deadline(io, base_name, default_kind, stop_flag, None).0
+}
+
+fn probe_hidpp_multi_slot_with_deadline(
+    io: &dyn HidIo,
+    base_name: &str,
+    default_kind: DeviceKind,
+    stop_flag: &AtomicBool,
+    deadline: Option<Instant>,
+) -> (Vec<(u8, String, DeviceKind, BatteryReading)>, bool) {
     const HIDPP_SHORT: u8 = 0x10;
     const HIDPP_LONG: u8 = 0x11;
     const SW_ID: u8 = 0x0A;
@@ -1453,7 +2277,7 @@ fn probe_hidpp_multi_slot(
 
     let info = io.info();
     if info.usage_page != 0xFF00 || !io.can_rw() || info.output_len < 7 || info.input_len < 7 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let report_id = if info.output_len >= 20 && info.usage == 0x0002 {
@@ -1461,205 +2285,203 @@ fn probe_hidpp_multi_slot(
     } else if info.usage == 0x0001 || info.output_len == 7 {
         HIDPP_SHORT
     } else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
 
-    fn hidpp_req(
-        io: &dyn HidIo,
+    struct HidppCtx<'a> {
+        io: &'a dyn HidIo,
         report_id: u8,
-        dev_idx: u8,
-        feat_idx: u8,
-        func_idx: u8,
-        params: &[u8],
-        raw_packets: &mut Vec<String>,
-    ) -> Option<Vec<u8>> {
-        let len = if report_id == HIDPP_LONG { 20 } else { 7 };
-        let mut pkt = vec![0u8; len];
-        pkt[0] = report_id;
-        pkt[1] = dev_idx;
-        pkt[2] = feat_idx;
-        pkt[3] = ((func_idx & 0x0F) << 4) | (SW_ID & 0x0F);
-        for (i, &b) in params.iter().take(len - 4).enumerate() {
-            pkt[4 + i] = b;
-        }
-        io.write_output(&pkt).ok()?;
+        raw_packets: Vec<String>,
+        deadline: Option<Instant>,
+        stop_flag: &'a AtomicBool,
+    }
 
-        for _ in 0..3 {
-            let Ok(resp) = io.read_input(120) else {
-                break;
-            };
-            if resp.len() < 7 || resp[1] != dev_idx {
-                continue;
-            }
-            if resp[2] == 0x8F || resp[2] == 0xFF {
-                raw_packets.push(format!("HID++ ERR: {}", format_hex(&resp)));
+    impl<'a> HidppCtx<'a> {
+        fn budget_expired(&self) -> bool {
+            self.stop_flag.load(Ordering::Relaxed)
+                || self.deadline.is_some_and(|d| Instant::now() >= d)
+        }
+
+        fn req(
+            &mut self,
+            dev_idx: u8,
+            feat_idx: u8,
+            func_idx: u8,
+            params: &[u8],
+        ) -> Option<Vec<u8>> {
+            if self.budget_expired() {
                 return None;
             }
-            if resp[2] == feat_idx && (resp[3] & 0x0F) == SW_ID {
-                raw_packets.push(format!("HID++ RX: {}", format_hex(&resp)));
-                return Some(resp);
+            let len = if self.report_id == HIDPP_LONG { 20 } else { 7 };
+            let mut pkt = vec![0u8; len];
+            pkt[0] = self.report_id;
+            pkt[1] = dev_idx;
+            pkt[2] = feat_idx;
+            pkt[3] = ((func_idx & 0x0F) << 4) | (SW_ID & 0x0F);
+            for (i, &b) in params.iter().take(len - 4).enumerate() {
+                pkt[4 + i] = b;
             }
-        }
-        None
-    }
+            self.io.write_output(&pkt).ok()?;
 
-    fn get_feat_idx(
-        io: &dyn HidIo,
-        report_id: u8,
-        dev_idx: u8,
-        feature_id: u16,
-        raw_packets: &mut Vec<String>,
-    ) -> Option<u8> {
-        let resp = hidpp_req(
-            io,
-            report_id,
-            dev_idx,
-            0x00,
-            0,
-            &[(feature_id >> 8) as u8, (feature_id & 0xFF) as u8, 0x00],
-            raw_packets,
-        )?;
-        let idx = resp.get(4).copied().unwrap_or(0);
-        if idx == 0 {
+            for _ in 0..3 {
+                if self.budget_expired() {
+                    break;
+                }
+                let read_ms = self
+                    .deadline
+                    .map(|d| {
+                        d.saturating_duration_since(Instant::now())
+                            .as_millis()
+                            .clamp(20, 120) as u32
+                    })
+                    .unwrap_or(120);
+                let Ok(resp) = self.io.read_input(read_ms) else {
+                    break;
+                };
+                if resp.len() < 7 || resp[1] != dev_idx {
+                    continue;
+                }
+                if resp[2] == 0x8F || resp[2] == 0xFF {
+                    self.raw_packets
+                        .push(format!("HID++ ERR: {}", format_hex(&resp)));
+                    return None;
+                }
+                if resp[2] == feat_idx && (resp[3] & 0x0F) == SW_ID {
+                    self.raw_packets
+                        .push(format!("HID++ RX: {}", format_hex(&resp)));
+                    return Some(resp);
+                }
+            }
             None
-        } else {
-            Some(idx)
         }
-    }
 
-    fn query_slot_identity(
-        io: &dyn HidIo,
-        report_id: u8,
-        dev_idx: u8,
-        base_name: &str,
-        default_kind: DeviceKind,
-        raw_packets: &mut Vec<String>,
-    ) -> (String, DeviceKind) {
-        let mut name_out = if dev_idx == 0xFF {
-            base_name.to_string()
-        } else {
-            format!("{} (Slot {})", base_name, dev_idx)
-        };
-        let mut kind_out = default_kind;
-
-        let Some(feat_idx) = get_feat_idx(io, report_id, dev_idx, FEAT_DEVICE_NAME, raw_packets)
-        else {
-            return (name_out, kind_out);
-        };
-
-        if let Some(count_resp) = hidpp_req(io, report_id, dev_idx, feat_idx, 0, &[], raw_packets) {
-            let name_len = (count_resp.get(4).copied().unwrap_or(0) as usize).min(48);
-            if name_len > 0 {
-                let mut bytes = Vec::with_capacity(name_len);
-                let mut offset = 0usize;
-                while offset < name_len {
-                    let Some(chunk) = hidpp_req(
-                        io,
-                        report_id,
-                        dev_idx,
-                        feat_idx,
-                        1,
-                        &[offset as u8],
-                        raw_packets,
-                    ) else {
-                        break;
-                    };
-                    let avail = chunk.len().saturating_sub(4);
-                    if avail == 0 {
-                        break;
-                    }
-                    let take = (name_len - offset).min(avail);
-                    bytes.extend_from_slice(&chunk[4..4 + take]);
-                    offset += take;
-                }
-                if let Ok(s) = std::str::from_utf8(&bytes) {
-                    let trimmed = s.trim_matches('\0').trim();
-                    if !trimmed.is_empty() {
-                        name_out = trimmed.to_string();
-                    }
-                }
+        fn feat_idx(&mut self, dev_idx: u8, feature_id: u16) -> Option<u8> {
+            let resp = self.req(
+                dev_idx,
+                0x00,
+                0,
+                &[(feature_id >> 8) as u8, (feature_id & 0xFF) as u8, 0x00],
+            )?;
+            let idx = resp.get(4).copied().unwrap_or(0);
+            if idx == 0 {
+                None
+            } else {
+                Some(idx)
             }
         }
 
-        if let Some(type_resp) = hidpp_req(io, report_id, dev_idx, feat_idx, 2, &[], raw_packets) {
-            kind_out = match type_resp.get(4).copied() {
-                Some(0..=2) => DeviceKind::Keyboard,
-                Some(3..=5) => DeviceKind::Mouse,
-                Some(8) => DeviceKind::Headset,
-                _ => default_kind,
+        fn query_slot_identity(
+            &mut self,
+            dev_idx: u8,
+            base_name: &str,
+            default_kind: DeviceKind,
+        ) -> (String, DeviceKind) {
+            let mut name_out = if dev_idx == 0xFF {
+                base_name.to_string()
+            } else {
+                format!("{} (Slot {})", base_name, dev_idx)
             };
-        }
+            let mut kind_out = default_kind;
 
-        (name_out, kind_out)
+            let Some(feat_idx) = self.feat_idx(dev_idx, FEAT_DEVICE_NAME) else {
+                return (name_out, kind_out);
+            };
+
+            if let Some(count_resp) = self.req(dev_idx, feat_idx, 0, &[]) {
+                let name_len = (count_resp.get(4).copied().unwrap_or(0) as usize).min(48);
+                if name_len > 0 {
+                    let mut bytes = Vec::with_capacity(name_len);
+                    let mut offset = 0usize;
+                    while offset < name_len {
+                        let Some(chunk) = self.req(dev_idx, feat_idx, 1, &[offset as u8]) else {
+                            break;
+                        };
+                        let avail = chunk.len().saturating_sub(4);
+                        if avail == 0 {
+                            break;
+                        }
+                        let take = (name_len - offset).min(avail);
+                        bytes.extend_from_slice(&chunk[4..4 + take]);
+                        offset += take;
+                    }
+                    if let Ok(s) = std::str::from_utf8(&bytes) {
+                        let trimmed = s.trim_matches('\0').trim();
+                        if !trimmed.is_empty() {
+                            name_out = trimmed.to_string();
+                        }
+                    }
+                }
+            }
+
+            if let Some(type_resp) = self.req(dev_idx, feat_idx, 2, &[]) {
+                kind_out = match type_resp.get(4).copied() {
+                    Some(0..=2) => DeviceKind::Keyboard,
+                    Some(3..=5) => DeviceKind::Mouse,
+                    Some(8) => DeviceKind::Headset,
+                    _ => default_kind,
+                };
+            }
+
+            (name_out, kind_out)
+        }
     }
 
     let mut results = Vec::new();
+    let mut hit_deadline = false;
     for &dev_idx in &[0xFFu8, 1, 2, 3, 4, 5, 6] {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        let mut raw_packets = Vec::new();
-        let battery = if let Some(feat_idx) = get_feat_idx(
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            hit_deadline = true;
+            break;
+        }
+        let mut ctx = HidppCtx {
             io,
             report_id,
-            dev_idx,
-            FEAT_UNIFIED_BATTERY,
-            &mut raw_packets,
-        ) {
-            hidpp_req(
-                io,
-                report_id,
-                dev_idx,
-                feat_idx,
-                1,
-                &[0, 0, 0],
-                &mut raw_packets,
-            )
-            .and_then(|resp| hidpp::parse_hidpp_battery(&resp))
-            .map(|(pct, chg)| (pct, chg, "UnifiedBattery"))
+            raw_packets: Vec::new(),
+            deadline,
+            stop_flag,
+        };
+        let battery = if let Some(feat_idx) = ctx.feat_idx(dev_idx, FEAT_UNIFIED_BATTERY) {
+            let caps = ctx
+                .req(dev_idx, feat_idx, 0, &[0, 0, 0])
+                .and_then(|r| hidpp::parse_unified_battery_capabilities(&r));
+            let supports_soc = caps.map(|c| c.supports_soc);
+            ctx.req(dev_idx, feat_idx, 1, &[0, 0, 0])
+                .and_then(|resp| hidpp::parse_unified_battery(&resp, supports_soc))
+                .map(|decoded| (decoded, "UnifiedBattery"))
         } else {
             None
         }
         .or_else(|| {
-            let feat_idx = get_feat_idx(
-                io,
-                report_id,
-                dev_idx,
-                FEAT_BATTERY_STATUS,
-                &mut raw_packets,
-            )?;
-            let resp = hidpp_req(
-                io,
-                report_id,
-                dev_idx,
-                feat_idx,
-                0,
-                &[0, 0, 0],
-                &mut raw_packets,
-            )?;
-            let (pct, chg) = hidpp::parse_hidpp_battery(&resp)?;
-            Some((pct, chg, "BatteryStatus"))
+            if ctx.budget_expired() {
+                return None;
+            }
+            let feat_idx = ctx.feat_idx(dev_idx, FEAT_BATTERY_STATUS)?;
+            let resp = ctx.req(dev_idx, feat_idx, 0, &[0, 0, 0])?;
+            let decoded = hidpp::parse_battery_status(&resp)?;
+            Some((decoded, "BatteryStatus"))
         });
 
-        if let Some((pct, chg, label)) = battery {
-            let (slot_name, slot_kind) = query_slot_identity(
-                io,
-                report_id,
-                dev_idx,
-                base_name,
-                default_kind,
-                &mut raw_packets,
-            );
+        if deadline.is_some_and(|d| Instant::now() >= d) && battery.is_none() {
+            hit_deadline = true;
+            break;
+        }
+
+        if let Some((decoded, label)) = battery {
+            let (slot_name, slot_kind) = ctx.query_slot_identity(dev_idx, base_name, default_kind);
+            let detail_note = hidpp::format_hidpp_detail_note(label, dev_idx, &decoded);
             results.push((
                 dev_idx,
                 slot_name,
                 slot_kind,
                 BatteryReading {
-                    battery_pct: Some(pct),
-                    charging: chg,
+                    battery_pct: decoded.battery_pct,
+                    charging: decoded.charging,
                     online: true,
-                    detail_note: Some(format!("HID++ 2.0 {} (slot {})", label, dev_idx)),
-                    raw_packets,
+                    detail_note: Some(detail_note),
+                    raw_packets: ctx.raw_packets,
                 },
             ));
             if dev_idx == 0xFF {
@@ -1668,7 +2490,7 @@ fn probe_hidpp_multi_slot(
         }
     }
 
-    results
+    (results, hit_deadline)
 }
 
 fn is_dareu_kbd_feature(info: &HidInterfaceInfo) -> bool {
@@ -1745,8 +2567,9 @@ unsafe fn read_container_id_tag(dev_info: HDEVINFO, dev_data: &SP_DEVINFO_DATA) 
     }
 }
 
-fn enumerate_hid_interfaces() -> Vec<EnumeratedHidPath> {
+fn enumerate_hid_interfaces_until(deadline: Option<Instant>) -> (Vec<EnumeratedHidPath>, bool) {
     let mut out = Vec::new();
+    let mut complete = true;
     unsafe {
         let Ok(dev_info) = SetupDiGetClassDevsW(
             Some(&GUID_DEVINTERFACE_HID),
@@ -1754,15 +2577,19 @@ fn enumerate_hid_interfaces() -> Vec<EnumeratedHidPath> {
             None,
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
         ) else {
-            return out;
+            return (out, true);
         };
         if dev_info.is_invalid() {
-            return out;
+            return (out, true);
         }
         let _guard = DevInfoGuard(dev_info);
 
         let mut idx = 0u32;
         loop {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                complete = false;
+                break;
+            }
             let mut iface_data = SP_DEVICE_INTERFACE_DATA {
                 cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
                 ..Default::default()
@@ -1836,7 +2663,7 @@ fn enumerate_hid_interfaces() -> Vec<EnumeratedHidPath> {
             }
         }
     }
-    out
+    (out, complete)
 }
 
 unsafe fn read_hid_info(handle: HANDLE, path: &str) -> Option<HidInterfaceInfo> {
@@ -2184,6 +3011,7 @@ mod tests {
                     kind: DeviceKind::Mouse,
                     protocol: ProtocolFamily::Rapoo,
                     min_poll_secs: None,
+                    allow_active_tx: false,
                 },
                 group_key: group.to_string(),
                 is_custom_match: false,
@@ -2210,8 +3038,10 @@ mod tests {
 
     struct StubProber {
         budget_exhausted: bool,
+        budget_exhaust_after_calls: Option<usize>,
         responses: HashMap<String, Option<BatteryReading>>,
         hidpp_responses: HashMap<String, Option<Vec<HidppSlotReading>>>,
+        hidpp_hit_deadline: bool,
         probe_calls: usize,
     }
 
@@ -2219,8 +3049,10 @@ mod tests {
         fn new() -> Self {
             Self {
                 budget_exhausted: false,
+                budget_exhaust_after_calls: None,
                 responses: HashMap::new(),
                 hidpp_responses: HashMap::new(),
+                hidpp_hit_deadline: false,
                 probe_calls: 0,
             }
         }
@@ -2229,6 +3061,9 @@ mod tests {
     impl CandidateProber for StubProber {
         fn is_budget_exhausted(&self) -> bool {
             self.budget_exhausted
+                || self
+                    .budget_exhaust_after_calls
+                    .is_some_and(|limit| self.probe_calls >= limit)
         }
 
         fn probe_hidpp(
@@ -2236,13 +3071,19 @@ mod tests {
             _monitor: &mut HidMonitor,
             info: &HidInterfaceInfo,
             _meta: &super::super::protocols::DeviceMeta,
-        ) -> Option<Vec<HidppSlotReading>> {
+        ) -> Option<HidppProbeOutcome> {
             self.probe_calls += 1;
             let key = format!("{:04X}:{:04X}", info.vid, info.pid);
-            self.hidpp_responses
+            let slots = self
+                .hidpp_responses
                 .get(&key)
                 .cloned()
-                .unwrap_or(Some(vec![]))
+                .unwrap_or(Some(vec![]))?;
+            Some(HidppProbeOutcome {
+                slots,
+                hit_deadline: self.hidpp_hit_deadline,
+                blocked_by_ro: false,
+            })
         }
 
         fn probe_standard_or_vendor(
@@ -2276,6 +3117,7 @@ mod tests {
                 kind,
                 protocol,
                 min_poll_secs,
+                allow_active_tx: true,
             },
             group_key: group_key.to_string(),
             is_custom_match: false,
@@ -2294,8 +3136,11 @@ mod tests {
             persistent_handles: HashMap::new(),
             cached_readings: HashMap::new(),
             cached_group_devices: HashMap::new(),
+            hidpp_slots: HashMap::new(),
+            known_group_paths: HashMap::new(),
             poll_states: HashMap::new(),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            reclaimer: Arc::new(IoReclaimer::new(HID_RECLAIM_QUEUE_CAP)),
         }
     }
 
@@ -2513,6 +3358,7 @@ mod tests {
                     kind: DeviceKind::Keyboard,
                     protocol: ProtocolFamily::Sonix,
                     min_poll_secs: None,
+                    allow_active_tx: true,
                 },
                 group_key: gk.to_string(),
                 is_custom_match: false,
@@ -2789,5 +3635,437 @@ mod tests {
         assert!(d_rec[0].online);
         assert_eq!(d_rec[0].battery_pct, Some(79));
         assert_eq!(mon.poll_states[gk].fail_streak, 0);
+    }
+
+    #[test]
+    fn test_hidpp_guard_blocks_external_device_override_and_unknown_pid() {
+        struct RecordingHidppIo {
+            info: HidInterfaceInfo,
+            writes: std::cell::RefCell<Vec<Vec<u8>>>,
+        }
+        impl HidIo for RecordingHidppIo {
+            fn info(&self) -> &HidInterfaceInfo {
+                &self.info
+            }
+            fn can_rw(&self) -> bool {
+                true
+            }
+            fn write_output(&self, data: &[u8]) -> Result<(), String> {
+                self.writes.borrow_mut().push(data.to_vec());
+                Ok(())
+            }
+            fn read_input(&self, _timeout_ms: u32) -> Result<Vec<u8>, String> {
+                Err("timeout".into())
+            }
+            fn get_feature(&self, _report_id: u8) -> Result<Vec<u8>, String> {
+                Err("unsupported".into())
+            }
+            fn get_input_report(&self, _report_id: u8) -> Result<Vec<u8>, String> {
+                Err("unsupported".into())
+            }
+            fn set_feature(&self, _data: &[u8]) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let builtin = include_str!("../../devices.toml");
+        let ext = r#"
+[[device]]
+vid = "046D"
+pid = "9999"
+name = "External Unverified Logitech"
+kind = "mouse"
+protocol = "hidpp"
+"#;
+        let reg = DeviceRegistry::from_toml_parts(builtin, &[ext]);
+        let stop = AtomicBool::new(false);
+
+        let io_ext = RecordingHidppIo {
+            info: mk_info(0x046D, 0x9999, "EXT"),
+            writes: std::cell::RefCell::new(Vec::new()),
+        };
+        let outcome =
+            probe_hidpp_guarded(&reg, &io_ext, "External", DeviceKind::Mouse, &stop, None);
+        assert!(outcome.blocked_by_ro);
+        assert!(outcome.slots.is_empty());
+        assert!(io_ext.writes.borrow().is_empty());
+
+        let io_unknown = RecordingHidppIo {
+            info: mk_info(0x9999, 0x8888, "UNK"),
+            writes: std::cell::RefCell::new(Vec::new()),
+        };
+        let outcome_unk =
+            probe_hidpp_guarded(&reg, &io_unknown, "Unknown", DeviceKind::Mouse, &stop, None);
+        assert!(outcome_unk.blocked_by_ro);
+        assert!(io_unknown.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_overlapped_cancel_delayed_completion_reclaim_cap_stop_race_and_quarantine() {
+        struct MockPending {
+            completed: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl ReclaimableIo for MockPending {
+            fn is_completed(&mut self) -> bool {
+                self.completed.load(Ordering::Acquire)
+            }
+        }
+        impl Drop for MockPending {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        struct FakeWaitOps {
+            slice_res: WaitSliceResult,
+            cancel_called: bool,
+            completed: bool,
+        }
+        impl OverlappedOps for FakeWaitOps {
+            fn wait_slice(&mut self, _timeout_ms: u32) -> WaitSliceResult {
+                self.slice_res
+            }
+            fn cancel_io(&mut self) {
+                self.cancel_called = true;
+            }
+            fn poll_completed(&mut self) -> bool {
+                self.completed
+            }
+            fn read_result(&mut self) -> Result<u32, String> {
+                Ok(0)
+            }
+        }
+
+        let reclaimer = Arc::new(IoReclaimer::new(3));
+        let stop = AtomicBool::new(false);
+
+        // 1. Timeout + driver fails to cancel within 80ms -> returns DeferredPending immediately
+        let mut ops1 = FakeWaitOps {
+            slice_res: WaitSliceResult::Timeout,
+            cancel_called: false,
+            completed: false,
+        };
+        let err = drive_overlapped_wait(&stop, 100, 80, "ReadFile", &mut ops1).unwrap_err();
+        assert!(ops1.cancel_called);
+        assert!(matches!(err, OverlappedDriveError::DeferredPending(_)));
+
+        // Hand off delayed request & quarantine faulty device path while healthy path stays active
+        let t0 = Instant::now();
+        let faulty_path = normalize_hid_path(r"\\?\hid#vid_1111&pid_2222");
+        let healthy_path = normalize_hid_path(r"\\?\hid#vid_3333&pid_4444");
+        reclaimer.quarantine_path(&faulty_path, t0, Duration::from_secs(120));
+        assert!(reclaimer.is_quarantined(&faulty_path, t0 + Duration::from_secs(30)));
+        assert!(!reclaimer.is_quarantined(&healthy_path, t0 + Duration::from_secs(30)));
+        assert!(!reclaimer.is_quarantined(&faulty_path, t0 + Duration::from_secs(121)));
+
+        let c1 = Arc::new(AtomicBool::new(false));
+        let d1 = Arc::new(AtomicBool::new(false));
+        reclaimer.handoff(
+            Box::new(MockPending {
+                completed: Arc::clone(&c1),
+                dropped: Arc::clone(&d1),
+            }),
+            false,
+        );
+        assert_eq!(reclaimer.pending_len(), 1);
+        assert!(!d1.load(Ordering::Acquire));
+
+        // Delayed completion arrives -> reaped and freed cleanly
+        c1.store(true, Ordering::Release);
+        assert_eq!(reclaimer.reap_completed(), 1);
+        assert_eq!(reclaimer.pending_len(), 0);
+        assert!(d1.load(Ordering::Acquire));
+
+        // 2. Bounded reclaim queue cap (cap = 3)
+        let mut flags = Vec::new();
+        for _ in 0..5 {
+            let c = Arc::new(AtomicBool::new(false));
+            let d = Arc::new(AtomicBool::new(false));
+            reclaimer.handoff(
+                Box::new(MockPending {
+                    completed: Arc::clone(&c),
+                    dropped: Arc::clone(&d),
+                }),
+                false,
+            );
+            flags.push((c, d));
+        }
+        assert!(reclaimer.pending_len() <= 3);
+        assert!(reclaimer.is_saturated());
+        let (_, reclaimed, evicted) = reclaimer.stats();
+        assert_eq!(reclaimed, 1);
+        assert_eq!(evicted, 2);
+
+        // Complete remaining -> saturation clears
+        for (c, _) in &flags {
+            c.store(true, Ordering::Release);
+        }
+        assert!(!reclaimer.is_saturated());
+        assert_eq!(reclaimer.pending_len(), 0);
+
+        // 3. Stop-flag race where driver completes right during cancel wait -> CompletedErr (no handoff)
+        stop.store(true, Ordering::Relaxed);
+        let mut ops_race = FakeWaitOps {
+            slice_res: WaitSliceResult::Signaled,
+            cancel_called: false,
+            completed: true,
+        };
+        let race_err =
+            drive_overlapped_wait(&stop, 300, 80, "ReadFile", &mut ops_race).unwrap_err();
+        assert!(ops_race.cancel_called);
+        assert!(matches!(race_err, OverlappedDriveError::CompletedErr(_)));
+    }
+
+    #[test]
+    fn test_hidpp_per_slot_cache_keeps_sleeping_sibling_when_other_slot_online() {
+        let mut mon = mk_monitor_for_test();
+        let gk = "hid:046D:C52B:RX_TWO";
+        let present: HashSet<String> = [gk.to_string()].into_iter().collect();
+        let make_cands = || {
+            vec![mk_candidate(
+                0x046D,
+                0xC52B,
+                "Logitech Unifying",
+                DeviceKind::Other,
+                ProtocolFamily::Hidpp,
+                gk,
+                None,
+            )]
+        };
+
+        let mut prober = StubProber::new();
+        prober.hidpp_responses.insert(
+            "046D:C52B".into(),
+            Some(vec![
+                (
+                    1,
+                    "MX Master 3".into(),
+                    DeviceKind::Mouse,
+                    BatteryReading {
+                        battery_pct: Some(85),
+                        charging: false,
+                        online: true,
+                        detail_note: Some("HID++ 2.0 UnifiedBattery (slot 1)".into()),
+                        raw_packets: vec![],
+                    },
+                ),
+                (
+                    2,
+                    "MX Keys".into(),
+                    DeviceKind::Keyboard,
+                    BatteryReading {
+                        battery_pct: Some(60),
+                        charging: false,
+                        online: true,
+                        detail_note: Some("HID++ 2.0 UnifiedBattery (slot 2)".into()),
+                        raw_packets: vec![],
+                    },
+                ),
+            ]),
+        );
+
+        let t0 = Instant::now();
+        let d0 = mon.poll_candidates_with(make_cands(), &present, t0, &mut prober);
+        assert_eq!(d0.len(), 2);
+
+        // Next round: Slot 1 responds (84%), Slot 2 is asleep (absent from slot_results).
+        // Slot 2 MUST NOT disappear! It stays online during debounce (<3 misses) with cached 60%.
+        prober.hidpp_responses.insert(
+            "046D:C52B".into(),
+            Some(vec![(
+                1,
+                "MX Master 3".into(),
+                DeviceKind::Mouse,
+                BatteryReading {
+                    battery_pct: Some(84),
+                    charging: false,
+                    online: true,
+                    detail_note: Some("HID++ 2.0 UnifiedBattery (slot 1)".into()),
+                    raw_packets: vec![],
+                },
+            )]),
+        );
+        let t1 = t0 + Duration::from_secs(50);
+        let d1 = mon.poll_candidates_with(make_cands(), &present, t1, &mut prober);
+        assert_eq!(d1.len(), 2);
+        let slot1 = d1.iter().find(|d| d.name == "MX Master 3").unwrap();
+        let slot2 = d1.iter().find(|d| d.name == "MX Keys").unwrap();
+        assert!(slot1.online && slot1.battery_pct == Some(84));
+        assert!(slot2.online && slot2.battery_pct == Some(60));
+
+        // 2 more misses on Slot 2 -> Slot 2 transitions to offline (cached) while Slot 1 stays online
+        let t2 = t1 + Duration::from_secs(50);
+        let _ = mon.poll_candidates_with(make_cands(), &present, t2, &mut prober);
+        let t3 = t2 + Duration::from_secs(50);
+        let d3 = mon.poll_candidates_with(make_cands(), &present, t3, &mut prober);
+        assert_eq!(d3.len(), 2);
+        let slot1_t3 = d3.iter().find(|d| d.name == "MX Master 3").unwrap();
+        let slot2_t3 = d3.iter().find(|d| d.name == "MX Keys").unwrap();
+        assert!(slot1_t3.online);
+        assert!(!slot2_t3.online);
+        assert_eq!(slot2_t3.battery_pct, Some(60));
+        assert!(slot2_t3
+            .detail_note
+            .as_deref()
+            .unwrap_or("")
+            .contains("(cached)"));
+    }
+
+    #[test]
+    fn test_device_change_poll_protects_min_poll_sleeping_devices_and_mid_group_budget() {
+        let mut mon = mk_monitor_for_test();
+        let gk_cherry = "hid:046A:01A1:CHERRY";
+        let gk_new = "hid:24AE:1412:RAPOO_NEW";
+        let gk_multi = "hid:260D:1175:MULTI_IF";
+
+        // 1. Mid-group budget exhaustion stops before 2nd interface of same group and marks deferred
+        let mut c1 = mk_candidate(
+            0x260D,
+            0x1175,
+            "Multi",
+            DeviceKind::Mouse,
+            ProtocolFamily::Compx,
+            gk_multi,
+            None,
+        );
+        c1.info.path = "p1".into();
+        let mut c2 = c1.clone();
+        c2.info.path = "p2".into();
+        c2.usage_prio = 1;
+        let present1: HashSet<String> = [gk_multi.to_string()].into_iter().collect();
+        let mut prober = StubProber::new();
+        prober.budget_exhaust_after_calls = Some(1);
+        let t0 = Instant::now();
+        let _ = mon.poll_candidates_with(vec![c1, c2], &present1, t0, &mut prober);
+        assert_eq!(
+            prober.probe_calls, 1,
+            "budget must stop 2nd interface in same group"
+        );
+        assert!(mon.poll_states[gk_multi].deferred);
+
+        // 2. DeviceChange poll probes newly added device while respecting unchanged min_poll_secs=600 device
+        let mut cherry_cand = mk_candidate(
+            0x046A,
+            0x01A1,
+            "Cherry Protected",
+            DeviceKind::Keyboard,
+            ProtocolFamily::CustomHid,
+            gk_cherry,
+            Some(600),
+        );
+        cherry_cand.info.path = r"\\?\hid#cherry#mi_00".into();
+
+        let mut new_cand = mk_candidate(
+            0x24AE,
+            0x1412,
+            "New Mouse",
+            DeviceKind::Mouse,
+            ProtocolFamily::Rapoo,
+            gk_new,
+            None,
+        );
+        new_cand.info.path = r"\\?\hid#rapoo#mi_01".into();
+
+        let mut prober2 = StubProber::new();
+        prober2.responses.insert(
+            gk_cherry.to_string(),
+            Some(BatteryReading {
+                battery_pct: Some(90),
+                charging: false,
+                online: true,
+                detail_note: Some("Cherry".into()),
+                raw_packets: vec![],
+            }),
+        );
+        let present_cherry: HashSet<String> = [gk_cherry.to_string()].into_iter().collect();
+        let _ = mon.poll_candidates_with_mode(
+            vec![cherry_cand.clone()],
+            &present_cherry,
+            true,
+            t0,
+            HidPollMode::Normal,
+            &mut prober2,
+        );
+        assert_eq!(prober2.probe_calls, 1);
+
+        // 10s later: new_cand arrives and triggers DeviceChange poll -> ONLY new_cand is probed,
+        // Cherry (min_poll_secs=600, unchanged path) is NOT disturbed!
+        prober2.responses.insert(
+            gk_new.to_string(),
+            Some(BatteryReading {
+                battery_pct: Some(77),
+                charging: false,
+                online: true,
+                detail_note: Some("Rapoo".into()),
+                raw_packets: vec![],
+            }),
+        );
+        let present_both: HashSet<String> = [gk_cherry.to_string(), gk_new.to_string()]
+            .into_iter()
+            .collect();
+        let d_dc = mon.poll_candidates_with_mode(
+            vec![cherry_cand, new_cand],
+            &present_both,
+            true,
+            t0 + Duration::from_secs(10),
+            HidPollMode::DeviceChange,
+            &mut prober2,
+        );
+        assert_eq!(
+            prober2.probe_calls, 2,
+            "only new device should be probed on DeviceChange"
+        );
+        assert_eq!(d_dc.len(), 2);
+    }
+
+    #[test]
+    fn test_hidpp_multi_slot_stops_at_deadline_and_marks_hit_deadline() {
+        let stop = AtomicBool::new(false);
+        let io = MultiSlotMockIo {
+            info: mk_info(0x046D, 0xC52B, "RX01"),
+            rx_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        };
+        let expired = Instant::now() - Duration::from_millis(1);
+        let (res, hit_deadline) = probe_hidpp_multi_slot_with_deadline(
+            &io,
+            "Logitech Unifying",
+            DeviceKind::Other,
+            &stop,
+            Some(expired),
+        );
+        assert!(res.is_empty());
+        assert!(hit_deadline);
+    }
+
+    #[test]
+    fn test_hid_diagnostics_redacts_serial_by_default_and_shows_when_verbose() {
+        let mut info = mk_info(0x24AE, 0x1412, "SECRET_SN_987654");
+        info.manufacturer = "Rapoo".into();
+        info.product = "VT3".into();
+
+        let redacted = format_hid_diag_line(&info, "Rapoo VT3", "Rapoo", false);
+        assert!(!redacted.contains("SECRET_SN_987654"));
+        assert!(redacted.contains("<redacted:16>"));
+
+        let verbose = format_hid_diag_line(&info, "Rapoo VT3", "Rapoo", true);
+        assert!(verbose.contains("SECRET_SN_987654"));
+    }
+
+    #[test]
+    fn test_hid_monitor_drop_does_not_mutate_caller_stop_flag_and_shuts_down_reclaimer() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reclaimer_ref;
+        {
+            let mut mon = mk_monitor_for_test();
+            mon.stop_flag = Arc::clone(&stop);
+            reclaimer_ref = Arc::clone(&mon.reclaimer);
+            assert!(!reclaimer_ref.shutdown.load(Ordering::Acquire));
+        }
+        assert!(reclaimer_ref.shutdown.load(Ordering::Acquire));
+        assert!(
+            !stop.load(Ordering::Relaxed),
+            "HidMonitor::drop must not mutate caller stop_flag"
+        );
     }
 }
