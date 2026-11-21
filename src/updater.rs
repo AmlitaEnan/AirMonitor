@@ -5,18 +5,23 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use windows::core::{s, w, PCSTR, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, FreeLibrary, GetLastError, HANDLE, HMODULE};
+use windows::Win32::Foundation::{
+    CloseHandle, FreeLibrary, GetLastError, HANDLE, HMODULE, WAIT_ABANDONED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
 use windows::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, ReleaseMutex, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -68,8 +73,16 @@ const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 const IMAGE_FILE_DLL: u16 = 0x2000;
 const STAGED_NEW_FILE_NAME: &str = "airmonitor.exe.new";
 const STAGED_OLD_FILE_NAME: &str = "airmonitor.exe.old";
+const TEMP_PART_PREFIX: &str = "airmonitor.exe.part.";
 const OLD_EXE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const WAIT_OLD_PID_TIMEOUT_MS: u32 = 5000;
+const DIR_MUTEX_POLL_MS: u32 = 50;
+
+pub const DEFAULT_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Optional embedded ECDSA P-256 publisher public key (SPKI DER / SEC1 / raw X||Y / CNG ECCPUBLICBLOB).
+/// When `None`, SHA-256 verified updates are permitted; when `Some(...)`, manifest signature verification is mandatory.
+const EMBEDDED_PUBLISHER_PUBLIC_KEY: Option<&[u8]> = None;
 
 static WRITE_CHECK_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -107,6 +120,20 @@ pub enum UpdateStatus {
         current: String,
     },
     Error(String),
+}
+
+impl UpdateStatus {
+    /// Returns `true` only when the release has both a valid download URL and a valid SHA-256 URL.
+    pub fn can_auto_update(&self) -> bool {
+        matches!(
+            self,
+            Self::UpdateAvailable {
+                download_url: Some(dl),
+                sha256_url: Some(sha),
+                ..
+            } if is_allowed_download_url(dl.trim()) && is_allowed_download_url(sha.trim())
+        )
+    }
 }
 
 type HInternet = *mut c_void;
@@ -257,6 +284,7 @@ impl WinHttpApi {
 
 type BCryptAlgHandle = *mut c_void;
 type BCryptHashHandle = *mut c_void;
+type BCryptKeyHandle = *mut c_void;
 type FnBCryptOpenAlgorithmProvider =
     unsafe extern "system" fn(*mut BCryptAlgHandle, *const u16, *const u16, u32) -> i32;
 type FnBCryptGetProperty =
@@ -274,6 +302,25 @@ type FnBCryptHashData = unsafe extern "system" fn(BCryptHashHandle, *const u8, u
 type FnBCryptFinishHash = unsafe extern "system" fn(BCryptHashHandle, *mut u8, u32, u32) -> i32;
 type FnBCryptDestroyHash = unsafe extern "system" fn(BCryptHashHandle) -> i32;
 type FnBCryptCloseAlgorithmProvider = unsafe extern "system" fn(BCryptAlgHandle, u32) -> i32;
+type FnBCryptImportKeyPair = unsafe extern "system" fn(
+    BCryptAlgHandle,
+    BCryptKeyHandle,
+    *const u16,
+    *mut BCryptKeyHandle,
+    *const u8,
+    u32,
+    u32,
+) -> i32;
+type FnBCryptVerifySignature = unsafe extern "system" fn(
+    BCryptKeyHandle,
+    *const c_void,
+    *const u8,
+    u32,
+    *const u8,
+    u32,
+    u32,
+) -> i32;
+type FnBCryptDestroyKey = unsafe extern "system" fn(BCryptKeyHandle) -> i32;
 
 struct BCryptApi {
     _module: ModuleGuard,
@@ -284,6 +331,9 @@ struct BCryptApi {
     finish_hash: FnBCryptFinishHash,
     destroy_hash: FnBCryptDestroyHash,
     close_algorithm_provider: FnBCryptCloseAlgorithmProvider,
+    import_key_pair: FnBCryptImportKeyPair,
+    verify_signature: FnBCryptVerifySignature,
+    destroy_key: FnBCryptDestroyKey,
 }
 
 struct BCryptAlgGuard {
@@ -307,6 +357,21 @@ struct BCryptHashGuard {
 }
 
 impl Drop for BCryptHashGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                let _ = (self.destroy_fn)(self.handle);
+            }
+        }
+    }
+}
+
+struct BCryptKeyGuard {
+    handle: BCryptKeyHandle,
+    destroy_fn: FnBCryptDestroyKey,
+}
+
+impl Drop for BCryptKeyGuard {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe {
@@ -351,6 +416,14 @@ impl BCryptApi {
                 s!("BCryptCloseAlgorithmProvider"),
             )
             .ok_or_else(|| "BCrypt 缺少 BCryptCloseAlgorithmProvider".to_string())?;
+            let import_key_pair =
+                load_proc::<FnBCryptImportKeyPair>(module, s!("BCryptImportKeyPair"))
+                    .ok_or_else(|| "BCrypt 缺少 BCryptImportKeyPair".to_string())?;
+            let verify_signature =
+                load_proc::<FnBCryptVerifySignature>(module, s!("BCryptVerifySignature"))
+                    .ok_or_else(|| "BCrypt 缺少 BCryptVerifySignature".to_string())?;
+            let destroy_key = load_proc::<FnBCryptDestroyKey>(module, s!("BCryptDestroyKey"))
+                .ok_or_else(|| "BCrypt 缺少 BCryptDestroyKey".to_string())?;
 
             Ok(Self {
                 _module: guard,
@@ -361,9 +434,145 @@ impl BCryptApi {
                 finish_hash,
                 destroy_hash,
                 close_algorithm_provider,
+                import_key_pair,
+                verify_signature,
+                destroy_key,
             })
         }
     }
+}
+
+struct TransferControl<'a> {
+    deadline: Instant,
+    cancel_flag: &'a AtomicBool,
+}
+
+impl<'a> TransferControl<'a> {
+    fn new(total_timeout: Duration, cancel_flag: &'a AtomicBool) -> Self {
+        let now = Instant::now();
+        let deadline = now.checked_add(total_timeout).unwrap_or(now);
+        Self {
+            deadline,
+            cancel_flag,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.cancel_flag.load(AtomicOrdering::Relaxed) {
+            return Err("更新已取消".to_string());
+        }
+        if Instant::now() >= self.deadline {
+            return Err("更新超时，请稍后重试或点击「手动下载」".to_string());
+        }
+        Ok(())
+    }
+
+    fn remaining_ms_clamped(&self, max_ms: i32) -> i32 {
+        let now = Instant::now();
+        if now >= self.deadline {
+            return 1;
+        }
+        let rem = self.deadline.saturating_duration_since(now).as_millis();
+        rem.min(max_ms.max(1) as u128).max(1) as i32
+    }
+}
+
+struct RawHandleGuard(HANDLE);
+
+impl Drop for RawHandleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() && !self.0 .0.is_null() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct DirUpdateMutexGuard {
+    handle: HANDLE,
+}
+
+impl Drop for DirUpdateMutexGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() && !self.handle.0.is_null() {
+            unsafe {
+                let _ = ReleaseMutex(self.handle);
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+impl DirUpdateMutexGuard {
+    fn create_handle(dir: &Path) -> Result<RawHandleGuard, String> {
+        let name = dir_update_mutex_name(dir);
+        let wide = to_wide_null(&name);
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }
+            .map_err(|e| format!("创建更新目录互斥锁失败: {e}"))?;
+        if handle.is_invalid() || handle.0.is_null() {
+            return Err("创建更新目录互斥锁失败".to_string());
+        }
+        Ok(RawHandleGuard(handle))
+    }
+
+    fn try_acquire(dir: &Path) -> Result<Option<Self>, String> {
+        let guard = Self::create_handle(dir)?;
+        let wait = unsafe { WaitForSingleObject(guard.0, 0) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            let handle = guard.0;
+            std::mem::forget(guard);
+            Ok(Some(Self { handle }))
+        } else if wait == WAIT_TIMEOUT {
+            Ok(None)
+        } else {
+            Err(format!("获取更新目录互斥锁失败 (WAIT={})", wait.0))
+        }
+    }
+
+    fn acquire_cancellable(dir: &Path, ctrl: &TransferControl<'_>) -> Result<Self, String> {
+        let guard = Self::create_handle(dir)?;
+        loop {
+            ctrl.check()?;
+            let slice_ms = ctrl.remaining_ms_clamped(DIR_MUTEX_POLL_MS as i32) as u32;
+            let wait = unsafe { WaitForSingleObject(guard.0, slice_ms) };
+            if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+                let handle = guard.0;
+                std::mem::forget(guard);
+                return Ok(Self { handle });
+            } else if wait == WAIT_TIMEOUT {
+                continue;
+            } else {
+                return Err(format!("等待更新目录互斥锁失败 (WAIT={})", wait.0));
+            }
+        }
+    }
+}
+
+fn canonical_dir_key(dir: &Path) -> String {
+    let resolved = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let raw = resolved.to_string_lossy();
+    let no_unc = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    };
+    no_unc.trim_end_matches(['\\', '/']).to_ascii_lowercase()
+}
+
+fn dir_update_mutex_name(dir: &Path) -> String {
+    let key = canonical_dir_key(dir);
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x8422_2325_cbf2_9ce4;
+    for &b in key.as_bytes() {
+        h1 ^= b as u64;
+        h1 = h1.wrapping_mul(0x0100_0000_01b3);
+        h2 = h2.wrapping_mul(0x0100_0000_01b3);
+        h2 ^= b as u64;
+    }
+    format!("Local\\AirMonitor_Update_{h1:016x}{h2:016x}")
 }
 
 struct TempFileCleanup {
@@ -679,10 +888,29 @@ struct OpenDownloadResponse {
     _connect: HInternetGuard,
 }
 
+fn apply_request_timeouts(
+    api: &WinHttpApi,
+    request: HInternet,
+    default_recv_timeout_ms: i32,
+    ctrl: &TransferControl<'_>,
+) -> Result<(), String> {
+    let resolve_ms = ctrl.remaining_ms_clamped(TIMEOUT_RESOLVE_MS);
+    let connect_ms = ctrl.remaining_ms_clamped(TIMEOUT_CONNECT_MS);
+    let send_ms = ctrl.remaining_ms_clamped(TIMEOUT_SEND_MS);
+    let recv_ms = ctrl.remaining_ms_clamped(default_recv_timeout_ms);
+    let ok = unsafe { (api.set_timeouts)(request, resolve_ms, connect_ms, send_ms, recv_ms) };
+    if ok == 0 {
+        return Err(format_winhttp_error("设置请求超时失败", last_win32_error()));
+    }
+    Ok(())
+}
+
 fn open_download_with_redirects(
     api: &WinHttpApi,
     session: &HInternetGuard,
     initial_url: &str,
+    default_recv_timeout_ms: i32,
+    ctrl: &TransferControl<'_>,
 ) -> Result<OpenDownloadResponse, String> {
     if !is_allowed_download_url(initial_url) {
         return Err("下载地址未通过安全白名单校验".to_string());
@@ -692,6 +920,7 @@ fn open_download_with_redirects(
     let mut current_url = initial_url.to_string();
 
     for hop in 0..=MAX_DOWNLOAD_REDIRECTS {
+        ctrl.check()?;
         let (host, path_and_query) = parse_https_url(&current_url)?;
         let host_w = to_wide_null(host);
         let path_w = to_wide_null(&path_and_query);
@@ -714,6 +943,8 @@ fn open_download_with_redirects(
         let request = HInternetGuard::new(request_raw, api.close_handle)
             .ok_or_else(|| format_winhttp_error("创建下载请求失败", last_win32_error()))?;
 
+        apply_request_timeouts(api, request.raw(), default_recv_timeout_ms, ctrl)?;
+
         let policy: u32 = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
         let opt_ok = unsafe {
             (api.set_option)(
@@ -730,6 +961,7 @@ fn open_download_with_redirects(
             ));
         }
 
+        ctrl.check()?;
         let send_ok = unsafe {
             (api.send_request)(
                 request.raw(),
@@ -742,13 +974,17 @@ fn open_download_with_redirects(
             )
         };
         if send_ok == 0 {
+            ctrl.check()?;
             return Err(format_winhttp_error("发送下载请求失败", last_win32_error()));
         }
 
+        ctrl.check()?;
         let recv_ok = unsafe { (api.receive_response)(request.raw(), std::ptr::null_mut()) };
         if recv_ok == 0 {
+            ctrl.check()?;
             return Err(format_winhttp_error("接收下载响应失败", last_win32_error()));
         }
+        ctrl.check()?;
 
         let status = query_status_code(api, request.raw())?;
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
@@ -779,13 +1015,16 @@ fn download_file_with_redirects<F>(
     url: &str,
     dest_path: &Path,
     latest: &str,
+    ctrl: &TransferControl<'_>,
     on_progress: &mut F,
 ) -> Result<(), String>
 where
     F: FnMut(UpdateStatus),
 {
-    let session = open_winhttp_session(api, TIMEOUT_RECEIVE_DOWNLOAD_MS)?;
-    let resp = open_download_with_redirects(api, &session, url)?;
+    ctrl.check()?;
+    let session =
+        open_winhttp_session(api, ctrl.remaining_ms_clamped(TIMEOUT_RECEIVE_DOWNLOAD_MS))?;
+    let resp = open_download_with_redirects(api, &session, url, TIMEOUT_RECEIVE_DOWNLOAD_MS, ctrl)?;
 
     let total_bytes = query_header_string(api, resp.request.raw(), WINHTTP_QUERY_CONTENT_LENGTH)?
         .and_then(|s| s.trim().parse::<u64>().ok());
@@ -809,9 +1048,11 @@ where
     });
 
     loop {
+        ctrl.check()?;
         let mut available: u32 = 0;
         let avail_ok = unsafe { (api.query_data_available)(resp.request.raw(), &mut available) };
         if avail_ok == 0 {
+            ctrl.check()?;
             return Err(format_winhttp_error("查询下载数据失败", last_win32_error()));
         }
         if available == 0 {
@@ -820,6 +1061,7 @@ where
 
         let mut remaining = available as usize;
         while remaining > 0 {
+            ctrl.check()?;
             let to_read = remaining.min(chunk.len());
             let mut bytes_read: u32 = 0;
             let read_ok = unsafe {
@@ -831,8 +1073,10 @@ where
                 )
             };
             if read_ok == 0 {
+                ctrl.check()?;
                 return Err(format_winhttp_error("读取下载数据失败", last_win32_error()));
             }
+            ctrl.check()?;
             if bytes_read == 0 {
                 break;
             }
@@ -896,9 +1140,11 @@ fn download_small_text_with_redirects(
     api: &WinHttpApi,
     url: &str,
     max_bytes: usize,
+    ctrl: &TransferControl<'_>,
 ) -> Result<String, String> {
-    let session = open_winhttp_session(api, TIMEOUT_RECEIVE_API_MS)?;
-    let resp = open_download_with_redirects(api, &session, url)?;
+    ctrl.check()?;
+    let session = open_winhttp_session(api, ctrl.remaining_ms_clamped(TIMEOUT_RECEIVE_API_MS))?;
+    let resp = open_download_with_redirects(api, &session, url, TIMEOUT_RECEIVE_API_MS, ctrl)?;
 
     if let Some(len) = query_header_string(api, resp.request.raw(), WINHTTP_QUERY_CONTENT_LENGTH)?
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -912,9 +1158,11 @@ fn download_small_text_with_redirects(
     let mut chunk = [0u8; 4096];
 
     loop {
+        ctrl.check()?;
         let mut available: u32 = 0;
         let avail_ok = unsafe { (api.query_data_available)(resp.request.raw(), &mut available) };
         if avail_ok == 0 {
+            ctrl.check()?;
             return Err(format_winhttp_error("查询校验文件失败", last_win32_error()));
         }
         if available == 0 {
@@ -923,6 +1171,7 @@ fn download_small_text_with_redirects(
 
         let mut remaining = available as usize;
         while remaining > 0 {
+            ctrl.check()?;
             if body.len() >= max_bytes {
                 return Err("校验文件超出 64 KiB 大小限制".to_string());
             }
@@ -938,8 +1187,10 @@ fn download_small_text_with_redirects(
                 )
             };
             if read_ok == 0 {
+                ctrl.check()?;
                 return Err(format_winhttp_error("读取校验文件失败", last_win32_error()));
             }
+            ctrl.check()?;
             if bytes_read == 0 {
                 break;
             }
@@ -1075,61 +1326,115 @@ pub fn download_and_apply_update<F>(
     download_url: &str,
     asset_name: Option<&str>,
     sha256_url: Option<&str>,
+    on_progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(UpdateStatus),
+{
+    let never_cancel = AtomicBool::new(false);
+    download_and_apply_update_cancellable(
+        latest,
+        download_url,
+        asset_name,
+        sha256_url,
+        &never_cancel,
+        DEFAULT_UPDATE_TIMEOUT,
+        on_progress,
+    )
+}
+
+pub fn download_and_apply_update_cancellable<F>(
+    latest: &str,
+    download_url: &str,
+    asset_name: Option<&str>,
+    sha256_url: Option<&str>,
+    cancel_flag: &AtomicBool,
+    total_timeout: Duration,
     mut on_progress: F,
 ) -> Result<(), String>
 where
     F: FnMut(UpdateStatus),
 {
-    if !is_self_update_dir_writable() {
-        return Err("当前程序目录无写入权限，请点击「手动下载」".to_string());
-    }
+    let ctrl = TransferControl::new(total_timeout, cancel_flag);
+    ctrl.check()?;
+
+    let sha_url = sha256_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "该版本缺少 SHA-256 校验文件，已禁止自动更新，请使用「手动下载」".to_string()
+        })?;
     if !is_allowed_download_url(download_url) {
         return Err("下载地址未通过安全白名单校验".to_string());
     }
-    if let Some(url) = sha256_url {
-        if !is_allowed_download_url(url) {
-            return Err("校验文件地址未通过安全白名单校验".to_string());
-        }
+    if !is_allowed_download_url(sha_url) {
+        return Err("校验文件地址未通过安全白名单校验".to_string());
+    }
+    if !is_self_update_dir_writable() {
+        return Err("当前程序目录无写入权限，请点击「手动下载」".to_string());
     }
 
     let current_exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径: {e}"))?;
     let exe_dir = current_exe
         .parent()
         .ok_or_else(|| "无法获取当前程序目录".to_string())?;
+
+    let _dir_mutex = DirUpdateMutexGuard::acquire_cancellable(exe_dir, &ctrl)?;
+
+    let attempt_seq = WRITE_CHECK_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+    let temp_download = exe_dir.join(format!(
+        "{}{}.{}.tmp",
+        TEMP_PART_PREFIX,
+        std::process::id(),
+        attempt_seq
+    ));
     let new_exe = exe_dir.join(STAGED_NEW_FILE_NAME);
     let old_exe = exe_dir.join(STAGED_OLD_FILE_NAME);
 
-    let _ = fs::remove_file(&new_exe);
-    let mut new_cleanup = TempFileCleanup::new(new_exe.clone());
+    let _ = fs::remove_file(&temp_download);
+    let mut download_cleanup = TempFileCleanup::new(temp_download.clone());
 
     let checksum_text = {
         let api = WinHttpApi::load()?;
-        download_file_with_redirects(&api, download_url, &new_exe, latest, &mut on_progress)?;
+        download_file_with_redirects(
+            &api,
+            download_url,
+            &temp_download,
+            latest,
+            &ctrl,
+            &mut on_progress,
+        )?;
 
+        ctrl.check()?;
         on_progress(UpdateStatus::Verifying {
             latest: latest.to_string(),
         });
 
-        match sha256_url {
-            Some(url) => Some(download_small_text_with_redirects(
-                &api,
-                url,
-                MAX_SHA256_BYTES,
-            )?),
-            None => None,
-        }
+        download_small_text_with_redirects(&api, sha_url, MAX_SHA256_BYTES, &ctrl)?
     };
 
-    validate_pe_x64_file(&new_exe)?;
+    ctrl.check()?;
+    validate_pe_x64_file(&temp_download)?;
 
-    if let Some(text) = checksum_text {
-        let expected_hash = parse_sha256_for_asset(&text, asset_name)
-            .ok_or_else(|| "校验文件格式无效或未找到匹配目标的 SHA-256".to_string())?;
-        let actual_hash = compute_file_sha256(&new_exe)?;
-        if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
-            return Err("安装包 SHA-256 校验失败，文件可能已损坏或被篡改".to_string());
-        }
+    let expected_hash = parse_sha256_for_asset(&checksum_text, asset_name)
+        .ok_or_else(|| "校验文件格式无效或未找到匹配目标的 SHA-256".to_string())?;
+    let actual_hash = compute_file_sha256_cancellable(&temp_download, &ctrl)?;
+    if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
+        return Err("安装包 SHA-256 校验失败，文件可能已损坏或被篡改".to_string());
     }
+
+    verify_manifest_publisher_signature(
+        checksum_text.as_bytes(),
+        None,
+        EMBEDDED_PUBLISHER_PUBLIC_KEY,
+    )?;
+
+    ctrl.check()?;
+
+    let _ = fs::remove_file(&new_exe);
+    move_file_replace(&temp_download, &new_exe)?;
+    download_cleanup.disarm();
+    let mut new_cleanup = TempFileCleanup::new(new_exe.clone());
 
     on_progress(UpdateStatus::Applying {
         latest: latest.to_string(),
@@ -1147,7 +1452,7 @@ where
     })
 }
 
-pub fn handle_post_update_startup() {
+pub fn wait_for_old_pid_if_needed() {
     if let Some(old_pid) = parse_wait_pid_from_args(std::env::args()) {
         if old_pid != 0 && old_pid != std::process::id() {
             unsafe {
@@ -1160,7 +1465,9 @@ pub fn handle_post_update_startup() {
             }
         }
     }
+}
 
+pub fn cleanup_post_update_files() {
     let Ok(current_exe) = std::env::current_exe() else {
         return;
     };
@@ -1168,7 +1475,22 @@ pub fn handle_post_update_startup() {
         return;
     };
 
-    cleanup_staged_files_in_dir(exe_dir, &current_exe);
+    cleanup_post_update_files_in_dir(exe_dir, &current_exe);
+}
+
+pub fn handle_post_update_startup() {
+    wait_for_old_pid_if_needed();
+    cleanup_post_update_files();
+}
+
+fn cleanup_post_update_files_in_dir(exe_dir: &Path, current_exe: &Path) {
+    let Ok(Some(_dir_mutex)) = DirUpdateMutexGuard::try_acquire(exe_dir) else {
+        return;
+    };
+    if !current_exe.exists() {
+        return;
+    }
+    cleanup_staged_files_in_dir(exe_dir, current_exe);
 }
 
 fn parse_wait_pid_from_args<I, S>(args: I) -> Option<u32>
@@ -1201,6 +1523,18 @@ fn cleanup_staged_files_in_dir(exe_dir: &Path, current_exe: &Path) {
             let _ = fs::remove_file(exe_dir.join(format!("{name}.new")));
         }
     }
+
+    if let Ok(entries) = fs::read_dir(exe_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                continue;
+            };
+            if name_str.starts_with(TEMP_PART_PREFIX) && name_str.ends_with(".tmp") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 fn remove_old_file_with_retry(path: &Path) {
@@ -1231,28 +1565,54 @@ fn apply_staged_update_with_spawner<S>(
     current_exe: &Path,
     new_exe: &Path,
     old_exe: &Path,
-    mut spawn_fn: S,
+    spawn_fn: S,
 ) -> Result<(), String>
 where
     S: FnMut(&Path) -> Result<(), String>,
 {
+    apply_staged_update_with_ops(current_exe, new_exe, old_exe, move_file_replace, spawn_fn)
+}
+
+fn apply_staged_update_with_ops<M, S>(
+    current_exe: &Path,
+    new_exe: &Path,
+    old_exe: &Path,
+    mut move_fn: M,
+    mut spawn_fn: S,
+) -> Result<(), String>
+where
+    M: FnMut(&Path, &Path) -> Result<(), String>,
+    S: FnMut(&Path) -> Result<(), String>,
+{
     let _ = fs::remove_file(old_exe);
 
-    if let Err(err) = move_file_replace(current_exe, old_exe) {
+    if let Err(err) = move_fn(current_exe, old_exe) {
         let _ = fs::remove_file(new_exe);
         return Err(format!("备份旧版程序失败: {err}"));
     }
 
-    if let Err(err) = move_file_replace(new_exe, current_exe) {
-        let _ = move_file_replace(old_exe, current_exe);
-        let _ = fs::remove_file(new_exe);
-        return Err(format!("替换为新版程序失败，已回滚旧版: {err}"));
+    if let Err(err) = move_fn(new_exe, current_exe) {
+        return match move_fn(old_exe, current_exe) {
+            Ok(()) => {
+                let _ = fs::remove_file(new_exe);
+                Err(format!("替换为新版程序失败，已自动回滚旧版: {err}"))
+            }
+            Err(rb_err) => Err(format!(
+                "替换为新版程序失败，且回滚失败，请手动将 AirMonitor.exe.old 重命名为 AirMonitor.exe（替换错误: {err}；回滚错误: {rb_err}）"
+            )),
+        };
     }
 
     if let Err(err) = spawn_fn(current_exe) {
-        let _ = move_file_replace(old_exe, current_exe);
-        let _ = fs::remove_file(new_exe);
-        return Err(format!("启动新版程序失败，已自动回滚旧版: {err}"));
+        return match move_fn(old_exe, current_exe) {
+            Ok(()) => {
+                let _ = fs::remove_file(new_exe);
+                Err(format!("启动新版程序失败，已自动回滚旧版: {err}"))
+            }
+            Err(rb_err) => Err(format!(
+                "启动新版程序失败，且回滚失败，请手动将 AirMonitor.exe.old 重命名为 AirMonitor.exe（启动错误: {err}；回滚错误: {rb_err}）"
+            )),
+        };
     }
 
     Ok(())
@@ -1354,12 +1714,40 @@ fn parse_sha256_for_asset(text: &str, asset_name: Option<&str>) -> Option<String
     None
 }
 
-fn compute_file_sha256(path: &Path) -> Result<String, String> {
+fn compute_file_sha256_cancellable(
+    path: &Path,
+    ctrl: &TransferControl<'_>,
+) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("无法打开安装包计算 SHA-256: {e}"))?;
-    compute_sha256_reader(&mut file)
+    compute_sha256_reader_cancellable(&mut file, Some(ctrl))
 }
 
+#[cfg(test)]
 fn compute_sha256_reader<R: Read>(reader: &mut R) -> Result<String, String> {
+    compute_sha256_reader_cancellable(reader, None)
+}
+
+fn compute_sha256_reader_cancellable<R: Read>(
+    reader: &mut R,
+    ctrl: Option<&TransferControl<'_>>,
+) -> Result<String, String> {
+    let digest = compute_sha256_digest_reader(reader, ctrl)?;
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
+fn compute_sha256_digest_reader<R: Read>(
+    reader: &mut R,
+    ctrl: Option<&TransferControl<'_>>,
+) -> Result<[u8; 32], String> {
+    if let Some(c) = ctrl {
+        c.check()?;
+    }
+
     let api = BCryptApi::load()?;
 
     let mut alg_handle: BCryptAlgHandle = std::ptr::null_mut();
@@ -1419,11 +1807,17 @@ fn compute_sha256_reader<R: Read>(reader: &mut R) -> Result<String, String> {
 
     let mut buf = [0u8; 16 * 1024];
     loop {
+        if let Some(c) = ctrl {
+            c.check()?;
+        }
         let n = reader
             .read(&mut buf)
             .map_err(|e| format!("读取文件计算 SHA-256 失败: {e}"))?;
         if n == 0 {
             break;
+        }
+        if let Some(c) = ctrl {
+            c.check()?;
         }
         let hash_status = unsafe { (api.hash_data)(hash.handle, buf.as_ptr(), n as u32, 0) };
         if hash_status < 0 {
@@ -1440,12 +1834,202 @@ fn compute_sha256_reader<R: Read>(reader: &mut R) -> Result<String, String> {
         ));
     }
 
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut hex, "{b:02x}");
+    Ok(digest)
+}
+
+const BCRYPT_ECDSA_PUBLIC_P256_MAGIC: u32 = 0x3153_4345;
+const P256_COORD_BYTES: usize = 32;
+const P256_SPKI_PREFIX: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06, 0x08, 0x2A,
+    0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+fn parse_p256_public_key_to_bcrypt_blob(key_bytes: &[u8]) -> Result<[u8; 72], String> {
+    let raw_xy: &[u8] = if key_bytes.len() == 72
+        && key_bytes[0..4] == BCRYPT_ECDSA_PUBLIC_P256_MAGIC.to_le_bytes()
+        && key_bytes[4..8] == (P256_COORD_BYTES as u32).to_le_bytes()
+    {
+        &key_bytes[8..72]
+    } else if key_bytes.len() == 91
+        && key_bytes[..P256_SPKI_PREFIX.len()] == P256_SPKI_PREFIX
+        && key_bytes[26] == 0x04
+    {
+        &key_bytes[27..91]
+    } else if key_bytes.len() == 65 && key_bytes[0] == 0x04 {
+        &key_bytes[1..65]
+    } else if key_bytes.len() == 64 {
+        key_bytes
+    } else {
+        return Err("ECDSA P-256 公钥格式无效".to_string());
+    };
+
+    let (x, y) = raw_xy.split_at(P256_COORD_BYTES);
+    if x.iter().all(|&b| b == 0) || y.iter().all(|&b| b == 0) {
+        return Err("ECDSA P-256 公钥坐标全零无效".to_string());
     }
-    Ok(hex)
+
+    let mut blob = [0u8; 72];
+    blob[0..4].copy_from_slice(&BCRYPT_ECDSA_PUBLIC_P256_MAGIC.to_le_bytes());
+    blob[4..8].copy_from_slice(&(P256_COORD_BYTES as u32).to_le_bytes());
+    blob[8..40].copy_from_slice(x);
+    blob[40..72].copy_from_slice(y);
+    Ok(blob)
+}
+
+fn parse_der_integer_to_32(input: &[u8]) -> Result<([u8; 32], &[u8]), String> {
+    if input.len() < 3 || input[0] != 0x02 {
+        return Err("DER ECDSA 签名缺少 INTEGER 标签".to_string());
+    }
+    let len = input[1] as usize;
+    if len == 0 || (len & 0x80) != 0 || input.len() < 2 + len {
+        return Err("DER ECDSA 签名整数长度无效".to_string());
+    }
+    let val = &input[2..2 + len];
+    if (val[0] & 0x80) != 0 {
+        return Err("DER ECDSA 签名包含负整数".to_string());
+    }
+    let stripped = if val[0] == 0x00 {
+        if val.len() == 1 || (val[1] & 0x80) == 0 {
+            return Err("DER ECDSA 签名整数存在多余前导零".to_string());
+        }
+        &val[1..]
+    } else {
+        val
+    };
+    if stripped.len() > P256_COORD_BYTES || stripped.iter().all(|&b| b == 0) {
+        return Err("DER ECDSA 签名整数超出 P-256 范围".to_string());
+    }
+    let mut out = [0u8; P256_COORD_BYTES];
+    out[P256_COORD_BYTES - stripped.len()..].copy_from_slice(stripped);
+    Ok((out, &input[2 + len..]))
+}
+
+fn parse_p256_signature_to_p1363(sig: &[u8]) -> Result<[u8; 64], String> {
+    if sig.len() == 64 {
+        let (r, s) = sig.split_at(P256_COORD_BYTES);
+        if r.iter().all(|&b| b == 0) || s.iter().all(|&b| b == 0) {
+            return Err("ECDSA P-256 签名分量为零".to_string());
+        }
+        let mut out = [0u8; 64];
+        out.copy_from_slice(sig);
+        return Ok(out);
+    }
+
+    if sig.len() < 8 || sig[0] != 0x30 {
+        return Err("ECDSA P-256 签名格式无效".to_string());
+    }
+    let seq_len = sig[1] as usize;
+    if (seq_len & 0x80) != 0 || sig.len() != 2 + seq_len {
+        return Err("DER ECDSA 签名序列长度无效".to_string());
+    }
+    let body = &sig[2..];
+    let (r, rest) = parse_der_integer_to_32(body)?;
+    let (s, tail) = parse_der_integer_to_32(rest)?;
+    if !tail.is_empty() {
+        return Err("DER ECDSA 签名存在多余尾部字节".to_string());
+    }
+
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&r);
+    out[32..].copy_from_slice(&s);
+    Ok(out)
+}
+
+pub fn verify_p256_digest_signature(
+    public_key: &[u8],
+    sha256_digest: &[u8; 32],
+    signature: &[u8],
+) -> Result<(), String> {
+    let key_blob = parse_p256_public_key_to_bcrypt_blob(public_key)?;
+    let sig_p1363 = parse_p256_signature_to_p1363(signature)?;
+
+    let api = BCryptApi::load()?;
+    let mut alg_handle: BCryptAlgHandle = std::ptr::null_mut();
+    let open_status = unsafe {
+        (api.open_algorithm_provider)(
+            &mut alg_handle,
+            w!("ECDSA_P256").as_ptr(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if open_status < 0 || alg_handle.is_null() {
+        return Err(format!(
+            "初始化 ECDSA_P256 算法失败 (0x{:08X})",
+            open_status as u32
+        ));
+    }
+    let alg = BCryptAlgGuard {
+        handle: alg_handle,
+        close_fn: api.close_algorithm_provider,
+    };
+
+    let mut key_handle: BCryptKeyHandle = std::ptr::null_mut();
+    let import_status = unsafe {
+        (api.import_key_pair)(
+            alg.handle,
+            std::ptr::null_mut(),
+            w!("ECCPUBLICBLOB").as_ptr(),
+            &mut key_handle,
+            key_blob.as_ptr(),
+            key_blob.len() as u32,
+            0,
+        )
+    };
+    if import_status < 0 || key_handle.is_null() {
+        return Err(format!(
+            "导入 ECDSA P-256 公钥失败 (0x{:08X})",
+            import_status as u32
+        ));
+    }
+    let key = BCryptKeyGuard {
+        handle: key_handle,
+        destroy_fn: api.destroy_key,
+    };
+
+    let verify_status = unsafe {
+        (api.verify_signature)(
+            key.handle,
+            std::ptr::null(),
+            sha256_digest.as_ptr(),
+            sha256_digest.len() as u32,
+            sig_p1363.as_ptr(),
+            sig_p1363.len() as u32,
+            0,
+        )
+    };
+    if verify_status != 0 {
+        return Err(format!(
+            "发布者 ECDSA P-256 签名校验失败 (0x{:08X})",
+            verify_status as u32
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn verify_p256_sha256_signature(
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
+    let mut cursor = std::io::Cursor::new(message);
+    let digest = compute_sha256_digest_reader(&mut cursor, None)?;
+    verify_p256_digest_signature(public_key, &digest, signature)
+}
+
+pub fn verify_manifest_publisher_signature(
+    manifest_bytes: &[u8],
+    signature_bytes: Option<&[u8]>,
+    publisher_public_key: Option<&[u8]>,
+) -> Result<(), String> {
+    let Some(pubkey) = publisher_public_key else {
+        return Ok(());
+    };
+    let sig = signature_bytes
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "已配置发布者公钥但缺少清单签名，已拒绝自动更新".to_string())?;
+    verify_p256_sha256_signature(pubkey, manifest_bytes, sig)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2663,6 +3247,496 @@ mod tests {
         assert_eq!(
             parse_wait_pid_from_args(["airmonitor.exe", "--wait-pid", "abc"]),
             None
+        );
+    }
+
+    #[test]
+    fn fail_closed_when_sha256_url_missing() {
+        let no_sha_json = br#"{
+            "tag_name": "v0.2.0",
+            "html_url": "https://github.com/AmlitaEnan/AirMonitor/releases/tag/v0.2.0",
+            "assets": [
+                {
+                    "name": "AirMonitor.exe",
+                    "size": 1048576,
+                    "browser_download_url": "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/AirMonitor.exe"
+                }
+            ]
+        }"#;
+        let status = process_release_response(200, no_sha_json, "0.1.0");
+        assert!(!status.can_auto_update());
+        match &status {
+            UpdateStatus::UpdateAvailable {
+                download_url,
+                sha256_url,
+                ..
+            } => {
+                assert!(download_url.is_some());
+                assert!(sha256_url.is_none());
+            }
+            other => panic!("unexpected status: {other:?}"),
+        }
+
+        let err = download_and_apply_update(
+            "0.2.0",
+            "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/AirMonitor.exe",
+            Some("AirMonitor.exe"),
+            None,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("SHA-256"));
+        assert!(err.contains("手动下载"));
+
+        let err_empty = download_and_apply_update(
+            "0.2.0",
+            "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/AirMonitor.exe",
+            Some("AirMonitor.exe"),
+            Some("   "),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err_empty.contains("手动下载"));
+
+        let valid_status = UpdateStatus::UpdateAvailable {
+            current: "0.1.0".to_string(),
+            latest: "0.2.0".to_string(),
+            release_url: RELEASES_URL.to_string(),
+            published_at: None,
+            download_url: Some(
+                "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/AirMonitor.exe"
+                    .to_string(),
+            ),
+            asset_name: Some("AirMonitor.exe".to_string()),
+            asset_size: Some(1_048_576),
+            sha256_url: Some(
+                "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/SHA256SUMS.txt"
+                    .to_string(),
+            ),
+        };
+        assert!(valid_status.can_auto_update());
+        assert!(!UpdateStatus::Idle.can_auto_update());
+    }
+
+    #[test]
+    fn rollback_paths_distinguish_recovered_vs_manual_recovery() {
+        let dir = unique_test_dir("rollback_paths");
+        let current_exe = dir.join("AirMonitor.exe");
+        let new_exe = dir.join("airmonitor.exe.new");
+        let old_exe = dir.join("airmonitor.exe.old");
+
+        // 1. Replace fails + rollback succeeds -> reports auto rollback
+        fs::write(&current_exe, b"old-v1").unwrap();
+        fs::write(&new_exe, b"new-v2").unwrap();
+        let err = apply_staged_update_with_ops(
+            &current_exe,
+            &new_exe,
+            &old_exe,
+            |src, dst| {
+                if src == new_exe && dst == current_exe {
+                    Err("simulated replace failure".to_string())
+                } else {
+                    move_file_replace(src, dst)
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.contains("已自动回滚旧版"), "got: {err}");
+        assert!(!err.contains("请手动将"));
+        assert_eq!(fs::read(&current_exe).unwrap(), b"old-v1");
+        assert!(!new_exe.exists());
+
+        // 2. Replace fails + rollback ALSO fails -> preserves .old and instructs manual rename
+        fs::write(&current_exe, b"old-v1").unwrap();
+        fs::write(&new_exe, b"new-v2").unwrap();
+        let err = apply_staged_update_with_ops(
+            &current_exe,
+            &new_exe,
+            &old_exe,
+            |src, dst| {
+                if src == current_exe && dst == old_exe {
+                    move_file_replace(src, dst)
+                } else if src == new_exe && dst == current_exe {
+                    Err("simulated replace failure".to_string())
+                } else {
+                    Err("simulated rollback failure".to_string())
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("回滚失败，请手动将 AirMonitor.exe.old 重命名为 AirMonitor.exe"),
+            "got: {err}"
+        );
+        assert!(old_exe.exists());
+        assert_eq!(fs::read(&old_exe).unwrap(), b"old-v1");
+
+        // 3. Spawn fails + rollback ALSO fails -> preserves .old and instructs manual rename
+        let _ = fs::remove_file(&old_exe);
+        fs::write(&current_exe, b"old-v1").unwrap();
+        fs::write(&new_exe, b"new-v2").unwrap();
+        let err = apply_staged_update_with_ops(
+            &current_exe,
+            &new_exe,
+            &old_exe,
+            |src, dst| {
+                if src == old_exe && dst == current_exe {
+                    Err("simulated rollback lock".to_string())
+                } else {
+                    move_file_replace(src, dst)
+                }
+            },
+            |_| Err("simulated launch failure".to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("回滚失败，请手动将 AirMonitor.exe.old 重命名为 AirMonitor.exe"),
+            "got: {err}"
+        );
+        assert!(old_exe.exists());
+        assert_eq!(fs::read(&old_exe).unwrap(), b"old-v1");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_mutex_name_normalization_and_cleanup_guard() {
+        let dir = unique_test_dir("mutex_guard");
+        let sub = dir.join("SubFolder");
+        fs::create_dir_all(&sub).unwrap();
+
+        let n1 = dir_update_mutex_name(&sub);
+        let with_slash = PathBuf::from(format!("{}\\", sub.display()));
+        let n2 = dir_update_mutex_name(&with_slash);
+        let unc_prefixed = PathBuf::from(format!(r"\\?\{}", sub.display()));
+        let n3 = dir_update_mutex_name(&unc_prefixed);
+        assert!(n1.starts_with("Local\\AirMonitor_Update_"));
+        assert_eq!(n1, n2);
+        assert_eq!(n1, n3);
+        assert_ne!(n1, dir_update_mutex_name(&dir));
+
+        let current_exe = sub.join("AirMonitor.exe");
+        let old_exe = sub.join("airmonitor.exe.old");
+        let new_exe = sub.join("airmonitor.exe.new");
+        let part_tmp = sub.join("airmonitor.exe.part.123.1.tmp");
+        fs::write(&current_exe, b"curr").unwrap();
+        fs::write(&old_exe, b"old").unwrap();
+        fs::write(&new_exe, b"new").unwrap();
+        fs::write(&part_tmp, b"tmp").unwrap();
+
+        // Hold mutex on another thread (Win32 mutex is re-entrant on the same thread).
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sub_clone = sub.clone();
+        let holder = std::thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let ctrl = TransferControl::new(Duration::from_secs(5), &cancel);
+            let _guard = DirUpdateMutexGuard::acquire_cancellable(&sub_clone, &ctrl)
+                .expect("holder should acquire mutex");
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        // Concurrent cleanup must skip while mutex is held.
+        cleanup_post_update_files_in_dir(&sub, &current_exe);
+        assert!(old_exe.exists());
+        assert!(new_exe.exists());
+        assert!(part_tmp.exists());
+
+        // Concurrent update acquire_cancellable respects cancel/timeout while held.
+        let cancel_wait = AtomicBool::new(true);
+        let cancel_ctrl = TransferControl::new(Duration::from_secs(5), &cancel_wait);
+        assert!(DirUpdateMutexGuard::acquire_cancellable(&sub, &cancel_ctrl).is_err());
+
+        let timeout_flag = AtomicBool::new(false);
+        let timeout_ctrl = TransferControl::new(Duration::from_millis(60), &timeout_flag);
+        assert!(DirUpdateMutexGuard::acquire_cancellable(&sub, &timeout_ctrl).is_err());
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        // After mutex is released, cleanup removes staged files when current_exe exists.
+        cleanup_post_update_files_in_dir(&sub, &current_exe);
+        assert!(!old_exe.exists());
+        assert!(!new_exe.exists());
+        assert!(!part_tmp.exists());
+
+        // If current_exe is missing (e.g. broken swap), .old must not be deleted.
+        fs::remove_file(&current_exe).unwrap();
+        fs::write(&old_exe, b"old-rescue").unwrap();
+        cleanup_post_update_files_in_dir(&sub, &current_exe);
+        assert!(old_exe.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancellable_update_and_sha256_timeout_cancel() {
+        let cancel = AtomicBool::new(true);
+        let err = download_and_apply_update_cancellable(
+            "0.2.0",
+            "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/AirMonitor.exe",
+            Some("AirMonitor.exe"),
+            Some(
+                "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/SHA256SUMS.txt",
+            ),
+            &cancel,
+            Duration::from_secs(30),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("已取消"), "got: {err}");
+
+        let never_cancel = AtomicBool::new(false);
+        let err_to = download_and_apply_update_cancellable(
+            "0.2.0",
+            "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/AirMonitor.exe",
+            Some("AirMonitor.exe"),
+            Some(
+                "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/SHA256SUMS.txt",
+            ),
+            &never_cancel,
+            Duration::ZERO,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err_to.contains("超时"), "got: {err_to}");
+
+        struct CancellingReader<'a> {
+            reads: usize,
+            cancel: &'a AtomicBool,
+        }
+        impl Read for CancellingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads >= 2 {
+                    self.cancel.store(true, AtomicOrdering::Relaxed);
+                }
+                buf[..16].fill(0x41);
+                Ok(16)
+            }
+        }
+        let flag = AtomicBool::new(false);
+        let ctrl = TransferControl::new(Duration::from_secs(10), &flag);
+        let mut reader = CancellingReader {
+            reads: 0,
+            cancel: &flag,
+        };
+        let hash_err = compute_sha256_reader_cancellable(&mut reader, Some(&ctrl)).unwrap_err();
+        assert!(hash_err.contains("已取消"), "got: {hash_err}");
+
+        // TempFileCleanup deletes per-attempt temp file on drop
+        let dir = unique_test_dir("temp_cleanup");
+        let tmp_path = dir.join("airmonitor.exe.part.999.1.tmp");
+        fs::write(&tmp_path, b"partial").unwrap();
+        {
+            let _cleanup = TempFileCleanup::new(tmp_path.clone());
+        }
+        assert!(!tmp_path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn encode_der_integer(be: &[u8]) -> Vec<u8> {
+        let trimmed = be
+            .iter()
+            .position(|&b| b != 0)
+            .map(|i| &be[i..])
+            .unwrap_or(&[0u8]);
+        let mut out = Vec::new();
+        out.push(0x02);
+        if (trimmed[0] & 0x80) != 0 {
+            out.push((trimmed.len() + 1) as u8);
+            out.push(0x00);
+        } else {
+            out.push(trimmed.len() as u8);
+        }
+        out.extend_from_slice(trimmed);
+        out
+    }
+
+    fn encode_der_ecdsa_sig(p1363: &[u8; 64]) -> Vec<u8> {
+        let r = encode_der_integer(&p1363[..32]);
+        let s = encode_der_integer(&p1363[32..]);
+        let mut out = Vec::with_capacity(2 + r.len() + s.len());
+        out.push(0x30);
+        out.push((r.len() + s.len()) as u8);
+        out.extend_from_slice(&r);
+        out.extend_from_slice(&s);
+        out
+    }
+
+    fn generate_test_p256_key_and_sign(digest: &[u8; 32]) -> (Vec<u8>, [u8; 64]) {
+        type FnBCryptGenerateKeyPair =
+            unsafe extern "system" fn(BCryptAlgHandle, *mut BCryptKeyHandle, u32, u32) -> i32;
+        type FnBCryptFinalizeKeyPair = unsafe extern "system" fn(BCryptKeyHandle, u32) -> i32;
+        type FnBCryptExportKey = unsafe extern "system" fn(
+            BCryptKeyHandle,
+            BCryptKeyHandle,
+            *const u16,
+            *mut u8,
+            u32,
+            *mut u32,
+            u32,
+        ) -> i32;
+        type FnBCryptSignHash = unsafe extern "system" fn(
+            BCryptKeyHandle,
+            *const c_void,
+            *const u8,
+            u32,
+            *mut u8,
+            u32,
+            *mut u32,
+            u32,
+        ) -> i32;
+
+        let api = BCryptApi::load().expect("load bcrypt");
+        unsafe {
+            let module = LoadLibraryExW(
+                w!("bcrypt.dll"),
+                HANDLE::default(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+            .expect("load bcrypt.dll");
+            let _mod_guard = ModuleGuard(module);
+
+            let gen_key = load_proc::<FnBCryptGenerateKeyPair>(module, s!("BCryptGenerateKeyPair"))
+                .expect("BCryptGenerateKeyPair");
+            let fin_key = load_proc::<FnBCryptFinalizeKeyPair>(module, s!("BCryptFinalizeKeyPair"))
+                .expect("BCryptFinalizeKeyPair");
+            let exp_key = load_proc::<FnBCryptExportKey>(module, s!("BCryptExportKey"))
+                .expect("BCryptExportKey");
+            let sign_hash = load_proc::<FnBCryptSignHash>(module, s!("BCryptSignHash"))
+                .expect("BCryptSignHash");
+
+            let mut alg_handle: BCryptAlgHandle = std::ptr::null_mut();
+            assert_eq!(
+                (api.open_algorithm_provider)(
+                    &mut alg_handle,
+                    w!("ECDSA_P256").as_ptr(),
+                    std::ptr::null(),
+                    0,
+                ),
+                0
+            );
+            let alg = BCryptAlgGuard {
+                handle: alg_handle,
+                close_fn: api.close_algorithm_provider,
+            };
+
+            let mut key_handle: BCryptKeyHandle = std::ptr::null_mut();
+            assert_eq!(gen_key(alg.handle, &mut key_handle, 256, 0), 0);
+            let key = BCryptKeyGuard {
+                handle: key_handle,
+                destroy_fn: api.destroy_key,
+            };
+            assert_eq!(fin_key(key.handle, 0), 0);
+
+            let mut pub_len: u32 = 0;
+            assert_eq!(
+                exp_key(
+                    key.handle,
+                    std::ptr::null_mut(),
+                    w!("ECCPUBLICBLOB").as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut pub_len,
+                    0,
+                ),
+                0
+            );
+            let mut pub_blob = vec![0u8; pub_len as usize];
+            let mut written: u32 = 0;
+            assert_eq!(
+                exp_key(
+                    key.handle,
+                    std::ptr::null_mut(),
+                    w!("ECCPUBLICBLOB").as_ptr(),
+                    pub_blob.as_mut_ptr(),
+                    pub_len,
+                    &mut written,
+                    0,
+                ),
+                0
+            );
+
+            let mut sig = [0u8; 64];
+            let mut sig_len: u32 = 0;
+            assert_eq!(
+                sign_hash(
+                    key.handle,
+                    std::ptr::null(),
+                    digest.as_ptr(),
+                    digest.len() as u32,
+                    sig.as_mut_ptr(),
+                    sig.len() as u32,
+                    &mut sig_len,
+                    0,
+                ),
+                0
+            );
+            assert_eq!(sig_len, 64);
+
+            (pub_blob, sig)
+        }
+    }
+
+    #[test]
+    fn bcrypt_ecdsa_p256_signature_verification() {
+        let message =
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  AirMonitor.exe\n";
+        let digest = compute_sha256_digest_reader(&mut Cursor::new(message.as_slice()), None)
+            .expect("sha256 digest");
+
+        let (pub_blob, sig_p1363) = generate_test_p256_key_and_sign(&digest);
+        assert_eq!(pub_blob.len(), 72);
+
+        // Construct SEC1 uncompressed, raw X||Y, and SPKI DER encodings of the same key
+        let raw_xy = pub_blob[8..72].to_vec();
+        let mut sec1 = Vec::with_capacity(65);
+        sec1.push(0x04);
+        sec1.extend_from_slice(&raw_xy);
+        let mut spki = Vec::with_capacity(91);
+        spki.extend_from_slice(&P256_SPKI_PREFIX);
+        spki.extend_from_slice(&sec1);
+
+        let sig_der = encode_der_ecdsa_sig(&sig_p1363);
+
+        // Valid verification across all key and signature formats
+        verify_p256_sha256_signature(&pub_blob, message, &sig_p1363)
+            .expect("ECCPUBLICBLOB + P1363");
+        verify_p256_sha256_signature(&sec1, message, &sig_der).expect("SEC1 + DER");
+        verify_p256_sha256_signature(&spki, message, &sig_der).expect("SPKI + DER");
+        verify_p256_sha256_signature(&raw_xy, message, &sig_p1363).expect("raw XY + P1363");
+
+        // Tampered message fails
+        let mut tampered_msg = message.to_vec();
+        tampered_msg[0] ^= 0x01;
+        assert!(verify_p256_sha256_signature(&spki, &tampered_msg, &sig_der).is_err());
+
+        // Tampered signature fails
+        let mut tampered_sig = sig_p1363;
+        tampered_sig[10] ^= 0x80;
+        assert!(verify_p256_sha256_signature(&spki, message, &tampered_sig).is_err());
+
+        // Wrong public key fails
+        let (other_pub, _) = generate_test_p256_key_and_sign(&digest);
+        assert!(verify_p256_sha256_signature(&other_pub, message, &sig_der).is_err());
+
+        // Malformed public keys / signatures fail cleanly
+        assert!(verify_p256_sha256_signature(&[0u8; 64], message, &sig_p1363).is_err());
+        assert!(verify_p256_sha256_signature(&spki, message, &[0u8; 64]).is_err());
+        assert!(verify_p256_sha256_signature(&spki, message, &[0x30, 0x02, 0x02, 0x00]).is_err());
+
+        // Optional publisher key policy: None allows SHA-256 verified manifest; Some enforces signature
+        verify_manifest_publisher_signature(message, None, None).expect("None key permits");
+        verify_manifest_publisher_signature(message, Some(&sig_der), Some(&spki))
+            .expect("valid signature with configured pubkey");
+        assert!(verify_manifest_publisher_signature(message, None, Some(&spki)).is_err());
+        assert!(
+            verify_manifest_publisher_signature(message, Some(&tampered_sig), Some(&spki)).is_err()
         );
     }
 }
