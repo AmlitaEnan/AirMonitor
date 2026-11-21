@@ -39,6 +39,14 @@ impl WirelessManager {
     }
 
     pub fn poll_once(&mut self) -> Vec<WirelessDevice> {
+        self.poll_once_internal(false)
+    }
+
+    pub fn poll_once_force(&mut self) -> Vec<WirelessDevice> {
+        self.poll_once_internal(true)
+    }
+
+    fn poll_once_internal(&mut self, force_refresh: bool) -> Vec<WirelessDevice> {
         if self.stop_flag.load(Ordering::Relaxed) {
             return Vec::new();
         }
@@ -51,7 +59,11 @@ impl WirelessManager {
         if self.stop_flag.load(Ordering::Relaxed) {
             return deduplicate_wireless_devices(devices);
         }
-        devices.extend(self.hid.poll());
+        if force_refresh {
+            devices.extend(self.hid.poll_force());
+        } else {
+            devices.extend(self.hid.poll());
+        }
         deduplicate_wireless_devices(devices)
     }
 

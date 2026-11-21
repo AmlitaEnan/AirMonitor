@@ -44,10 +44,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE, DBT_DEVNODES_CHANGED, DBT_DEVTYP_DEVICEINTERFACE,
     DEVICE_NOTIFY_ALL_INTERFACE_CLASSES, DEVICE_NOTIFY_WINDOW_HANDLE,
     DEV_BROADCAST_DEVICEINTERFACE_W, GWLP_USERDATA, HDEVNOTIFY, IDC_ARROW, MA_NOACTIVATE, MSG,
-    WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DEVICECHANGE,
-    WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WM_TIMER, WM_USER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DEVICECHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+    WM_USER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::config::{AnchorEdge, AppConfig, LayoutMode};
@@ -309,6 +309,12 @@ impl Drop for ComApartmentGuard {
     }
 }
 
+#[derive(Default)]
+struct WirelessWakeState {
+    woken: bool,
+    force_refresh: bool,
+}
+
 struct UiApp {
     state: SnapshotStore,
     hinstance: HINSTANCE,
@@ -318,7 +324,7 @@ struct UiApp {
     tray: TrayManager,
     popup: Rc<RefCell<PopupManager>>,
     hw_signal: HwWakeSignal,
-    wireless_wake: Arc<(Mutex<bool>, Condvar)>,
+    wireless_wake: Arc<(Mutex<WirelessWakeState>, Condvar)>,
     stop_flag: Arc<AtomicBool>,
     hdevnotify: HDEVNOTIFY,
     smoke_test: bool,
@@ -380,10 +386,13 @@ impl UiApp {
         }
     }
 
-    fn wake_wireless_worker(&self) {
+    fn wake_wireless_worker(&self, force_refresh: bool) {
         let (lock, cvar) = &*self.wireless_wake;
-        if let Ok(mut woken) = lock.lock() {
-            *woken = true;
+        if let Ok(mut st) = lock.lock() {
+            st.woken = true;
+            if force_refresh {
+                st.force_refresh = true;
+            }
             cvar.notify_all();
         }
     }
@@ -403,7 +412,7 @@ impl UiApp {
         }
         self.stop_flag.store(true, Ordering::Release);
         self.hw_signal.stop();
-        self.wake_wireless_worker();
+        self.wake_wireless_worker(false);
         unsafe {
             let _ = KillTimer(self.host_hwnd, TIMER_ZORDER_CHECK);
             let _ = KillTimer(self.host_hwnd, TIMER_DEVICE_DEBOUNCE);
@@ -451,7 +460,7 @@ pub fn run(smoke_test: bool) -> i32 {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let hw_signal = HwWakeSignal::new();
     let popup_open = Arc::new(AtomicBool::new(false));
-    let wireless_wake = Arc::new((Mutex::new(false), Condvar::new()));
+    let wireless_wake = Arc::new((Mutex::new(WirelessWakeState::default()), Condvar::new()));
 
     let hinstance: HINSTANCE = unsafe {
         match GetModuleHandleW(None) {
@@ -577,8 +586,8 @@ pub fn run(smoke_test: bool) -> i32 {
     hw_signal.stop();
     {
         let (lock, cvar) = &*wireless_wake;
-        if let Ok(mut woken) = lock.lock() {
-            *woken = true;
+        if let Ok(mut st) = lock.lock() {
+            st.woken = true;
             cvar.notify_all();
         }
     }
@@ -723,7 +732,7 @@ fn has_pending_passive_telemetry(devices: &[crate::state::WirelessDevice]) -> bo
 fn spawn_wireless_worker(
     state: SnapshotStore,
     stop_flag: Arc<AtomicBool>,
-    wake_sig: Arc<(Mutex<bool>, Condvar)>,
+    wake_sig: Arc<(Mutex<WirelessWakeState>, Condvar)>,
     host_hwnd_raw: isize,
 ) -> Option<thread::JoinHandle<()>> {
     thread::Builder::new()
@@ -731,8 +740,14 @@ fn spawn_wireless_worker(
         .spawn(move || {
             let mut mgr = WirelessManager::with_stop_flag(Arc::clone(&stop_flag));
             let mut passive_fast_retries: u8 = 0;
+            let mut next_force = false;
             while !stop_flag.load(Ordering::Relaxed) {
-                let devices = mgr.poll_once();
+                let devices = if next_force {
+                    mgr.poll_once_force()
+                } else {
+                    mgr.poll_once()
+                };
+                next_force = false;
                 let awaiting_passive = has_pending_passive_telemetry(&devices);
                 state.update_devices(devices);
                 post_wireless_update(host_hwnd_raw);
@@ -754,14 +769,16 @@ fn spawn_wireless_worker(
                     };
 
                 let (lock, cvar) = &*wake_sig;
-                if let Ok(mut woken) = lock.lock() {
-                    if !*woken && !stop_flag.load(Ordering::Relaxed) {
+                if let Ok(mut st) = lock.lock() {
+                    if !st.woken && !stop_flag.load(Ordering::Relaxed) {
                         let (guard, _) = cvar
-                            .wait_timeout(woken, Duration::from_secs(wait_secs))
+                            .wait_timeout(st, Duration::from_secs(wait_secs))
                             .unwrap_or_else(|e| e.into_inner());
-                        woken = guard;
+                        st = guard;
                     }
-                    *woken = false;
+                    next_force = st.force_refresh;
+                    st.woken = false;
+                    st.force_refresh = false;
                 }
             }
         })
@@ -938,7 +955,7 @@ unsafe fn run_context_menu(
         }
         MenuAction::RefreshWireless => {
             if let Ok(app) = app_cell.try_borrow() {
-                app.wake_wireless_worker();
+                app.wake_wireless_worker(true);
             } else {
                 let _ = PostMessageW(host_hwnd, WM_APP_REFRESH_WIRELESS, WPARAM(0), LPARAM(0));
             }
@@ -988,6 +1005,13 @@ unsafe extern "system" fn host_wnd_proc(
             let _ = SetTimer(hwnd, TIMER_DEVICE_DEBOUNCE, DEVICE_DEBOUNCE_MS, None);
         }
         return LRESULT(0);
+    }
+    if msg == WM_POWERBROADCAST {
+        let evt = wparam.0 as u32;
+        if evt == PBT_APMRESUMEAUTOMATIC || evt == PBT_APMRESUMESUSPEND {
+            let _ = SetTimer(hwnd, TIMER_DEVICE_DEBOUNCE, DEVICE_DEBOUNCE_MS, None);
+        }
+        return LRESULT(1);
     }
     if msg == WM_DESTROY {
         return LRESULT(0);
@@ -1139,7 +1163,7 @@ unsafe extern "system" fn host_wnd_proc(
             return LRESULT(0);
         }
         WM_APP_REFRESH_WIRELESS => {
-            app.wake_wireless_worker();
+            app.wake_wireless_worker(true);
             return LRESULT(0);
         }
         WM_APP_UPDATE_STATUS => {
@@ -1297,11 +1321,11 @@ unsafe extern "system" fn host_wnd_proc(
                 TIMER_DEVICE_DEBOUNCE => {
                     let _ = KillTimer(hwnd, TIMER_DEVICE_DEBOUNCE);
                     let _ = SetTimer(hwnd, TIMER_DEVICE_FOLLOWUP, DEVICE_FOLLOWUP_MS, None);
-                    app.wake_wireless_worker();
+                    app.wake_wireless_worker(true);
                 }
                 TIMER_DEVICE_FOLLOWUP => {
                     let _ = KillTimer(hwnd, TIMER_DEVICE_FOLLOWUP);
-                    app.wake_wireless_worker();
+                    app.wake_wireless_worker(true);
                 }
                 TIMER_SMOKE_TEST => {
                     let _ = KillTimer(hwnd, TIMER_SMOKE_TEST);

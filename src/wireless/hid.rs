@@ -40,8 +40,10 @@ const HID_IOCTL_TIMEOUT_MS: u32 = 300;
 const HID_WAIT_SLICE_MS: u32 = 50;
 const HID_MAX_BACKOFF_SECS: u64 = 600;
 const HID_DEFAULT_POLL_BASE_SECS: u64 = 45;
+const HID_PASSIVE_MAX_BACKOFF_SECS: u64 = 45;
 const HID_PASSIVE_INITIAL_RETRY_SECS: u64 = 4;
 const HID_PASSIVE_INITIAL_FAST_RETRIES: u32 = 2;
+const HID_PASSIVE_REOPEN_FAIL_INTERVAL: u32 = 20;
 
 // Win32 WDK CTL_CODE definitions for hidclass.sys (hidclass.h):
 // CTL_CODE(FILE_DEVICE_KEYBOARD=0x0B, Function, Method, FILE_ANY_ACCESS=0)
@@ -504,6 +506,14 @@ impl HidMonitor {
     }
 
     pub fn poll(&mut self) -> Vec<WirelessDevice> {
+        self.poll_internal(false)
+    }
+
+    pub fn poll_force(&mut self) -> Vec<WirelessDevice> {
+        self.poll_internal(true)
+    }
+
+    fn poll_internal(&mut self, force_refresh: bool) -> Vec<WirelessDevice> {
         if self.is_stopped() {
             return Vec::new();
         }
@@ -561,15 +571,34 @@ impl HidMonitor {
 
         let mut prober = RealCandidateProber {
             poll_start: Instant::now(),
+            force_refresh,
         };
-        self.poll_candidates_with(candidates, &present_groups, Instant::now(), &mut prober)
+        self.poll_candidates_with_force(
+            candidates,
+            &present_groups,
+            Instant::now(),
+            force_refresh,
+            &mut prober,
+        )
     }
 
+    #[cfg(test)]
     fn poll_candidates_with(
+        &mut self,
+        candidates: Vec<PollCandidate>,
+        present_groups: &HashSet<String>,
+        now: Instant,
+        prober: &mut impl CandidateProber,
+    ) -> Vec<WirelessDevice> {
+        self.poll_candidates_with_force(candidates, present_groups, now, false, prober)
+    }
+
+    fn poll_candidates_with_force(
         &mut self,
         mut candidates: Vec<PollCandidate>,
         present_groups: &HashSet<String>,
         now: Instant,
+        force_refresh: bool,
         prober: &mut impl CandidateProber,
     ) -> Vec<WirelessDevice> {
         let mut grouped: HashMap<String, WirelessDevice> = HashMap::new();
@@ -638,21 +667,23 @@ impl HidMonitor {
             }
 
             // Enforce per-device min_poll_secs / exponential backoff & overall poll budget
-            // once per device group per round.
+            // once per device group per round (bypassed on explicit user/wake force refresh).
             if !probed_groups_this_round.contains(&group_key) {
-                if let Some(st) = self.poll_states.get(&group_key) {
-                    if now < st.next_probe_after {
-                        let cached_online = self.resolve_skipped_group_online(&group_key, now);
-                        self.emit_cached_group_or_standby(
-                            &group_key,
-                            &info,
-                            &meta,
-                            cached_online,
-                            now,
-                            &mut grouped,
-                        );
-                        skipped_groups.insert(group_key);
-                        continue;
+                if !force_refresh {
+                    if let Some(st) = self.poll_states.get(&group_key) {
+                        if now < st.next_probe_after {
+                            let cached_online = self.resolve_skipped_group_online(&group_key, now);
+                            self.emit_cached_group_or_standby(
+                                &group_key,
+                                &info,
+                                &meta,
+                                cached_online,
+                                now,
+                                &mut grouped,
+                            );
+                            skipped_groups.insert(group_key);
+                            continue;
+                        }
                     }
                 }
 
@@ -848,16 +879,21 @@ impl HidMonitor {
             let prev_streak = prev.map(|s| s.fail_streak).unwrap_or(0);
             let prev_ever = prev.map(|s| s.ever_had_battery).unwrap_or(false);
             let mut next_state = update_poll_state(now, success, prev_streak, min_poll);
-            if is_passive_push
-                && !success
-                && !prev_ever
-                && next_state.fail_streak <= HID_PASSIVE_INITIAL_FAST_RETRIES
-            {
-                // Passive-push devices (e.g. Rapoo Gen2 54L) emit periodic 0x07 frames
-                // every ~3-10s without active TX; allow 2 short passive buffer re-reads
-                // before falling back to normal 45s/90s exponential backoff.
-                next_state.next_probe_after =
-                    now + Duration::from_secs(HID_PASSIVE_INITIAL_RETRY_SECS);
+            if is_passive_push && !success {
+                if !prev_ever && next_state.fail_streak <= HID_PASSIVE_INITIAL_FAST_RETRIES {
+                    // Passive-push devices (e.g. Rapoo Gen2 54L) emit periodic 0x07 frames
+                    // without active TX; allow 2 short passive buffer re-reads on startup.
+                    next_state.next_probe_after =
+                        now + Duration::from_secs(HID_PASSIVE_INITIAL_RETRY_SECS);
+                } else {
+                    // Passive-push reads only drain the local Windows HID ring buffer (zero
+                    // USB TX, never wakes sleeping mice). Cap cooldown at 45s (or min_poll_secs)
+                    // instead of exponential 600s backoff so woken mice recover promptly.
+                    let cap_secs = min_poll
+                        .filter(|&s| s > 0)
+                        .unwrap_or(HID_PASSIVE_MAX_BACKOFF_SECS);
+                    next_state.next_probe_after = now + Duration::from_secs(cap_secs);
+                }
             }
             next_state.ever_had_battery = prev_ever || success;
             self.poll_states.insert(group_key, next_state);
@@ -1056,15 +1092,37 @@ impl HidMonitor {
                 let probe_res = if family == ProtocolFamily::Rapoo && info.usage == 0x0002 {
                     let norm_key = normalize_hid_path(&info.path);
                     if !self.persistent_handles.contains_key(&norm_key) {
-                        if let Some(rw) =
-                            OpenHidDevice::open_with_info(info, true, Arc::clone(&self.stop_flag))
-                        {
+                        if let Some(rw) = OpenHidDevice::open_with_info(
+                            info.clone(),
+                            true,
+                            Arc::clone(&self.stop_flag),
+                        ) {
                             self.persistent_handles.insert(norm_key.clone(), rw);
                         }
                     }
-                    self.persistent_handles
+                    let first = self
+                        .persistent_handles
                         .get(&norm_key)
-                        .and_then(|io| rapoo::probe_diagnostics_listen(io))
+                        .map(|io| rapoo::probe_detailed(io, 3200));
+                    match first {
+                        Some(res) if res.io_error => {
+                            self.persistent_handles.remove(&norm_key);
+                            if let Some(rw) = OpenHidDevice::open_with_info(
+                                info,
+                                true,
+                                Arc::clone(&self.stop_flag),
+                            ) {
+                                self.persistent_handles.insert(norm_key.clone(), rw);
+                                self.persistent_handles
+                                    .get(&norm_key)
+                                    .and_then(|io| rapoo::probe_diagnostics_listen(io))
+                            } else {
+                                res.reading
+                            }
+                        }
+                        Some(res) => res.reading,
+                        None => None,
+                    }
                 } else {
                     OpenHidDevice::open_with_info(info, true, Arc::clone(&self.stop_flag))
                         .and_then(|rw_dev| probe_protocol(&self.registry, family, &rw_dev))
@@ -1115,6 +1173,7 @@ trait CandidateProber {
 
 struct RealCandidateProber {
     poll_start: Instant,
+    force_refresh: bool,
 }
 
 impl CandidateProber for RealCandidateProber {
@@ -1155,7 +1214,8 @@ impl CandidateProber for RealCandidateProber {
             && info.usage == 0x0002
         {
             let norm_key = normalize_hid_path(&info.path);
-            if !monitor.persistent_handles.contains_key(&norm_key) {
+            let had_existing_handle = monitor.persistent_handles.contains_key(&norm_key);
+            if !had_existing_handle {
                 if let Some(rw) = OpenHidDevice::open_with_info(
                     info.clone(),
                     true,
@@ -1169,14 +1229,106 @@ impl CandidateProber for RealCandidateProber {
                 .get(group_key)
                 .and_then(|(r, _)| r.battery_pct)
                 .is_some();
+            let prev_state = monitor.poll_states.get(group_key);
+            let prev_streak = prev_state.map(|s| s.fail_streak).unwrap_or(0);
+            let ever_had_battery = prev_state.map(|s| s.ever_had_battery).unwrap_or(false);
+            let is_sleeping_offline = ever_had_battery && prev_streak >= HID_OFFLINE_FAIL_THRESHOLD;
 
-            monitor.persistent_handles.get(&norm_key).and_then(|io| {
+            // Always read/drain the existing handle first so any already-buffered wake frame
+            // is never discarded before deciding whether the handle needs to be reopened.
+            let first_listen_ms: u64 = if self.force_refresh {
                 if has_cached_pct {
-                    rapoo::probe_fast(io)
+                    400
+                } else if had_existing_handle {
+                    // Split budget across existing handle drain/listen and a reopened handle fallback.
+                    1600
                 } else {
-                    rapoo::probe(io)
+                    3600
                 }
-            })
+            } else if is_sleeping_offline {
+                // Sleeping passive mouse: drain already-buffered wake frames only (~25ms, zero TX).
+                0
+            } else if has_cached_pct {
+                80
+            } else {
+                3600
+            };
+
+            let first_res = monitor.persistent_handles.get(&norm_key).map(|io| {
+                if first_listen_ms == 0 {
+                    rapoo::probe_drain_only(io)
+                } else {
+                    rapoo::probe_detailed(io, first_listen_ms)
+                }
+            });
+
+            let first_has_pct = first_res
+                .as_ref()
+                .and_then(|r| r.reading.as_ref())
+                .and_then(|r| r.battery_pct)
+                .is_some();
+            let first_io_err = first_res.as_ref().is_some_and(|r| r.io_error);
+
+            if first_io_err {
+                // Handle returned a non-timeout Win32 I/O error: close and reopen immediately.
+                monitor.persistent_handles.remove(&norm_key);
+                if let Some(rw) = OpenHidDevice::open_with_info(
+                    info.clone(),
+                    true,
+                    Arc::clone(&monitor.stop_flag),
+                ) {
+                    monitor.persistent_handles.insert(norm_key.clone(), rw);
+                    if !first_has_pct {
+                        let retry_ms = if first_listen_ms == 0 {
+                            250
+                        } else if self.force_refresh {
+                            2000
+                        } else {
+                            first_listen_ms
+                        };
+                        return monitor
+                            .persistent_handles
+                            .get(&norm_key)
+                            .and_then(|io| rapoo::probe_detailed(io, retry_ms).reading);
+                    }
+                }
+                return first_res.and_then(|r| r.reading);
+            }
+
+            if !first_has_pct && had_existing_handle {
+                // On manual force refresh while offline/no-battery, reopen once to recover from
+                // silent stale handles (USB suspend/driver quirk) and listen with remaining budget.
+                if self.force_refresh && (is_sleeping_offline || !has_cached_pct) {
+                    monitor.persistent_handles.remove(&norm_key);
+                    if let Some(rw) = OpenHidDevice::open_with_info(
+                        info.clone(),
+                        true,
+                        Arc::clone(&monitor.stop_flag),
+                    ) {
+                        monitor.persistent_handles.insert(norm_key.clone(), rw);
+                        return monitor
+                            .persistent_handles
+                            .get(&norm_key)
+                            .and_then(|io| rapoo::probe_detailed(io, 2000).reading);
+                    }
+                } else if is_sleeping_offline
+                    && prev_streak > 0
+                    && prev_streak.is_multiple_of(HID_PASSIVE_REOPEN_FAIL_INTERVAL)
+                {
+                    // Periodic silent-stale-handle self-heal during long offline periods (~15m).
+                    // Reopening a local HID file handle sends zero USB TX to the sleeping mouse.
+                    monitor.persistent_handles.remove(&norm_key);
+                    if let Some(rw) = OpenHidDevice::open_with_info(
+                        info.clone(),
+                        true,
+                        Arc::clone(&monitor.stop_flag),
+                    ) {
+                        monitor.persistent_handles.insert(norm_key.clone(), rw);
+                    }
+                }
+            }
+
+            first_res.and_then(|r| r.reading)
         } else {
             let io =
                 OpenHidDevice::open_with_info(info.clone(), true, Arc::clone(&monitor.stop_flag))?;
@@ -1191,6 +1343,9 @@ fn is_within_cache_grace(cached_ts: Instant, now: Instant) -> bool {
 
 fn mark_device_cached_offline(dev: &mut WirelessDevice) {
     dev.online = false;
+    if dev.battery_pct.is_none() {
+        return;
+    }
     if let Some(note) = &dev.detail_note {
         if !note.contains("(cached)") {
             dev.detail_note = Some(format!("{} (cached)", note));
@@ -2469,5 +2624,170 @@ mod tests {
         let d3 = mon.poll_candidates_with(make_cands(), &present, t3, &mut prober);
         assert!(!d3[0].online);
         assert_eq!(d3[0].battery_pct, Some(85));
+    }
+
+    #[test]
+    fn test_passive_rapoo_sleep_caps_backoff_and_force_refresh_bypasses_cooldown() {
+        let mut mon = mk_monitor_for_test();
+        let gk = "hid:24AE:1412:2607-54L";
+        let present: HashSet<String> = [gk.to_string()].into_iter().collect();
+        let make_cands = || {
+            vec![mk_candidate(
+                0x24AE,
+                0x1412,
+                "Rapoo VT3",
+                DeviceKind::Mouse,
+                ProtocolFamily::Rapoo,
+                gk,
+                None,
+            )]
+        };
+
+        let mut prober = StubProber::new();
+        prober.responses.insert(
+            gk.to_string(),
+            Some(BatteryReading {
+                battery_pct: Some(65),
+                charging: false,
+                online: true,
+                detail_note: Some("Rapoo Gen2 (54L)".into()),
+                raw_packets: vec![],
+            }),
+        );
+
+        let t0 = Instant::now();
+        let d0 = mon.poll_candidates_with(make_cands(), &present, t0, &mut prober);
+        assert_eq!(d0.len(), 1);
+        assert!(d0[0].online);
+        assert_eq!(d0[0].battery_pct, Some(65));
+
+        // Overnight sleep: > 30 min cache expiry and 6 consecutive failures.
+        prober.responses.insert(gk.to_string(), None);
+        let mut t = t0 + Duration::from_secs(HID_CACHE_GRACE_SECS + 60);
+        for _ in 0..6 {
+            let d = mon.poll_candidates_with(make_cands(), &present, t, &mut prober);
+            assert_eq!(d.len(), 1);
+            let cooldown = mon.poll_states[gk]
+                .next_probe_after
+                .duration_since(t)
+                .as_secs();
+            assert_eq!(
+                cooldown, HID_PASSIVE_MAX_BACKOFF_SECS,
+                "passive Rapoo cooldown must stay capped at 45s instead of 600s"
+            );
+            t += Duration::from_secs(HID_PASSIVE_MAX_BACKOFF_SECS + 1);
+        }
+
+        // During cooldown (+5s), normal poll skips probing and reports offline standby without redundant "(cached)".
+        let t_cool = t - Duration::from_secs(HID_PASSIVE_MAX_BACKOFF_SECS) + Duration::from_secs(5);
+        let calls_before = prober.probe_calls;
+        let d_skip = mon.poll_candidates_with(make_cands(), &present, t_cool, &mut prober);
+        assert_eq!(prober.probe_calls, calls_before);
+        assert!(!d_skip[0].online);
+        assert_eq!(d_skip[0].battery_pct, None);
+        assert!(
+            !d_skip[0]
+                .detail_note
+                .as_deref()
+                .unwrap_or("")
+                .contains("(cached)"),
+            "standby entry without cached percentage should not append (cached): {:?}",
+            d_skip[0].detail_note
+        );
+
+        // Mouse wakes up; explicit force refresh bypasses cooldown and recovers immediately.
+        prober.responses.insert(
+            gk.to_string(),
+            Some(BatteryReading {
+                battery_pct: Some(63),
+                charging: false,
+                online: true,
+                detail_note: Some("Rapoo Gen2 (54L)".into()),
+                raw_packets: vec![],
+            }),
+        );
+        let d_force = mon.poll_candidates_with_force(
+            make_cands(),
+            &present,
+            t_cool + Duration::from_secs(1),
+            true,
+            &mut prober,
+        );
+        assert_eq!(prober.probe_calls, calls_before + 1);
+        assert!(d_force[0].online);
+        assert_eq!(d_force[0].battery_pct, Some(63));
+        assert_eq!(mon.poll_states[gk].fail_streak, 0);
+    }
+
+    #[test]
+    fn test_active_device_force_refresh_bypasses_long_backoff() {
+        let mut mon = mk_monitor_for_test();
+        let gk = "hid:260D:1175:SN9";
+        let present: HashSet<String> = [gk.to_string()].into_iter().collect();
+        let make_cands = || {
+            vec![mk_candidate(
+                0x260D,
+                0x1175,
+                "Dareu A950 Air",
+                DeviceKind::Mouse,
+                ProtocolFamily::Compx,
+                gk,
+                None,
+            )]
+        };
+
+        let mut prober = StubProber::new();
+        prober.responses.insert(
+            gk.to_string(),
+            Some(BatteryReading {
+                battery_pct: Some(80),
+                charging: false,
+                online: true,
+                detail_note: Some("CompX".into()),
+                raw_packets: vec![],
+            }),
+        );
+
+        let t0 = Instant::now();
+        let _ = mon.poll_candidates_with(make_cands(), &present, t0, &mut prober);
+
+        // 3 consecutive failures push active Compx device into 180s backoff.
+        prober.responses.insert(gk.to_string(), None);
+        let t1 = t0 + Duration::from_secs(50);
+        let _ = mon.poll_candidates_with(make_cands(), &present, t1, &mut prober);
+        let t2 = t1 + Duration::from_secs(50);
+        let _ = mon.poll_candidates_with(make_cands(), &present, t2, &mut prober);
+        let t3 = t2 + Duration::from_secs(95);
+        let d_off = mon.poll_candidates_with(make_cands(), &present, t3, &mut prober);
+        assert!(!d_off[0].online);
+        assert_eq!(
+            mon.poll_states[gk]
+                .next_probe_after
+                .duration_since(t3)
+                .as_secs(),
+            180
+        );
+
+        // Woken 10s later: manual force refresh bypasses the 180s backoff.
+        prober.responses.insert(
+            gk.to_string(),
+            Some(BatteryReading {
+                battery_pct: Some(79),
+                charging: false,
+                online: true,
+                detail_note: Some("CompX".into()),
+                raw_packets: vec![],
+            }),
+        );
+        let d_rec = mon.poll_candidates_with_force(
+            make_cands(),
+            &present,
+            t3 + Duration::from_secs(10),
+            true,
+            &mut prober,
+        );
+        assert!(d_rec[0].online);
+        assert_eq!(d_rec[0].battery_pct, Some(79));
+        assert_eq!(mon.poll_states[gk].fail_streak, 0);
     }
 }
