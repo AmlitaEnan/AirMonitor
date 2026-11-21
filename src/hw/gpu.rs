@@ -1,11 +1,13 @@
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::mem::{size_of, zeroed};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Foundation::{FreeLibrary, HANDLE, HMODULE, LUID};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
 };
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
@@ -13,11 +15,45 @@ use windows::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
     PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
 };
+use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+
+use super::pdh::PdhBackoff;
 
 const VENDOR_AMD: u32 = 0x1002;
 const VENDOR_NVIDIA: u32 = 0x10DE;
 const VENDOR_INTEL: u32 = 0x8086;
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GpuDemand {
+    pub usage: bool,
+    pub temp: bool,
+    pub hotspot: bool,
+    pub power: bool,
+    pub fan: bool,
+    pub vram: bool,
+}
+
+impl GpuDemand {
+    pub fn all() -> Self {
+        Self {
+            usage: true,
+            temp: true,
+            hotspot: true,
+            power: true,
+            fan: true,
+            vram: true,
+        }
+    }
+
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn any(&self) -> bool {
+        self.usage || self.temp || self.hotspot || self.power || self.fan || self.vram
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct GpuSample {
@@ -31,6 +67,7 @@ pub struct GpuSample {
     pub vram_used_gb: Option<f32>,
     pub vram_total_gb: Option<f32>,
     pub provider: &'static str,
+    pub(crate) multi_gpu: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,8 +75,10 @@ struct DxgiGpuInfo {
     name: String,
     vendor_id: u32,
     device_id: u32,
+    subsys_id: u32,
     luid: LUID,
     vram_total_gb: f32,
+    multi_gpu: bool,
 }
 
 pub struct GpuMonitor {
@@ -53,9 +92,13 @@ pub struct GpuMonitor {
     pdh_usage_query: isize,
     pdh_usage_counter: isize,
     pdh_usage_init_attempted: bool,
+    pdh_usage_invalid_streak: u8,
+    pdh_usage_backoff: PdhBackoff,
     pdh_vram_query: isize,
     pdh_vram_counter: isize,
     pdh_vram_init_attempted: bool,
+    pdh_vram_invalid_streak: u8,
+    pdh_vram_backoff: PdhBackoff,
 }
 
 impl GpuMonitor {
@@ -86,7 +129,7 @@ impl GpuMonitor {
 
         let (nvidia, nvidia_status) = match dxgi.as_ref() {
             Some(info) if info.vendor_id == VENDOR_NVIDIA => {
-                match NvidiaNvml::try_new(Some(&info.name)) {
+                match NvidiaNvml::try_new(Some(info)) {
                     Ok(nv) => {
                         let s = format!("已加载 ({})", nv.device_name);
                         (Some(nv), s)
@@ -120,11 +163,17 @@ impl GpuMonitor {
 
         let luid = dxgi.as_ref().map(|d| d.luid);
         let eager_vram_pdh = need_vram_pdh
+            && luid.is_some()
             && !nvidia
                 .as_ref()
                 .is_some_and(|nv| nv.fn_get_mem_info.is_some());
+        let mut pdh_vram_backoff = PdhBackoff::default();
         let (pdh_vram_query, pdh_vram_counter) = if eager_vram_pdh {
-            init_gpu_vram_pdh(luid)
+            let (q, c) = init_gpu_vram_pdh(luid);
+            if q == 0 {
+                pdh_vram_backoff.record_failure(Instant::now());
+            }
+            (q, c)
         } else {
             (0, 0)
         };
@@ -132,9 +181,15 @@ impl GpuMonitor {
         // Only open the heavy per-process GPU Engine(*engtype_3D) PDH query upfront when
         // demanded and no vendor telemetry API is available; otherwise defer until needed.
         let has_vendor = amd.is_some() || nvidia.is_some() || intel.is_some();
-        let eager_usage_pdh = need_usage_pdh && should_eagerly_init_usage_pdh(has_vendor, false);
+        let eager_usage_pdh =
+            need_usage_pdh && luid.is_some() && should_eagerly_init_usage_pdh(has_vendor, false);
+        let mut pdh_usage_backoff = PdhBackoff::default();
         let (pdh_usage_query, pdh_usage_counter) = if eager_usage_pdh {
-            init_gpu_usage_pdh(luid)
+            let (q, c) = init_gpu_usage_pdh(luid);
+            if q == 0 {
+                pdh_usage_backoff.record_failure(Instant::now());
+            }
+            (q, c)
         } else {
             (0, 0)
         };
@@ -150,26 +205,47 @@ impl GpuMonitor {
             pdh_usage_query,
             pdh_usage_counter,
             pdh_usage_init_attempted: eager_usage_pdh,
+            pdh_usage_invalid_streak: 0,
+            pdh_usage_backoff,
             pdh_vram_query,
             pdh_vram_counter,
             pdh_vram_init_attempted: eager_vram_pdh,
+            pdh_vram_invalid_streak: 0,
+            pdh_vram_backoff,
         }
     }
 
     pub fn sample(&mut self) -> GpuSample {
-        self.sample_with_demand(true, true)
+        self.sample_with_gpu_demand(GpuDemand::all())
     }
 
     pub fn sample_with_demand(&mut self, need_usage_pdh: bool, need_vram: bool) -> GpuSample {
+        self.sample_with_gpu_demand(GpuDemand {
+            usage: need_usage_pdh,
+            temp: true,
+            hotspot: true,
+            power: true,
+            fan: true,
+            vram: need_vram,
+        })
+    }
+
+    pub fn sample_with_gpu_demand(&mut self, demand: GpuDemand) -> GpuSample {
         let mut out = GpuSample::default();
+        let now = Instant::now();
 
         if let Some(info) = &self.dxgi {
             out.name = info.name.clone();
             out.vram_total_gb = Some(info.vram_total_gb);
+            out.multi_gpu = info.multi_gpu;
+        }
+
+        if !demand.any() {
+            return out;
         }
 
         if let Some(amd) = &self.amd {
-            let t = amd.sample();
+            let t = amd.sample_with_demand(demand);
             if out.name.is_empty() {
                 out.name = amd.adapter_name.clone();
             }
@@ -181,7 +257,7 @@ impl GpuMonitor {
             out.fan_pct = t.fan_pct;
             out.provider = "AMD ADL2";
         } else if let Some(nv) = &self.nvidia {
-            let t = nv.sample();
+            let t = nv.sample_with_demand(demand);
             if out.name.is_empty() {
                 out.name = nv.device_name.clone();
             }
@@ -196,7 +272,7 @@ impl GpuMonitor {
             }
             out.provider = "NVIDIA NVML";
         } else if let Some(igcl) = &mut self.intel {
-            let t = igcl.sample();
+            let t = igcl.sample_with_demand(demand);
             if out.name.is_empty() {
                 out.name = igcl.device_name.clone();
             }
@@ -210,53 +286,155 @@ impl GpuMonitor {
             out.provider = "DXGI/PDH";
         }
 
-        if need_usage_pdh && out.usage_pct.is_none() {
-            if !self.pdh_usage_init_attempted {
-                self.pdh_usage_init_attempted = true;
-                let (q, c) = init_gpu_usage_pdh(self.dxgi.as_ref().map(|d| d.luid));
-                self.pdh_usage_query = q;
-                self.pdh_usage_counter = c;
-            } else if self.pdh_usage_query != 0
-                && self.pdh_usage_counter != 0
-                && unsafe { PdhCollectQueryData(self.pdh_usage_query) == 0 }
-            {
-                out.usage_pct = read_pdh_counter_sum(self.pdh_usage_counter)
-                    .map(|v| v.clamp(0.0, 100.0) as f32);
-            }
+        let luid = self.dxgi.as_ref().map(|d| d.luid);
+        let luid_filter = luid.map(format_pdh_luid_tag);
+
+        if demand.usage && out.usage_pct.is_none() && luid.is_some() {
+            out.usage_pct = self
+                .sample_usage_pdh_at(luid, luid_filter.as_deref(), now)
+                .map(|v| v.clamp(0.0, 100.0) as f32);
         }
 
-        if need_vram && out.vram_used_gb.is_none() {
-            if !self.pdh_vram_init_attempted {
-                self.pdh_vram_init_attempted = true;
-                let (q, c) = init_gpu_vram_pdh(self.dxgi.as_ref().map(|d| d.luid));
-                self.pdh_vram_query = q;
-                self.pdh_vram_counter = c;
-            } else if self.pdh_vram_query != 0
-                && self.pdh_vram_counter != 0
-                && unsafe { PdhCollectQueryData(self.pdh_vram_query) == 0 }
-            {
-                out.vram_used_gb = read_pdh_counter_sum(self.pdh_vram_counter)
-                    .map(|bytes| (bytes / BYTES_PER_GB) as f32);
-            }
+        if demand.vram && out.vram_used_gb.is_none() && luid.is_some() {
+            out.vram_used_gb = self
+                .sample_vram_pdh_at(luid, luid_filter.as_deref(), now)
+                .map(|bytes| (bytes / BYTES_PER_GB) as f32);
         }
 
         out
     }
 
+    fn sample_usage_pdh_at(
+        &mut self,
+        luid: Option<LUID>,
+        luid_tag: Option<&str>,
+        now: Instant,
+    ) -> Option<f64> {
+        if self.pdh_usage_query == 0 || self.pdh_usage_counter == 0 {
+            if !self.pdh_usage_backoff.can_attempt(now) {
+                return None;
+            }
+            self.pdh_usage_init_attempted = true;
+            let (q, c) = init_gpu_usage_pdh(luid);
+            self.pdh_usage_query = q;
+            self.pdh_usage_counter = c;
+            if q == 0 || c == 0 {
+                close_pdh_query_handle(
+                    &mut self.pdh_usage_query,
+                    &mut self.pdh_usage_counter,
+                    &mut self.pdh_usage_invalid_streak,
+                );
+                self.pdh_usage_backoff.record_failure(now);
+                return None;
+            }
+            // Initial collect happened in init_gpu_usage_pdh; wait for next sample tick.
+            return None;
+        }
+
+        if unsafe { PdhCollectQueryData(self.pdh_usage_query) != 0 } {
+            close_pdh_query_handle(
+                &mut self.pdh_usage_query,
+                &mut self.pdh_usage_counter,
+                &mut self.pdh_usage_invalid_streak,
+            );
+            self.pdh_usage_backoff.record_failure(now);
+            return None;
+        }
+
+        if let Some(val) = read_pdh_counter_sum(self.pdh_usage_counter, luid_tag) {
+            self.pdh_usage_invalid_streak = 0;
+            self.pdh_usage_backoff.record_success();
+            Some(val)
+        } else {
+            self.pdh_usage_invalid_streak = self.pdh_usage_invalid_streak.saturating_add(1);
+            if self.pdh_usage_invalid_streak >= 3 {
+                close_pdh_query_handle(
+                    &mut self.pdh_usage_query,
+                    &mut self.pdh_usage_counter,
+                    &mut self.pdh_usage_invalid_streak,
+                );
+                self.pdh_usage_backoff.record_failure(now);
+            }
+            None
+        }
+    }
+
+    fn sample_vram_pdh_at(
+        &mut self,
+        luid: Option<LUID>,
+        luid_tag: Option<&str>,
+        now: Instant,
+    ) -> Option<f64> {
+        if self.pdh_vram_query == 0 || self.pdh_vram_counter == 0 {
+            if !self.pdh_vram_backoff.can_attempt(now) {
+                return None;
+            }
+            self.pdh_vram_init_attempted = true;
+            let (q, c) = init_gpu_vram_pdh(luid);
+            self.pdh_vram_query = q;
+            self.pdh_vram_counter = c;
+            if q == 0 || c == 0 {
+                close_pdh_query_handle(
+                    &mut self.pdh_vram_query,
+                    &mut self.pdh_vram_counter,
+                    &mut self.pdh_vram_invalid_streak,
+                );
+                self.pdh_vram_backoff.record_failure(now);
+                return None;
+            }
+            return None;
+        }
+
+        if unsafe { PdhCollectQueryData(self.pdh_vram_query) != 0 } {
+            close_pdh_query_handle(
+                &mut self.pdh_vram_query,
+                &mut self.pdh_vram_counter,
+                &mut self.pdh_vram_invalid_streak,
+            );
+            self.pdh_vram_backoff.record_failure(now);
+            return None;
+        }
+
+        if let Some(val) = read_pdh_counter_sum(self.pdh_vram_counter, luid_tag) {
+            self.pdh_vram_invalid_streak = 0;
+            self.pdh_vram_backoff.record_success();
+            Some(val)
+        } else {
+            self.pdh_vram_invalid_streak = self.pdh_vram_invalid_streak.saturating_add(1);
+            if self.pdh_vram_invalid_streak >= 3 {
+                close_pdh_query_handle(
+                    &mut self.pdh_vram_query,
+                    &mut self.pdh_vram_counter,
+                    &mut self.pdh_vram_invalid_streak,
+                );
+                self.pdh_vram_backoff.record_failure(now);
+            }
+            None
+        }
+    }
+
     pub fn release_usage_pdh(&mut self) -> bool {
-        close_pdh_query(
+        let was_open = close_pdh_query_handle(
             &mut self.pdh_usage_query,
             &mut self.pdh_usage_counter,
-            &mut self.pdh_usage_init_attempted,
-        )
+            &mut self.pdh_usage_invalid_streak,
+        );
+        let had_attempted = self.pdh_usage_init_attempted;
+        self.pdh_usage_init_attempted = false;
+        let had_backoff = self.pdh_usage_backoff.reset();
+        was_open || had_attempted || had_backoff
     }
 
     pub fn release_vram_pdh(&mut self) -> bool {
-        close_pdh_query(
+        let was_open = close_pdh_query_handle(
             &mut self.pdh_vram_query,
             &mut self.pdh_vram_counter,
-            &mut self.pdh_vram_init_attempted,
-        )
+            &mut self.pdh_vram_invalid_streak,
+        );
+        let had_attempted = self.pdh_vram_init_attempted;
+        self.pdh_vram_init_attempted = false;
+        let had_backoff = self.pdh_vram_backoff.reset();
+        was_open || had_attempted || had_backoff
     }
 
     pub fn release_pdh_queries(&mut self) -> bool {
@@ -277,8 +455,14 @@ impl GpuMonitor {
         let mut lines = Vec::new();
         match &self.dxgi {
             Some(info) => lines.push(format!(
-                "  DXGI 主卡: {} (VID=0x{:04X}, DID=0x{:04X}, VRAM={:.2} GB)",
-                info.name, info.vendor_id, info.device_id, info.vram_total_gb
+                "  DXGI 主卡: {} (VID=0x{:04X}, DID=0x{:04X}, LUID=0x{:08X}_{:08X}, VRAM={:.2} GB, multi_gpu={})",
+                info.name,
+                info.vendor_id,
+                info.device_id,
+                info.luid.HighPart as u32,
+                info.luid.LowPart,
+                info.vram_total_gb,
+                info.multi_gpu
             )),
             None => lines.push("  DXGI 主卡: (未检测到硬件显卡)".to_string()),
         }
@@ -288,6 +472,8 @@ impl GpuMonitor {
 
         let usage_pdh_status = if self.pdh_usage_query != 0 && self.pdh_usage_counter != 0 {
             "已初始化"
+        } else if self.pdh_usage_backoff.is_backing_off() {
+            "退避重试中"
         } else if !self.pdh_usage_init_attempted {
             "延迟未触发"
         } else {
@@ -295,6 +481,8 @@ impl GpuMonitor {
         };
         let vram_pdh_status = if self.pdh_vram_query != 0 && self.pdh_vram_counter != 0 {
             "已初始化"
+        } else if self.pdh_vram_backoff.is_backing_off() {
+            "退避重试中"
         } else if !self.pdh_vram_init_attempted {
             "延迟未触发 (优先使用 NVML)"
         } else {
@@ -308,7 +496,7 @@ impl GpuMonitor {
     }
 }
 
-fn read_pdh_counter_sum(counter: isize) -> Option<f64> {
+fn read_pdh_counter_sum(counter: isize, required_luid_tag: Option<&str>) -> Option<f64> {
     if counter == 0 {
         return None;
     }
@@ -344,6 +532,16 @@ fn read_pdh_counter_sum(counter: isize) -> Option<f64> {
         let mut total = 0.0_f64;
         let mut any_valid = false;
         for item in buf.iter().take(item_count as usize) {
+            if let Some(tag) = required_luid_tag {
+                let sz = item.szName;
+                if sz.is_null() {
+                    continue;
+                }
+                let inst_name = sz.to_string().unwrap_or_default().to_ascii_lowercase();
+                if !inst_name.contains(tag) {
+                    continue;
+                }
+            }
             // PDH_CSTATUS_VALID_DATA (0) or PDH_CSTATUS_NEW_DATA (1)
             if item.FmtValue.CStatus <= 1 {
                 let v = item.FmtValue.Anonymous.doubleValue;
@@ -369,7 +567,7 @@ impl Drop for GpuMonitor {
     }
 }
 
-fn close_pdh_query(query: &mut isize, counter: &mut isize, attempted: &mut bool) -> bool {
+fn close_pdh_query_handle(query: &mut isize, counter: &mut isize, invalid_streak: &mut u8) -> bool {
     let was_open = *query != 0;
     if *query != 0 {
         unsafe {
@@ -378,7 +576,7 @@ fn close_pdh_query(query: &mut isize, counter: &mut isize, attempted: &mut bool)
         *query = 0;
     }
     *counter = 0;
-    *attempted = false;
+    *invalid_streak = 0;
     was_open
 }
 
@@ -406,6 +604,7 @@ fn select_primary_dxgi_gpu() -> Option<DxgiGpuInfo> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
         let mut best: Option<(usize, DxgiGpuInfo)> = None;
+        let mut hw_count: usize = 0;
         let mut idx = 0_u32;
 
         while let Ok(adapter) = factory.EnumAdapters1(idx) {
@@ -417,13 +616,16 @@ fn select_primary_dxgi_gpu() -> Option<DxgiGpuInfo> {
             if is_virtual_or_software_gpu(&name, desc.VendorId, desc.Flags) {
                 continue;
             }
+            hw_count += 1;
             let dedicated = desc.DedicatedVideoMemory;
             let info = DxgiGpuInfo {
                 name,
                 vendor_id: desc.VendorId,
                 device_id: desc.DeviceId,
+                subsys_id: desc.SubSysId,
                 luid: desc.AdapterLuid,
                 vram_total_gb: (dedicated as f64 / BYTES_PER_GB) as f32,
+                multi_gpu: false,
             };
             let replace = match &best {
                 None => true,
@@ -434,7 +636,10 @@ fn select_primary_dxgi_gpu() -> Option<DxgiGpuInfo> {
             }
         }
 
-        best.map(|(_, info)| info)
+        best.map(|(_, mut info)| {
+            info.multi_gpu = hw_count > 1;
+            info
+        })
     }
 }
 
@@ -442,26 +647,41 @@ fn should_eagerly_init_usage_pdh(has_amd: bool, has_nvidia: bool) -> bool {
     !has_amd && !has_nvidia
 }
 
-fn init_single_counter_pdh(
+fn format_pdh_luid_tag(luid: LUID) -> String {
+    format!("luid_0x{:08x}_0x{:08x}", luid.HighPart as u32, luid.LowPart)
+}
+
+fn build_gpu_usage_pdh_path(luid: LUID) -> String {
+    format!(
+        "\\GPU Engine(*{}*engtype_3D)\\Utilization Percentage",
+        format_pdh_luid_tag(luid)
+    )
+}
+
+fn build_gpu_vram_pdh_path(luid: LUID) -> String {
+    format!(
+        "\\GPU Adapter Memory(*{}*)\\Dedicated Usage",
+        format_pdh_luid_tag(luid)
+    )
+}
+
+fn init_luid_counter_pdh(
     luid: Option<LUID>,
     luid_path_fn: impl FnOnce(LUID) -> String,
-    fallback_path: &str,
 ) -> (isize, isize) {
+    let Some(l) = luid else {
+        return (0, 0);
+    };
     unsafe {
         let mut query: isize = 0;
         if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != 0 {
             return (0, 0);
         }
 
-        let counter = luid
-            .and_then(|l| try_add_pdh_counter(query, &luid_path_fn(l)))
-            .or_else(|| try_add_pdh_counter(query, fallback_path))
-            .unwrap_or(0);
-
-        if counter == 0 {
+        let Some(counter) = try_add_pdh_counter(query, &luid_path_fn(l)) else {
             let _ = PdhCloseQuery(query);
             return (0, 0);
-        }
+        };
 
         let _ = PdhCollectQueryData(query);
         (query, counter)
@@ -469,29 +689,11 @@ fn init_single_counter_pdh(
 }
 
 fn init_gpu_usage_pdh(luid: Option<LUID>) -> (isize, isize) {
-    init_single_counter_pdh(
-        luid,
-        |l| {
-            format!(
-                "\\GPU Engine(*luid_0x{:08x}_0x{:08x}*engtype_3D)\\Utilization Percentage",
-                l.HighPart as u32, l.LowPart
-            )
-        },
-        "\\GPU Engine(*engtype_3D)\\Utilization Percentage",
-    )
+    init_luid_counter_pdh(luid, build_gpu_usage_pdh_path)
 }
 
 fn init_gpu_vram_pdh(luid: Option<LUID>) -> (isize, isize) {
-    init_single_counter_pdh(
-        luid,
-        |l| {
-            format!(
-                "\\GPU Adapter Memory(*luid_0x{:08x}_0x{:08x}*)\\Dedicated Usage",
-                l.HighPart as u32, l.LowPart
-            )
-        },
-        "\\GPU Adapter Memory(*)\\Dedicated Usage",
-    )
+    init_luid_counter_pdh(luid, build_gpu_vram_pdh_path)
 }
 
 fn try_add_pdh_counter(query: isize, path: &str) -> Option<isize> {
@@ -507,6 +709,34 @@ fn try_add_pdh_counter(query: isize, path: &str) -> Option<isize> {
     }
 }
 
+fn normalize_gpu_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_space = true;
+    for ch in name.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_space = false;
+        }
+    }
+    out.trim()
+        .replace("(tm)", "")
+        .replace("(r)", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strict_gpu_name_eq(a: &str, b: &str) -> bool {
+    let na = normalize_gpu_name(a);
+    let nb = normalize_gpu_name(b);
+    !na.is_empty() && na == nb
+}
+
 // ---------------------------------------------------------------------------
 // AMD ADL2 (atiadlxx.dll)
 // ---------------------------------------------------------------------------
@@ -520,8 +750,6 @@ const ADL_PMLOG_ASIC_POWER: usize = 23;
 const ADL_PMLOG_TEMPERATURE_HOTSPOT: usize = 27;
 const ADL_PMLOG_BOARD_POWER: usize = 73;
 
-// ADL2 SDK functions use the __cdecl (extern "C") calling convention on Windows
-// (which matches the Microsoft x64 ABI on x86_64).
 #[cfg(target_arch = "x86_64")]
 type AdlMallocCallback = unsafe extern "C" fn(i_size: c_int) -> *mut c_void;
 #[cfg(not(target_arch = "x86_64"))]
@@ -696,7 +924,7 @@ impl AmdAdl {
             let Some((adapter_index, adapter_name)) = chosen else {
                 let _ = fn_destroy(ctx);
                 let _ = FreeLibrary(HMODULE(module as *mut c_void));
-                return Err("初始化失败 (未找到支持 PMLog 的适配器)".to_string());
+                return Err("初始化失败 (未匹配到支持 PMLog 的适配器)".to_string());
             };
 
             Ok(Self {
@@ -710,7 +938,10 @@ impl AmdAdl {
         }
     }
 
-    fn sample(&self) -> VendorTelemetry {
+    fn sample_with_demand(&self, demand: GpuDemand) -> VendorTelemetry {
+        if !(demand.usage || demand.temp || demand.hotspot || demand.power || demand.fan) {
+            return VendorTelemetry::default();
+        }
         unsafe {
             let mut out = AdlPmLogDataOutput {
                 size: size_of::<AdlPmLogDataOutput>() as c_int,
@@ -728,19 +959,39 @@ impl AmdAdl {
                 }
             };
 
-            let usage_pct =
-                sensor(ADL_PMLOG_INFO_ACTIVITY_GFX).map(|v| (v as f32).clamp(0.0, 100.0));
-            let temp_c = sensor(ADL_PMLOG_TEMPERATURE_EDGE)
-                .map(|v| v as f32)
-                .filter(|v| (-20.0..=150.0).contains(v));
-            let hotspot_c = sensor(ADL_PMLOG_TEMPERATURE_HOTSPOT)
-                .map(|v| v as f32)
-                .filter(|v| (-20.0..=150.0).contains(v));
-            let power_w = sensor(ADL_PMLOG_BOARD_POWER)
-                .or_else(|| sensor(ADL_PMLOG_ASIC_POWER))
-                .map(|v| v as f32)
-                .filter(|v| (0.0..=2000.0).contains(v));
-            let fan_rpm = sensor(ADL_PMLOG_FAN_RPM).map(|v| v.max(0) as u32);
+            let usage_pct = demand
+                .usage
+                .then(|| sensor(ADL_PMLOG_INFO_ACTIVITY_GFX).map(|v| (v as f32).clamp(0.0, 100.0)))
+                .flatten();
+            let temp_c = demand
+                .temp
+                .then(|| {
+                    sensor(ADL_PMLOG_TEMPERATURE_EDGE)
+                        .map(|v| v as f32)
+                        .filter(|v| (-20.0..=150.0).contains(v))
+                })
+                .flatten();
+            let hotspot_c = demand
+                .hotspot
+                .then(|| {
+                    sensor(ADL_PMLOG_TEMPERATURE_HOTSPOT)
+                        .map(|v| v as f32)
+                        .filter(|v| (-20.0..=150.0).contains(v))
+                })
+                .flatten();
+            let power_w = demand
+                .power
+                .then(|| {
+                    sensor(ADL_PMLOG_BOARD_POWER)
+                        .or_else(|| sensor(ADL_PMLOG_ASIC_POWER))
+                        .map(|v| v as f32)
+                        .filter(|v| (0.0..=2000.0).contains(v))
+                })
+                .flatten();
+            let fan_rpm = demand
+                .fan
+                .then(|| sensor(ADL_PMLOG_FAN_RPM).map(|v| v.max(0) as u32))
+                .flatten();
 
             VendorTelemetry {
                 usage_pct,
@@ -776,7 +1027,12 @@ fn pick_adl_adapter(
     let is_amd_vendor = |v: c_int| v == 1002 || v == 0x1002;
 
     if let Some(d) = dxgi {
+        if d.vendor_id != VENDOR_AMD {
+            return None;
+        }
         let dev_tag = format!("DEV_{:04X}", d.device_id);
+        let mut pnp_matches: Vec<(c_int, String)> = Vec::new();
+        let mut seen_bdf = std::collections::HashSet::new();
         for info in infos {
             if !is_amd_vendor(info.i_vendor_id) {
                 continue;
@@ -784,41 +1040,79 @@ fn pick_adl_adapter(
             let pnp = c_char_slice_to_string(&info.str_pnp_string);
             if pnp.to_ascii_uppercase().contains(&dev_tag)
                 && adl_pmlog_works(ctx, info.i_adapter_index, fn_query_pmlog)
+                && seen_bdf.insert((
+                    info.i_bus_number,
+                    info.i_device_number,
+                    info.i_function_number,
+                ))
             {
-                return Some((
+                pnp_matches.push((
                     info.i_adapter_index,
                     c_char_slice_to_string(&info.str_adapter_name),
                 ));
             }
         }
+        if pnp_matches.len() == 1 {
+            return pnp_matches.into_iter().next();
+        }
+        if pnp_matches.len() > 1 {
+            // Multiple AMD cards with same DID: only bind if strict name uniquely identifies one.
+            let strict: Vec<_> = pnp_matches
+                .into_iter()
+                .filter(|(_, name)| strict_gpu_name_eq(name, &d.name))
+                .collect();
+            if strict.len() == 1 {
+                return strict.into_iter().next();
+            }
+            return None;
+        }
 
-        let target_lower = d.name.to_lowercase();
+        let mut name_matches: Vec<(c_int, String)> = Vec::new();
+        let mut seen_bdf_name = std::collections::HashSet::new();
         for info in infos {
             if !is_amd_vendor(info.i_vendor_id) {
                 continue;
             }
             let name = c_char_slice_to_string(&info.str_adapter_name);
-            let name_lower = name.to_lowercase();
-            if (name_lower == target_lower || name_lower.contains(&target_lower))
+            if strict_gpu_name_eq(&name, &d.name)
                 && adl_pmlog_works(ctx, info.i_adapter_index, fn_query_pmlog)
+                && seen_bdf_name.insert((
+                    info.i_bus_number,
+                    info.i_device_number,
+                    info.i_function_number,
+                ))
             {
-                return Some((info.i_adapter_index, name));
+                name_matches.push((info.i_adapter_index, name));
             }
         }
+        if name_matches.len() == 1 {
+            return name_matches.into_iter().next();
+        }
+        return None;
     }
 
+    let mut fallback: Vec<(c_int, String)> = Vec::new();
+    let mut seen_bdf = std::collections::HashSet::new();
     for info in infos {
         if !is_amd_vendor(info.i_vendor_id) {
             continue;
         }
-        if adl_pmlog_works(ctx, info.i_adapter_index, fn_query_pmlog) {
-            return Some((
+        if adl_pmlog_works(ctx, info.i_adapter_index, fn_query_pmlog)
+            && seen_bdf.insert((
+                info.i_bus_number,
+                info.i_device_number,
+                info.i_function_number,
+            ))
+        {
+            fallback.push((
                 info.i_adapter_index,
                 c_char_slice_to_string(&info.str_adapter_name),
             ));
         }
     }
-    None
+    (fallback.len() == 1)
+        .then(|| fallback.into_iter().next())
+        .flatten()
 }
 
 fn adl_pmlog_works(
@@ -870,9 +1164,46 @@ struct NvmlMemory {
     used: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NvmlPciInfoV2 {
+    bus_id: [c_char; 16],
+    domain: c_uint,
+    bus: c_uint,
+    device: c_uint,
+    pci_device_id: c_uint,
+    pci_sub_system_id: c_uint,
+}
+
+impl Default for NvmlPciInfoV2 {
+    fn default() -> Self {
+        unsafe { zeroed() }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NvmlPciInfoV3 {
+    bus_id_legacy: [c_char; 16],
+    domain: c_uint,
+    bus: c_uint,
+    device: c_uint,
+    pci_device_id: c_uint,
+    pci_sub_system_id: c_uint,
+    bus_id: [c_char; 32],
+}
+
+impl Default for NvmlPciInfoV3 {
+    fn default() -> Self {
+        unsafe { zeroed() }
+    }
+}
+
 const _: () = assert!(size_of::<NvmlUtilization>() == 8);
 const _: () = assert!(size_of::<NvmlFanSpeedInfo>() == 12);
 const _: () = assert!(size_of::<NvmlMemory>() == 24);
+const _: () = assert!(size_of::<NvmlPciInfoV2>() == 36);
+const _: () = assert!(size_of::<NvmlPciInfoV3>() == 68);
 
 const NVML_FAN_SPEED_INFO_V1: u32 = (size_of::<NvmlFanSpeedInfo>() as u32) | (1u32 << 24);
 
@@ -881,6 +1212,8 @@ type FnNvmlShutdown = unsafe extern "C" fn() -> c_int;
 type FnNvmlDeviceGetCount = unsafe extern "C" fn(*mut c_uint) -> c_int;
 type FnNvmlDeviceGetHandleByIndex = unsafe extern "C" fn(c_uint, *mut *mut c_void) -> c_int;
 type FnNvmlDeviceGetName = unsafe extern "C" fn(*mut c_void, *mut c_char, c_uint) -> c_int;
+type FnNvmlDeviceGetPciInfoV2 = unsafe extern "C" fn(*mut c_void, *mut NvmlPciInfoV2) -> c_int;
+type FnNvmlDeviceGetPciInfoV3 = unsafe extern "C" fn(*mut c_void, *mut NvmlPciInfoV3) -> c_int;
 type FnNvmlDeviceGetUtilizationRates =
     unsafe extern "C" fn(*mut c_void, *mut NvmlUtilization) -> c_int;
 type FnNvmlDeviceGetTemperature = unsafe extern "C" fn(*mut c_void, c_uint, *mut c_uint) -> c_int;
@@ -888,6 +1221,92 @@ type FnNvmlDeviceGetPowerUsage = unsafe extern "C" fn(*mut c_void, *mut c_uint) 
 type FnNvmlDeviceGetFanSpeed = unsafe extern "C" fn(*mut c_void, *mut c_uint) -> c_int;
 type FnNvmlDeviceGetFanSpeedRpm = unsafe extern "C" fn(*mut c_void, *mut NvmlFanSpeedInfo) -> c_int;
 type FnNvmlDeviceGetMemoryInfo = unsafe extern "C" fn(*mut c_void, *mut NvmlMemory) -> c_int;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NvmlDeviceCandidate {
+    index: usize,
+    name: String,
+    pci_vendor_id: Option<u32>,
+    pci_device_id: Option<u32>,
+    pci_subsys_id: Option<u32>,
+}
+
+fn decode_nvml_pci_ids(
+    pci_device_id_combined: u32,
+    pci_subsys_id: u32,
+) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let vendor_id = pci_device_id_combined & 0xFFFF;
+    let device_id = (pci_device_id_combined >> 16) & 0xFFFF;
+    (
+        (vendor_id != 0).then_some(vendor_id),
+        (device_id != 0).then_some(device_id),
+        (pci_subsys_id != 0).then_some(pci_subsys_id),
+    )
+}
+
+fn select_nvml_device_index(
+    dxgi: Option<&DxgiGpuInfo>,
+    candidates: &[NvmlDeviceCandidate],
+) -> Option<usize> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let Some(d) = dxgi else {
+        // Without DXGI reference, only bind when there is a single unambiguous NVIDIA device.
+        return (candidates.len() == 1).then(|| candidates[0].index);
+    };
+
+    if d.vendor_id != VENDOR_NVIDIA {
+        return None;
+    }
+
+    // Priority 1: PCI Vendor/Device/SubSys ID match.
+    let pci_matches: Vec<&NvmlDeviceCandidate> = candidates
+        .iter()
+        .filter(|c| c.pci_vendor_id == Some(VENDOR_NVIDIA) && c.pci_device_id == Some(d.device_id))
+        .collect();
+    if !pci_matches.is_empty() {
+        let subsys_matches: Vec<&NvmlDeviceCandidate> = if d.subsys_id != 0 {
+            pci_matches
+                .iter()
+                .copied()
+                .filter(|c| c.pci_subsys_id == Some(d.subsys_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let pool = if !subsys_matches.is_empty() {
+            subsys_matches
+        } else {
+            pci_matches
+        };
+        if pool.len() == 1 {
+            return Some(pool[0].index);
+        }
+        let name_narrowed: Vec<&NvmlDeviceCandidate> = pool
+            .into_iter()
+            .filter(|c| strict_gpu_name_eq(&c.name, &d.name))
+            .collect();
+        if name_narrowed.len() == 1 {
+            return Some(name_narrowed[0].index);
+        }
+        // Multiple indistinguishable NVIDIA GPUs with identical PCI IDs and names:
+        // cannot prove which matches DXGI LUID, so refuse to guess device 0.
+        return None;
+    }
+
+    // Priority 2: Strict normalized name match ONLY for candidates lacking PCI info.
+    let name_matches: Vec<&NvmlDeviceCandidate> = candidates
+        .iter()
+        .filter(|c| c.pci_device_id.is_none() && strict_gpu_name_eq(&c.name, &d.name))
+        .collect();
+    if name_matches.len() == 1 {
+        return Some(name_matches[0].index);
+    }
+
+    None
+}
 
 struct NvidiaNvml {
     module: isize,
@@ -903,7 +1322,12 @@ struct NvidiaNvml {
 }
 
 impl NvidiaNvml {
-    fn try_new(expected_name: Option<&str>) -> Result<Self, String> {
+    fn try_new(dxgi: Option<&DxgiGpuInfo>) -> Result<Self, String> {
+        if let Some(d) = dxgi {
+            if d.vendor_id != VENDOR_NVIDIA {
+                return Err("未匹配厂商".to_string());
+            }
+        }
         unsafe {
             let Some(module) = load_nvml_dll() else {
                 return Err("DLL 未安装 (nvml.dll)".to_string());
@@ -944,10 +1368,17 @@ impl NvidiaNvml {
                 get_proc(module, b"nvmlDeviceGetCount_v2\0")
                     .or_else(|| get_proc(module, b"nvmlDeviceGetCount\0"));
             let fn_get_name: Option<FnNvmlDeviceGetName> = get_proc(module, b"nvmlDeviceGetName\0");
+            let fn_get_pci_v3: Option<FnNvmlDeviceGetPciInfoV3> =
+                get_proc(module, b"nvmlDeviceGetPciInfo_v3\0");
+            let fn_get_pci_v2: Option<FnNvmlDeviceGetPciInfoV2> =
+                get_proc(module, b"nvmlDeviceGetPciInfo_v2\0")
+                    .or_else(|| get_proc(module, b"nvmlDeviceGetPciInfo\0"));
 
             let mut count: c_uint = 1;
             if let Some(f) = fn_get_count {
-                let _ = f(&mut count);
+                if f(&mut count) != NVML_SUCCESS {
+                    count = 0;
+                }
             }
             if count == 0 {
                 let _ = fn_shutdown();
@@ -955,8 +1386,8 @@ impl NvidiaNvml {
                 return Err("初始化失败 (未检测到 NVIDIA 设备)".to_string());
             }
 
-            let mut chosen_dev: *mut c_void = std::ptr::null_mut();
-            let mut chosen_name = String::new();
+            let mut handles: Vec<*mut c_void> = Vec::with_capacity(count as usize);
+            let mut candidates: Vec<NvmlDeviceCandidate> = Vec::with_capacity(count as usize);
 
             for idx in 0..count {
                 let mut dev: *mut c_void = std::ptr::null_mut();
@@ -974,26 +1405,44 @@ impl NvidiaNvml {
                     String::new()
                 };
 
-                if chosen_dev.is_null() {
-                    chosen_dev = dev;
-                    chosen_name = name.clone();
-                }
-                if let Some(target) = expected_name {
-                    let nl = name.to_lowercase();
-                    let tl = target.to_lowercase();
-                    if !nl.is_empty() && (nl == tl || tl.contains(&nl) || nl.contains(&tl)) {
-                        chosen_dev = dev;
-                        chosen_name = name;
-                        break;
+                let (pci_vendor_id, pci_device_id, pci_subsys_id) = if let Some(f3) = fn_get_pci_v3
+                {
+                    let mut pci = NvmlPciInfoV3::default();
+                    if f3(dev, &mut pci) == NVML_SUCCESS {
+                        decode_nvml_pci_ids(pci.pci_device_id, pci.pci_sub_system_id)
+                    } else {
+                        (None, None, None)
                     }
-                }
+                } else if let Some(f2) = fn_get_pci_v2 {
+                    let mut pci = NvmlPciInfoV2::default();
+                    if f2(dev, &mut pci) == NVML_SUCCESS {
+                        decode_nvml_pci_ids(pci.pci_device_id, pci.pci_sub_system_id)
+                    } else {
+                        (None, None, None)
+                    }
+                } else {
+                    (None, None, None)
+                };
+
+                let cand_idx = handles.len();
+                handles.push(dev);
+                candidates.push(NvmlDeviceCandidate {
+                    index: cand_idx,
+                    name,
+                    pci_vendor_id,
+                    pci_device_id,
+                    pci_subsys_id,
+                });
             }
 
-            if chosen_dev.is_null() {
+            let Some(chosen_pos) = select_nvml_device_index(dxgi, &candidates) else {
                 let _ = fn_shutdown();
                 let _ = FreeLibrary(HMODULE(module as *mut c_void));
-                return Err("初始化失败 (未获取到有效句柄)".to_string());
-            }
+                return Err("初始化失败 (未能可靠匹配 DXGI 选定 NVIDIA 设备)".to_string());
+            };
+
+            let chosen_dev = handles[chosen_pos];
+            let chosen_name = candidates[chosen_pos].name.clone();
 
             Ok(Self {
                 module,
@@ -1010,47 +1459,70 @@ impl NvidiaNvml {
         }
     }
 
-    fn sample(&self) -> VendorTelemetry {
+    fn sample_with_demand(&self, demand: GpuDemand) -> VendorTelemetry {
         unsafe {
             let dev = self.device as *mut c_void;
-            let usage_pct = self.fn_get_util.and_then(|f| {
-                let mut u = NvmlUtilization::default();
-                (f(dev, &mut u) == NVML_SUCCESS).then(|| (u.gpu as f32).clamp(0.0, 100.0))
-            });
-            let temp_c = self.fn_get_temp.and_then(|f| {
-                let mut t: c_uint = 0;
-                (f(dev, NVML_TEMPERATURE_GPU, &mut t) == NVML_SUCCESS).then_some(t as f32)
-            });
-            let power_w = self.fn_get_power.and_then(|f| {
-                let mut mw: c_uint = 0;
-                (f(dev, &mut mw) == NVML_SUCCESS).then(|| mw as f32 / 1000.0)
-            });
-            let fan_pct = self.fn_get_fan_pct.and_then(|f| {
-                let mut pct: c_uint = 0;
-                (f(dev, &mut pct) == NVML_SUCCESS && pct <= 100).then_some(pct)
-            });
-            let fan_rpm = self.fn_get_fan_rpm.and_then(|f| {
-                let mut info = NvmlFanSpeedInfo {
-                    version: NVML_FAN_SPEED_INFO_V1,
-                    fan: 0,
-                    speed: 0,
-                };
-                (f(dev, &mut info) == NVML_SUCCESS).then_some(info.speed)
-            });
-            let (vram_used_gb, vram_total_gb) = self
-                .fn_get_mem_info
-                .and_then(|f| {
-                    let mut mem = NvmlMemory::default();
-                    if f(dev, &mut mem) == NVML_SUCCESS && mem.total > 0 {
-                        Some((
-                            Some((mem.used as f64 / BYTES_PER_GB) as f32),
-                            Some((mem.total as f64 / BYTES_PER_GB) as f32),
-                        ))
-                    } else {
-                        None
-                    }
+            let usage_pct = if demand.usage {
+                self.fn_get_util.and_then(|f| {
+                    let mut u = NvmlUtilization::default();
+                    (f(dev, &mut u) == NVML_SUCCESS).then(|| (u.gpu as f32).clamp(0.0, 100.0))
                 })
-                .unwrap_or((None, None));
+            } else {
+                None
+            };
+            let temp_c = if demand.temp {
+                self.fn_get_temp.and_then(|f| {
+                    let mut t: c_uint = 0;
+                    (f(dev, NVML_TEMPERATURE_GPU, &mut t) == NVML_SUCCESS).then_some(t as f32)
+                })
+            } else {
+                None
+            };
+            let power_w = if demand.power {
+                self.fn_get_power.and_then(|f| {
+                    let mut mw: c_uint = 0;
+                    (f(dev, &mut mw) == NVML_SUCCESS).then(|| mw as f32 / 1000.0)
+                })
+            } else {
+                None
+            };
+            let fan_pct = if demand.fan {
+                self.fn_get_fan_pct.and_then(|f| {
+                    let mut pct: c_uint = 0;
+                    (f(dev, &mut pct) == NVML_SUCCESS && pct <= 100).then_some(pct)
+                })
+            } else {
+                None
+            };
+            let fan_rpm = if demand.fan {
+                self.fn_get_fan_rpm.and_then(|f| {
+                    let mut info = NvmlFanSpeedInfo {
+                        version: NVML_FAN_SPEED_INFO_V1,
+                        fan: 0,
+                        speed: 0,
+                    };
+                    (f(dev, &mut info) == NVML_SUCCESS).then_some(info.speed)
+                })
+            } else {
+                None
+            };
+            let (vram_used_gb, vram_total_gb) = if demand.vram {
+                self.fn_get_mem_info
+                    .and_then(|f| {
+                        let mut mem = NvmlMemory::default();
+                        if f(dev, &mut mem) == NVML_SUCCESS && mem.total > 0 {
+                            Some((
+                                Some((mem.used as f64 / BYTES_PER_GB) as f32),
+                                Some((mem.total as f64 / BYTES_PER_GB) as f32),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
 
             VendorTelemetry {
                 usage_pct,
@@ -1077,17 +1549,122 @@ impl Drop for NvidiaNvml {
     }
 }
 
-fn load_nvml_dll() -> Option<isize> {
-    if let Some(m) = load_dll("nvml.dll") {
-        return Some(m);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NvmlCandidate {
+    System32(&'static str),
+    ProtectedFallback(PathBuf),
+}
+
+fn known_program_files_dir() -> Option<PathBuf> {
+    unsafe {
+        let pwstr =
+            SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, HANDLE::default())
+                .ok()?;
+        let res = if pwstr.is_null() {
+            None
+        } else {
+            let s = pwstr.to_string().ok();
+            s.filter(|p| !p.trim().is_empty()).map(PathBuf::from)
+        };
+        CoTaskMemFree(Some(pwstr.0 as *const c_void));
+        res
     }
-    if let Ok(pf) = std::env::var("ProgramFiles") {
-        let candidate = format!("{}\\NVIDIA Corporation\\NVSMI\\nvml.dll", pf);
-        if let Some(m) = load_dll(&candidate) {
-            return Some(m);
+}
+
+fn is_valid_nvml_fallback_policy_path(program_files: &Path, candidate: &Path) -> bool {
+    if !program_files.is_absolute() || !candidate.is_absolute() {
+        return false;
+    }
+    let has_unsafe_component = |p: &Path| {
+        p.components().any(|c| {
+            matches!(c, Component::ParentDir | Component::CurDir)
+                || c.as_os_str().to_string_lossy().contains('\0')
+        })
+    };
+    if has_unsafe_component(program_files) || has_unsafe_component(candidate) {
+        return false;
+    }
+    let Ok(rel) = candidate.strip_prefix(program_files) else {
+        return false;
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    parts == ["nvidia corporation", "nvsmi", "nvml.dll"]
+}
+
+fn canonicalize_verified_nvml_path(program_files: &Path, candidate: &Path) -> Option<PathBuf> {
+    if !is_valid_nvml_fallback_policy_path(program_files, candidate) {
+        return None;
+    }
+    let canon_pf = std::fs::canonicalize(program_files).ok()?;
+    let canon_cand = std::fs::canonicalize(candidate).ok()?;
+    if !canon_cand.is_file() {
+        return None;
+    }
+    let rel = canon_cand.strip_prefix(&canon_pf).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    if parts == ["nvidia corporation", "nvsmi", "nvml.dll"] {
+        Some(canon_cand)
+    } else {
+        None
+    }
+}
+
+fn nvml_load_candidates(program_files: Option<&Path>) -> Vec<NvmlCandidate> {
+    let mut candidates = vec![NvmlCandidate::System32("nvml.dll")];
+    if let Some(pf) = program_files {
+        let fallback = pf.join("NVIDIA Corporation").join("NVSMI").join("nvml.dll");
+        if is_valid_nvml_fallback_policy_path(pf, &fallback) {
+            candidates.push(NvmlCandidate::ProtectedFallback(fallback));
+        }
+    }
+    candidates
+}
+
+fn load_nvml_with<F>(
+    program_files: Option<&Path>,
+    mut try_load: F,
+    verify_disk: bool,
+) -> Option<isize>
+where
+    F: FnMut(&str) -> Option<isize>,
+{
+    for candidate in nvml_load_candidates(program_files) {
+        match candidate {
+            NvmlCandidate::System32(name) => {
+                if let Some(m) = try_load(name) {
+                    return Some(m);
+                }
+            }
+            NvmlCandidate::ProtectedFallback(path) => {
+                let verified = if verify_disk {
+                    let Some(pf) = program_files else { continue };
+                    let Some(canon) = canonicalize_verified_nvml_path(pf, &path) else {
+                        continue;
+                    };
+                    canon
+                } else {
+                    path
+                };
+                if let Some(s) = verified.to_str() {
+                    if let Some(m) = try_load(s) {
+                        return Some(m);
+                    }
+                }
+            }
         }
     }
     None
+}
+
+fn load_nvml_dll() -> Option<isize> {
+    let pf = known_program_files_dir();
+    load_nvml_with(pf.as_deref(), load_dll, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,6 +1903,11 @@ struct IntelIgcl {
 
 impl IntelIgcl {
     fn try_new(dxgi: Option<&DxgiGpuInfo>) -> Result<Self, String> {
+        if let Some(d) = dxgi {
+            if d.vendor_id != VENDOR_INTEL {
+                return Err("未匹配厂商".to_string());
+            }
+        }
         unsafe {
             let Some(module) = load_igcl_dll() else {
                 return Err("DLL 未安装 (ControlLib.dll)".to_string());
@@ -1403,7 +1985,10 @@ impl IntelIgcl {
                 return Err("初始化失败 (ctlEnumerateDevices)".to_string());
             }
 
-            let mut chosen: Option<(*mut c_void, String, bool)> = None;
+            let mut luid_matches: Vec<(*mut c_void, String)> = Vec::new();
+            let mut did_matches: Vec<(*mut c_void, String)> = Vec::new();
+            let mut all_intel: Vec<(*mut c_void, String)> = Vec::new();
+
             for &dev in handles.iter().take(count as usize) {
                 if dev.is_null() {
                     continue;
@@ -1425,23 +2010,34 @@ impl IntelIgcl {
                     continue;
                 }
                 let name = c_char_slice_to_string(&props.name);
-                let exact_match = dxgi.is_some_and(|d| {
-                    (luid.LowPart == d.luid.LowPart && luid.HighPart == d.luid.HighPart)
-                        || (d.device_id != 0 && props.pci_device_id == d.device_id)
-                });
-                if exact_match {
-                    chosen = Some((dev, name, true));
-                    break;
+                if let Some(d) = dxgi {
+                    if luid.LowPart == d.luid.LowPart && luid.HighPart == d.luid.HighPart {
+                        luid_matches.push((dev, name.clone()));
+                    } else if d.device_id != 0 && props.pci_device_id == d.device_id {
+                        did_matches.push((dev, name.clone()));
+                    }
                 }
-                if chosen.is_none() {
-                    chosen = Some((dev, name, false));
-                }
+                all_intel.push((dev, name));
             }
 
-            let Some((device, device_name, _)) = chosen else {
+            let chosen = if dxgi.is_some() {
+                if luid_matches.len() == 1 {
+                    luid_matches.into_iter().next()
+                } else if did_matches.len() == 1 {
+                    did_matches.into_iter().next()
+                } else {
+                    None
+                }
+            } else if all_intel.len() == 1 {
+                all_intel.into_iter().next()
+            } else {
+                None
+            };
+
+            let Some((device, device_name)) = chosen else {
                 let _ = fn_close(api_handle);
                 let _ = FreeLibrary(HMODULE(module as *mut c_void));
-                return Err("初始化失败 (未找到 Intel 图形设备)".to_string());
+                return Err("初始化失败 (未匹配到 Intel 图形设备)".to_string());
             };
 
             Ok(Self {
@@ -1458,7 +2054,10 @@ impl IntelIgcl {
         }
     }
 
-    fn sample(&mut self) -> VendorTelemetry {
+    fn sample_with_demand(&mut self, demand: GpuDemand) -> VendorTelemetry {
+        if !(demand.usage || demand.temp || demand.power || demand.fan) {
+            return VendorTelemetry::default();
+        }
         unsafe {
             let dev = self.device as *mut c_void;
             let now = Instant::now();
@@ -1477,7 +2076,7 @@ impl IntelIgcl {
                     &mut v1 as *mut CtlPowerTelemetryV1 as *mut c_void,
                 );
                 if res == CTL_RESULT_SUCCESS {
-                    return self.decode_telemetry_v0(&v1.v0, now);
+                    return self.decode_telemetry_v0(&v1.v0, now, demand);
                 }
                 if res != CTL_RESULT_ERROR_INVALID_SIZE
                     && res != CTL_RESULT_ERROR_UNSUPPORTED_VERSION
@@ -1497,55 +2096,79 @@ impl IntelIgcl {
                 &mut v0 as *mut CtlPowerTelemetryV0 as *mut c_void,
             );
             if res == CTL_RESULT_SUCCESS {
-                self.decode_telemetry_v0(&v0, now)
+                self.decode_telemetry_v0(&v0, now, demand)
             } else {
                 VendorTelemetry::default()
             }
         }
     }
 
-    fn decode_telemetry_v0(&mut self, t: &CtlPowerTelemetryV0, now: Instant) -> VendorTelemetry {
-        let ts_secs = extract_igcl_item(&t.time_stamp)
-            .and_then(|(units, val)| (units == CTL_UNITS_TIME_SECONDS).then_some(val));
+    fn decode_telemetry_v0(
+        &mut self,
+        t: &CtlPowerTelemetryV0,
+        now: Instant,
+        demand: GpuDemand,
+    ) -> VendorTelemetry {
+        let ts_secs = if demand.power || demand.usage {
+            extract_igcl_item(&t.time_stamp)
+                .and_then(|(units, val)| (units == CTL_UNITS_TIME_SECONDS).then_some(val))
+        } else {
+            None
+        };
 
-        let temp_c = extract_igcl_item(&t.gpu_current_temperature).and_then(|(units, val)| {
-            if (units == CTL_UNITS_TEMPERATURE_CELSIUS || units > CTL_UNITS_PERCENT)
-                && (-20.0..=150.0).contains(&val)
-            {
-                Some(val as f32)
+        let temp_c = if demand.temp {
+            extract_igcl_item(&t.gpu_current_temperature).and_then(|(units, val)| {
+                if (units == CTL_UNITS_TEMPERATURE_CELSIUS || units > CTL_UNITS_PERCENT)
+                    && (-20.0..=150.0).contains(&val)
+                {
+                    Some(val as f32)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        let power_w = if demand.power {
+            let energy_item = if t.total_card_energy_counter.b_supported {
+                &t.total_card_energy_counter
             } else {
-                None
-            }
-        });
-
-        let energy_item = if t.total_card_energy_counter.b_supported {
-            &t.total_card_energy_counter
+                &t.gpu_energy_counter
+            };
+            compute_igcl_power_w(&mut self.prev_energy, energy_item, ts_secs, now)
         } else {
-            &t.gpu_energy_counter
+            self.prev_energy = None;
+            None
         };
-        let power_w = compute_igcl_power_w(&mut self.prev_energy, energy_item, ts_secs, now);
 
-        let activity_item = if t.global_activity_counter.b_supported {
-            &t.global_activity_counter
+        let usage_pct = if demand.usage {
+            let activity_item = if t.global_activity_counter.b_supported {
+                &t.global_activity_counter
+            } else {
+                &t.render_compute_activity_counter
+            };
+            compute_igcl_usage_pct(&mut self.prev_activity, activity_item, ts_secs, now)
         } else {
-            &t.render_compute_activity_counter
+            self.prev_activity = None;
+            None
         };
-        let usage_pct =
-            compute_igcl_usage_pct(&mut self.prev_activity, activity_item, ts_secs, now);
 
         let mut fan_rpm: Option<u32> = None;
         let mut fan_pct: Option<u32> = None;
-        for item in &t.fan_speed {
-            if let Some((units, val)) = extract_igcl_item(item) {
-                if units == CTL_UNITS_PERCENT {
-                    if (0.0..=100.0).contains(&val) && fan_pct.is_none() {
-                        fan_pct = Some(val.round() as u32);
+        if demand.fan {
+            for item in &t.fan_speed {
+                if let Some((units, val)) = extract_igcl_item(item) {
+                    if units == CTL_UNITS_PERCENT {
+                        if (0.0..=100.0).contains(&val) && fan_pct.is_none() {
+                            fan_pct = Some(val.round() as u32);
+                        }
+                    } else if (units == CTL_UNITS_ANGULAR_SPEED_RPM || units > CTL_UNITS_PERCENT)
+                        && (0.0..=15_000.0).contains(&val)
+                        && fan_rpm.is_none()
+                    {
+                        fan_rpm = Some(val.round() as u32);
                     }
-                } else if (units == CTL_UNITS_ANGULAR_SPEED_RPM || units > CTL_UNITS_PERCENT)
-                    && (0.0..=15_000.0).contains(&val)
-                    && fan_rpm.is_none()
-                {
-                    fan_rpm = Some(val.round() as u32);
                 }
             }
         }
@@ -1722,6 +2345,7 @@ fn c_char_slice_to_string(buf: &[c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn filters_virtual_and_software_adapters() {
@@ -1775,6 +2399,8 @@ mod tests {
         assert_eq!(NVML_FAN_SPEED_INFO_V1, 12 | (1 << 24));
         assert_eq!(size_of::<NvmlUtilization>(), 8);
         assert_eq!(size_of::<NvmlMemory>(), 24);
+        assert_eq!(size_of::<NvmlPciInfoV2>(), 36);
+        assert_eq!(size_of::<NvmlPciInfoV3>(), 68);
         assert_eq!(size_of::<AdlAdapterInfo>(), 1572);
         assert_eq!(size_of::<AdlSingleSensorData>(), 8);
         assert_eq!(size_of::<AdlPmLogDataOutput>(), 2052);
@@ -1791,6 +2417,215 @@ mod tests {
 
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GpuMonitor>();
+    }
+
+    #[test]
+    fn nvml_load_policy_prefers_system32_and_validates_known_folder_fallback() {
+        let pf = Path::new("C:\\Program Files");
+        let valid = Path::new("C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+        assert!(is_valid_nvml_fallback_policy_path(pf, valid));
+
+        // Reject relative, traversal, wrong prefix, wrong subpath
+        assert!(!is_valid_nvml_fallback_policy_path(
+            Path::new("Program Files"),
+            valid
+        ));
+        assert!(!is_valid_nvml_fallback_policy_path(
+            pf,
+            Path::new("C:\\Program Files\\NVIDIA Corporation\\..\\evil\\nvml.dll")
+        ));
+        assert!(!is_valid_nvml_fallback_policy_path(
+            pf,
+            Path::new("C:\\Users\\Public\\NVIDIA Corporation\\NVSMI\\nvml.dll")
+        ));
+        assert!(!is_valid_nvml_fallback_policy_path(
+            pf,
+            Path::new("C:\\Program Files\\NVIDIA Corporation\\NVSMI\\evil.dll")
+        ));
+
+        // Mock loader: System32 succeeds -> fallback is never attempted
+        let mut attempts = Vec::new();
+        let loaded = load_nvml_with(
+            Some(pf),
+            |p| {
+                attempts.push(p.to_string());
+                Some(101)
+            },
+            false,
+        );
+        assert_eq!(loaded, Some(101));
+        assert_eq!(attempts, vec!["nvml.dll"]);
+
+        // Mock loader: System32 fails -> fallback attempted with protected ProgramFiles path
+        let mut attempts2 = Vec::new();
+        let loaded2 = load_nvml_with(
+            Some(pf),
+            |p| {
+                attempts2.push(p.to_string());
+                if p == "nvml.dll" {
+                    None
+                } else {
+                    Some(202)
+                }
+            },
+            false,
+        );
+        assert_eq!(loaded2, Some(202));
+        assert_eq!(
+            attempts2,
+            vec![
+                "nvml.dll",
+                "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll"
+            ]
+        );
+
+        // Invalid ProgramFiles rejects fallback candidate completely
+        let mut attempts3 = Vec::new();
+        let loaded3 = load_nvml_with(
+            Some(Path::new("relative\\dir")),
+            |p| {
+                attempts3.push(p.to_string());
+                None
+            },
+            false,
+        );
+        assert_eq!(loaded3, None);
+        assert_eq!(attempts3, vec!["nvml.dll"]);
+    }
+
+    #[test]
+    fn known_program_files_dir_returns_valid_protected_path() {
+        let pf = known_program_files_dir().expect("FOLDERID_ProgramFiles");
+        assert!(pf.is_absolute());
+        let cand = pf.join("NVIDIA Corporation").join("NVSMI").join("nvml.dll");
+        assert!(is_valid_nvml_fallback_policy_path(&pf, &cand));
+    }
+
+    #[test]
+    fn pdh_luid_paths_bind_to_selected_adapter_without_wildcard_fallback() {
+        let luid = LUID {
+            LowPart: 0x0001_2345,
+            HighPart: 0x0000_0001,
+        };
+        assert_eq!(
+            build_gpu_usage_pdh_path(luid),
+            "\\GPU Engine(*luid_0x00000001_0x00012345*engtype_3D)\\Utilization Percentage"
+        );
+        assert_eq!(
+            build_gpu_vram_pdh_path(luid),
+            "\\GPU Adapter Memory(*luid_0x00000001_0x00012345*)\\Dedicated Usage"
+        );
+        assert_eq!(init_gpu_usage_pdh(None), (0, 0));
+        assert_eq!(init_gpu_vram_pdh(None), (0, 0));
+    }
+
+    #[test]
+    fn nvml_selection_requires_reliable_pci_or_strict_name_match_and_never_falls_back_blindly() {
+        let dxgi_rtx4070 = DxgiGpuInfo {
+            name: "NVIDIA GeForce RTX 4070".to_string(),
+            vendor_id: VENDOR_NVIDIA,
+            device_id: 0x2786,
+            subsys_id: 0x1111_10DE,
+            luid: LUID {
+                LowPart: 1,
+                HighPart: 0,
+            },
+            vram_total_gb: 12.0,
+            multi_gpu: true,
+        };
+
+        // 1. Non-NVIDIA DXGI adapter must never bind to NVML
+        let dxgi_amd = DxgiGpuInfo {
+            vendor_id: VENDOR_AMD,
+            ..dxgi_rtx4070.clone()
+        };
+        let cands = vec![NvmlDeviceCandidate {
+            index: 0,
+            name: "NVIDIA GeForce RTX 4070".to_string(),
+            pci_vendor_id: Some(VENDOR_NVIDIA),
+            pci_device_id: Some(0x2786),
+            pci_subsys_id: Some(0x1111_10DE),
+        }];
+        assert_eq!(select_nvml_device_index(Some(&dxgi_amd), &cands), None);
+
+        // 2. Mismatched PCI device_id and mismatched name -> None (never falls back to device 0!)
+        let wrong_cands = vec![NvmlDeviceCandidate {
+            index: 0,
+            name: "NVIDIA GeForce RTX 4070 Ti".to_string(),
+            pci_vendor_id: Some(VENDOR_NVIDIA),
+            pci_device_id: Some(0x2782),
+            pci_subsys_id: Some(0x2222_10DE),
+        }];
+        assert_eq!(
+            select_nvml_device_index(Some(&dxgi_rtx4070), &wrong_cands),
+            None
+        );
+
+        // 3. Multi-NVIDIA cards: PCI match picks index 1 even when index 0 is another NVIDIA card
+        let multi_cands = vec![
+            NvmlDeviceCandidate {
+                index: 0,
+                name: "NVIDIA GeForce RTX 4070 Ti".to_string(),
+                pci_vendor_id: Some(VENDOR_NVIDIA),
+                pci_device_id: Some(0x2782),
+                pci_subsys_id: Some(0x2222_10DE),
+            },
+            NvmlDeviceCandidate {
+                index: 1,
+                name: "NVIDIA GeForce RTX 4070".to_string(),
+                pci_vendor_id: Some(VENDOR_NVIDIA),
+                pci_device_id: Some(0x2786),
+                pci_subsys_id: Some(0x1111_10DE),
+            },
+        ];
+        assert_eq!(
+            select_nvml_device_index(Some(&dxgi_rtx4070), &multi_cands),
+            Some(1)
+        );
+
+        // 4. Dual identical NVIDIA cards without LUID disambiguation -> None (cannot prove identity)
+        let identical_cands = vec![
+            NvmlDeviceCandidate {
+                index: 0,
+                name: "NVIDIA GeForce RTX 4070".to_string(),
+                pci_vendor_id: Some(VENDOR_NVIDIA),
+                pci_device_id: Some(0x2786),
+                pci_subsys_id: Some(0x1111_10DE),
+            },
+            NvmlDeviceCandidate {
+                index: 1,
+                name: "NVIDIA GeForce RTX 4070".to_string(),
+                pci_vendor_id: Some(VENDOR_NVIDIA),
+                pci_device_id: Some(0x2786),
+                pci_subsys_id: Some(0x1111_10DE),
+            },
+        ];
+        assert_eq!(
+            select_nvml_device_index(Some(&dxgi_rtx4070), &identical_cands),
+            None
+        );
+
+        // 5. Fallback to strict name match only when PCI info unavailable (rejects "RTX 4070 Ti")
+        let no_pci_cands = vec![
+            NvmlDeviceCandidate {
+                index: 0,
+                name: "NVIDIA GeForce RTX 4070 Ti".to_string(),
+                pci_vendor_id: None,
+                pci_device_id: None,
+                pci_subsys_id: None,
+            },
+            NvmlDeviceCandidate {
+                index: 1,
+                name: "NVIDIA GeForce RTX 4070".to_string(),
+                pci_vendor_id: None,
+                pci_device_id: None,
+                pci_subsys_id: None,
+            },
+        ];
+        assert_eq!(
+            select_nvml_device_index(Some(&dxgi_rtx4070), &no_pci_cands),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1884,7 +2719,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_monitor_demand_defers_and_releases_pdh_queries() {
+    fn gpu_monitor_demand_defers_and_releases_pdh_queries_and_backoff() {
         let mut mon = GpuMonitor::new_with_demand(false, false);
         assert!(!mon.has_usage_pdh());
         assert!(!mon.has_vram_pdh());
@@ -1897,8 +2732,15 @@ mod tests {
         assert!(!mon.pdh_usage_init_attempted);
         assert!(!mon.pdh_vram_init_attempted);
 
-        let _ = mon.release_pdh_queries();
-        assert!(!mon.has_usage_pdh());
-        assert!(!mon.has_vram_pdh());
+        let t0 = Instant::now();
+        mon.pdh_usage_backoff.record_failure(t0);
+        mon.pdh_vram_backoff.record_failure(t0);
+        assert!(!mon
+            .pdh_usage_backoff
+            .can_attempt(t0 + Duration::from_secs(1)));
+        assert!(mon.release_pdh_queries());
+        assert!(!mon.pdh_usage_backoff.is_backing_off());
+        assert!(!mon.pdh_vram_backoff.is_backing_off());
+        assert!(!mon.release_pdh_queries());
     }
 }

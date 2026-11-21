@@ -2,19 +2,23 @@ use std::time::Instant;
 
 use crate::config::AppConfig;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HardwareMetrics {
     pub cpu_usage_pct: f32,
+    pub cpu_usage_valid: bool,
     pub cpu_freq_ghz: Option<f32>,
     pub cpu_temp_c: Option<f32>,
+    pub acpi_temp_c: Option<f32>,
     pub cpu_power_w: Option<f32>,
     pub cpu_fan_rpm: Option<u32>,
     pub mem_usage_pct: f32,
     pub mem_used_gb: f32,
     pub mem_total_gb: f32,
+    pub mem_valid: bool,
     pub net_up_bps: f64,
     pub net_down_bps: f64,
     pub net_adapter_name: String,
+    pub net_valid: bool,
     pub disk_read_bps: Option<f64>,
     pub disk_write_bps: Option<f64>,
     pub disk_temp_c: Option<f32>,
@@ -33,11 +37,60 @@ pub struct HardwareMetrics {
     pub sensor_provider: String,
 }
 
+impl Default for HardwareMetrics {
+    fn default() -> Self {
+        Self {
+            cpu_usage_pct: 0.0,
+            cpu_usage_valid: true,
+            cpu_freq_ghz: None,
+            cpu_temp_c: None,
+            acpi_temp_c: None,
+            cpu_power_w: None,
+            cpu_fan_rpm: None,
+            mem_usage_pct: 0.0,
+            mem_used_gb: 0.0,
+            mem_total_gb: 0.0,
+            mem_valid: true,
+            net_up_bps: 0.0,
+            net_down_bps: 0.0,
+            net_adapter_name: String::new(),
+            net_valid: true,
+            disk_read_bps: None,
+            disk_write_bps: None,
+            disk_temp_c: None,
+            sys_battery_pct: None,
+            sys_battery_charging: false,
+            gpu_name: String::new(),
+            gpu_usage_pct: None,
+            gpu_temp_c: None,
+            gpu_hotspot_c: None,
+            gpu_power_w: None,
+            gpu_fan_rpm: None,
+            gpu_fan_pct: None,
+            gpu_vram_used_gb: None,
+            gpu_vram_total_gb: None,
+            gpu_provider: String::new(),
+            sensor_provider: String::new(),
+        }
+    }
+}
+
 impl HardwareMetrics {
+    pub fn unavailable() -> Self {
+        Self {
+            cpu_usage_valid: false,
+            mem_valid: false,
+            net_valid: false,
+            ..Default::default()
+        }
+    }
+
     pub fn is_metric_available(&self, metric: crate::config::HwMetric) -> bool {
         use crate::config::HwMetric;
         match metric {
-            HwMetric::CpuUsage | HwMetric::MemUsage | HwMetric::NetUp | HwMetric::NetDown => true,
+            HwMetric::CpuUsage => self.cpu_usage_valid,
+            HwMetric::MemUsage => self.mem_valid,
+            HwMetric::NetUp | HwMetric::NetDown => self.net_valid,
             HwMetric::CpuFreq => self.cpu_freq_ghz.is_some(),
             HwMetric::CpuTemp => self.cpu_temp_c.is_some(),
             HwMetric::CpuPower => self.cpu_power_w.is_some(),
@@ -357,5 +410,23 @@ mod tests {
         hw.gpu_fan_pct = None;
         hw.gpu_fan_rpm = Some(1500);
         assert!(hw.is_metric_available(HwMetric::GpuFan));
+
+        // Validity flags gate required metrics and ACPI thermal does not spoof CPU temp.
+        hw.cpu_usage_valid = false;
+        hw.mem_valid = false;
+        hw.net_valid = false;
+        hw.cpu_temp_c = None;
+        hw.acpi_temp_c = Some(55.0);
+        assert!(!hw.is_metric_available(HwMetric::CpuUsage));
+        assert!(!hw.is_metric_available(HwMetric::MemUsage));
+        assert!(!hw.is_metric_available(HwMetric::NetUp));
+        assert!(!hw.is_metric_available(HwMetric::NetDown));
+        assert!(!hw.is_metric_available(HwMetric::CpuTemp));
+
+        let unavail = HardwareMetrics::unavailable();
+        assert!(!unavail.is_metric_available(HwMetric::CpuUsage));
+        assert!(!unavail.is_metric_available(HwMetric::MemUsage));
+        assert!(!unavail.is_metric_available(HwMetric::NetUp));
+        assert!(!unavail.is_metric_available(HwMetric::NetDown));
     }
 }

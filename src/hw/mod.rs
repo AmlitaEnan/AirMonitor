@@ -3,6 +3,7 @@ pub mod disk;
 pub mod gpu;
 pub mod mem;
 pub mod net;
+mod pdh;
 pub mod power;
 pub mod sensors;
 
@@ -12,15 +13,15 @@ use crate::config::{AppConfig, HwMetric, LayoutMode};
 use crate::state::HardwareMetrics;
 use cpu::CpuMonitor;
 use disk::DiskMonitor;
-use gpu::{GpuMonitor, GpuSample};
+use gpu::{GpuDemand, GpuMonitor, GpuSample};
 use mem::sample_memory;
 use net::NetMonitor;
 use power::{battery_diagnostics, sample_system_battery};
-use sensors::{ExternalSensorSample, SensorHub};
+use sensors::{external_gpu_matches_selected, ExternalSensorSample, SensorDemand, SensorHub};
 
 const IDLE_RELEASE_GRACE: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HardwareDemand {
     pub cpu_usage: bool,
     pub cpu_freq: bool,
@@ -32,9 +33,26 @@ pub struct HardwareDemand {
     pub disk_io: bool,
     pub sys_battery: bool,
     pub external_sensors: bool,
+    pub gpu_temp: bool,
+    pub gpu_hotspot: bool,
+    pub gpu_power: bool,
+    pub gpu_fan: bool,
+    pub cpu_temp: bool,
+    pub cpu_power: bool,
+    pub cpu_fan: bool,
+    pub disk_temp: bool,
+    pub acpi_temp: bool,
 }
 
 impl HardwareDemand {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::none()
+    }
+
     pub fn all(enable_external_sensors: bool) -> Self {
         Self {
             cpu_usage: true,
@@ -47,52 +65,59 @@ impl HardwareDemand {
             disk_io: true,
             sys_battery: true,
             external_sensors: enable_external_sensors,
+            gpu_temp: true,
+            gpu_hotspot: true,
+            gpu_power: true,
+            gpu_fan: true,
+            cpu_temp: enable_external_sensors,
+            cpu_power: enable_external_sensors,
+            cpu_fan: enable_external_sensors,
+            disk_temp: enable_external_sensors,
+            acpi_temp: enable_external_sensors,
         }
     }
 
     pub fn from_config(cfg: &AppConfig, popup_open: bool) -> Self {
-        if popup_open {
+        Self::from_config_with_mode(cfg, true, popup_open)
+    }
+
+    pub fn from_config_with_mode(
+        cfg: &AppConfig,
+        hardware_enabled: bool,
+        popup_overview_open: bool,
+    ) -> Self {
+        if !hardware_enabled {
+            return Self::none();
+        }
+        if popup_overview_open {
             return Self::all(cfg.enable_external_sensors);
         }
-        if cfg.layout_mode == LayoutMode::DevicesOnly {
-            return Self {
-                cpu_usage: true,
-                cpu_freq: false,
-                memory: true,
-                network: false,
-                gpu_vendor: false,
-                gpu_usage_pdh: false,
-                gpu_vram: false,
-                disk_io: false,
-                sys_battery: false,
-                external_sensors: false,
-            };
+        if !is_hw_taskbar_visible(cfg) {
+            return Self::none();
         }
 
         let has = |m: HwMetric| cfg.hardware_items.contains(&m);
         let gpu_usage_pdh = has(HwMetric::GpuUsage);
         let gpu_vram = has(HwMetric::GpuVram);
-        let gpu_vendor = gpu_usage_pdh
-            || gpu_vram
-            || has(HwMetric::GpuTemp)
-            || has(HwMetric::GpuHotspot)
-            || has(HwMetric::GpuPower)
-            || has(HwMetric::GpuFan);
+        let gpu_temp = has(HwMetric::GpuTemp);
+        let gpu_hotspot = has(HwMetric::GpuHotspot);
+        let gpu_power = has(HwMetric::GpuPower);
+        let gpu_fan = has(HwMetric::GpuFan);
+        let gpu_vendor =
+            gpu_usage_pdh || gpu_vram || gpu_temp || gpu_hotspot || gpu_power || gpu_fan;
 
-        let external_sensors = cfg.enable_external_sensors
-            && (has(HwMetric::CpuTemp)
-                || has(HwMetric::CpuPower)
-                || has(HwMetric::CpuFan)
-                || has(HwMetric::DiskTemp)
-                || has(HwMetric::GpuTemp)
-                || has(HwMetric::GpuHotspot)
-                || has(HwMetric::GpuPower)
-                || has(HwMetric::GpuFan));
+        let cpu_temp = cfg.enable_external_sensors && has(HwMetric::CpuTemp);
+        let cpu_power = cfg.enable_external_sensors && has(HwMetric::CpuPower);
+        let cpu_fan = cfg.enable_external_sensors && has(HwMetric::CpuFan);
+        let disk_temp = cfg.enable_external_sensors && has(HwMetric::DiskTemp);
+        let ext_gpu =
+            cfg.enable_external_sensors && (gpu_temp || gpu_hotspot || gpu_power || gpu_fan);
+        let external_sensors = cpu_temp || cpu_power || cpu_fan || disk_temp || ext_gpu;
 
         Self {
-            cpu_usage: true,
+            cpu_usage: has(HwMetric::CpuUsage),
             cpu_freq: has(HwMetric::CpuFreq),
-            memory: true,
+            memory: has(HwMetric::MemUsage),
             network: has(HwMetric::NetUp) || has(HwMetric::NetDown),
             gpu_vendor,
             gpu_usage_pdh,
@@ -100,7 +125,83 @@ impl HardwareDemand {
             disk_io: has(HwMetric::DiskRead) || has(HwMetric::DiskWrite),
             sys_battery: has(HwMetric::SysBattery),
             external_sensors,
+            gpu_temp,
+            gpu_hotspot,
+            gpu_power,
+            gpu_fan,
+            cpu_temp,
+            cpu_power,
+            cpu_fan,
+            disk_temp,
+            acpi_temp: false,
         }
+    }
+
+    pub fn gpu_demand(&self) -> GpuDemand {
+        if !self.gpu_vendor {
+            return GpuDemand::none();
+        }
+        let has_fine_grained = self.gpu_usage_pdh
+            || self.gpu_vram
+            || self.gpu_temp
+            || self.gpu_hotspot
+            || self.gpu_power
+            || self.gpu_fan;
+        if has_fine_grained {
+            GpuDemand {
+                usage: self.gpu_usage_pdh,
+                temp: self.gpu_temp,
+                hotspot: self.gpu_hotspot,
+                power: self.gpu_power,
+                fan: self.gpu_fan,
+                vram: self.gpu_vram,
+            }
+        } else {
+            // Backward compatibility when callers set `gpu_vendor: true` with `..Default::default()`.
+            GpuDemand {
+                usage: self.gpu_usage_pdh,
+                temp: true,
+                hotspot: true,
+                power: true,
+                fan: true,
+                vram: self.gpu_vram,
+            }
+        }
+    }
+
+    pub fn sensor_demand(&self) -> SensorDemand {
+        if !self.external_sensors {
+            return SensorDemand::none();
+        }
+        let has_fine_grained = self.cpu_temp
+            || self.cpu_power
+            || self.cpu_fan
+            || self.disk_temp
+            || self.acpi_temp
+            || (self.gpu_temp || self.gpu_hotspot || self.gpu_power || self.gpu_fan);
+        if has_fine_grained {
+            SensorDemand {
+                cpu_temp: self.cpu_temp,
+                cpu_power: self.cpu_power,
+                cpu_fan: self.cpu_fan,
+                disk_temp: self.disk_temp,
+                gpu_temp: self.gpu_temp,
+                gpu_hotspot: self.gpu_hotspot,
+                gpu_power: self.gpu_power,
+                gpu_fan: self.gpu_fan,
+                acpi_temp: self.acpi_temp || self.cpu_temp,
+            }
+        } else {
+            SensorDemand::all()
+        }
+    }
+}
+
+fn is_hw_taskbar_visible(cfg: &AppConfig) -> bool {
+    match cfg.layout_mode {
+        LayoutMode::Combined => cfg.combined_zone.visible,
+        LayoutMode::HardwareOnly | LayoutMode::Split => cfg.hardware_zone.visible,
+        LayoutMode::DevicesOnly => false,
     }
 }
 
@@ -167,19 +268,66 @@ impl HardwareCollector {
         self.sample_with_demand_at(demand, Instant::now(), IDLE_RELEASE_GRACE)
     }
 
+    pub fn release_all(&mut self) -> bool {
+        let mut released = false;
+        if self.cpu.release() {
+            released = true;
+        }
+        if self.net.take().is_some() {
+            released = true;
+        }
+        if let Some(mut d) = self.disk.take() {
+            let _ = d.release();
+            released = true;
+        }
+        if let Some(mut g) = self.gpu.take() {
+            let _ = g.release_pdh_queries();
+            released = true;
+        }
+        if self.sensors.release() {
+            released = true;
+        }
+        self.cpu_freq_idle_since = None;
+        self.net_idle_since = None;
+        self.gpu_idle_since = None;
+        self.gpu_usage_pdh_idle_since = None;
+        self.gpu_vram_pdh_idle_since = None;
+        self.disk_idle_since = None;
+        self.sensors_idle_since = None;
+        released
+    }
+
     fn sample_with_demand_at(
         &mut self,
         demand: HardwareDemand,
         now: Instant,
         grace: Duration,
     ) -> (HardwareMetrics, bool) {
+        if demand.is_empty() {
+            let released = self.release_all();
+            return (HardwareMetrics::unavailable(), released);
+        }
+
         let mut released_idle = false;
 
-        let (cpu_usage_pct, cpu_freq_ghz) = if demand.cpu_usage || demand.cpu_freq {
-            let (usage, freq) = self.cpu.sample_with_freq(demand.cpu_freq);
-            (if demand.cpu_usage { usage } else { 0.0 }, freq)
+        let (cpu_usage_pct, cpu_usage_valid, cpu_freq_ghz) = if demand.cpu_usage || demand.cpu_freq
+        {
+            let (usage_opt, freq) = if demand.cpu_usage {
+                self.cpu.sample_with_freq(demand.cpu_freq)
+            } else {
+                // Only CPU freq demanded: skip CPU usage delta read.
+                (None, self.cpu.sample_with_freq(true).1)
+            };
+            if demand.cpu_usage {
+                match usage_opt {
+                    Some(u) => (u, true, freq),
+                    None => (0.0, false, freq),
+                }
+            } else {
+                (0.0, false, freq)
+            }
         } else {
-            (0.0, None)
+            (0.0, false, None)
         };
         if update_idle_release(
             &mut self.cpu_freq_idle_since,
@@ -192,15 +340,21 @@ impl HardwareCollector {
             released_idle = true;
         }
 
-        let mem = if demand.memory {
-            sample_memory()
+        let (mem, mem_valid) = if demand.memory {
+            match sample_memory() {
+                Some(m) => (m, true),
+                None => ((0.0, 0.0, 0.0), false),
+            }
         } else {
-            (0.0, 0.0, 0.0)
+            ((0.0, 0.0, 0.0), false)
         };
 
-        let net = if demand.network {
+        let (net, net_valid) = if demand.network {
             self.net_idle_since = None;
-            self.net.get_or_insert_with(NetMonitor::new).sample()
+            match self.net.get_or_insert_with(NetMonitor::new).sample() {
+                Some(n) => (n, true),
+                None => ((0.0, 0.0, String::new()), false),
+            }
         } else {
             if update_idle_release(
                 &mut self.net_idle_since,
@@ -211,7 +365,7 @@ impl HardwareCollector {
             ) {
                 self.net = None;
             }
-            (0.0, 0.0, String::new())
+            ((0.0, 0.0, String::new()), false)
         };
 
         let disk = if demand.disk_io {
@@ -239,17 +393,18 @@ impl HardwareCollector {
             (None, false)
         };
 
+        let gpu_demand = demand.gpu_demand();
         let gpu = if demand.gpu_vendor {
             self.gpu_idle_since = None;
             let gpu_mon = self.gpu.get_or_insert_with(|| {
-                GpuMonitor::new_with_demand(demand.gpu_usage_pdh, demand.gpu_vram)
+                GpuMonitor::new_with_demand(gpu_demand.usage, gpu_demand.vram)
             });
-            let sample = gpu_mon.sample_with_demand(demand.gpu_usage_pdh, demand.gpu_vram);
+            let sample = gpu_mon.sample_with_gpu_demand(gpu_demand);
 
             if update_idle_release(
                 &mut self.gpu_usage_pdh_idle_since,
                 gpu_mon.has_usage_pdh(),
-                demand.gpu_usage_pdh,
+                gpu_demand.usage,
                 now,
                 grace,
             ) && gpu_mon.release_usage_pdh()
@@ -259,7 +414,7 @@ impl HardwareCollector {
             if update_idle_release(
                 &mut self.gpu_vram_pdh_idle_since,
                 gpu_mon.has_vram_pdh(),
-                demand.gpu_vram,
+                gpu_demand.vram,
                 now,
                 grace,
             ) && gpu_mon.release_vram_pdh()
@@ -283,9 +438,12 @@ impl HardwareCollector {
             GpuSample::default()
         };
 
-        let ext = if demand.external_sensors {
+        let sensor_demand = demand.sensor_demand();
+        let ext = if demand.external_sensors && sensor_demand.any() {
             self.sensors_idle_since = None;
-            self.sensors.sample(true)
+            let selected_gpu_name = (!gpu.name.is_empty()).then_some(gpu.name.as_str());
+            self.sensors
+                .sample_with_demand(true, sensor_demand, selected_gpu_name)
         } else {
             if update_idle_release(
                 &mut self.sensors_idle_since,
@@ -302,9 +460,12 @@ impl HardwareCollector {
 
         let metrics = assemble_metrics(
             cpu_usage_pct,
+            cpu_usage_valid,
             cpu_freq_ghz,
             mem,
+            mem_valid,
             net,
+            net_valid,
             disk,
             sys_battery,
             gpu,
@@ -356,12 +517,27 @@ fn update_idle_release(
     }
 }
 
+fn should_backfill_external_gpu(gpu: &GpuSample, ext: &ExternalSensorSample) -> bool {
+    if gpu.name.is_empty() {
+        return false;
+    }
+    match ext.gpu_sensor_name.as_deref() {
+        Some(ext_name) => external_gpu_matches_selected(&gpu.name, ext_name),
+        // When external tool doesn't expose GPU adapter name (e.g. AIDA64/Afterburner GPU1),
+        // only backfill on single-GPU systems to avoid cross-GPU contamination.
+        None => !gpu.multi_gpu,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assemble_metrics(
     cpu_usage_pct: f32,
+    cpu_usage_valid: bool,
     cpu_freq_ghz: Option<f32>,
     mem: (f32, f32, f32),
+    mem_valid: bool,
     net: (f64, f64, String),
+    net_valid: bool,
     disk: (Option<f64>, Option<f64>),
     sys_battery: (Option<u8>, bool),
     gpu: GpuSample,
@@ -371,19 +547,25 @@ fn assemble_metrics(
     let (net_up_bps, net_down_bps, net_adapter_name) = net;
     let (disk_read_bps, disk_write_bps) = disk;
     let (sys_battery_pct, sys_battery_charging) = sys_battery;
+    let allow_ext_gpu = should_backfill_external_gpu(&gpu, &ext);
+    let sensor_provider = ext.effective_provider().to_string();
 
     HardwareMetrics {
         cpu_usage_pct,
+        cpu_usage_valid,
         cpu_freq_ghz,
         cpu_temp_c: ext.cpu_temp_c,
+        acpi_temp_c: ext.acpi_temp_c,
         cpu_power_w: ext.cpu_power_w,
         cpu_fan_rpm: ext.cpu_fan_rpm,
         mem_usage_pct,
         mem_used_gb,
         mem_total_gb,
+        mem_valid,
         net_up_bps,
         net_down_bps,
         net_adapter_name,
+        net_valid,
         disk_read_bps,
         disk_write_bps,
         disk_temp_c: ext.disk_temp_c,
@@ -391,15 +573,23 @@ fn assemble_metrics(
         sys_battery_charging,
         gpu_name: gpu.name,
         gpu_usage_pct: gpu.usage_pct,
-        gpu_temp_c: gpu.temp_c.or(ext.gpu_temp_c),
-        gpu_hotspot_c: gpu.hotspot_c.or(ext.gpu_hotspot_c),
-        gpu_power_w: gpu.power_w.or(ext.gpu_power_w),
-        gpu_fan_rpm: gpu.fan_rpm.or(ext.gpu_fan_rpm),
+        gpu_temp_c: gpu
+            .temp_c
+            .or_else(|| allow_ext_gpu.then_some(ext.gpu_temp_c).flatten()),
+        gpu_hotspot_c: gpu
+            .hotspot_c
+            .or_else(|| allow_ext_gpu.then_some(ext.gpu_hotspot_c).flatten()),
+        gpu_power_w: gpu
+            .power_w
+            .or_else(|| allow_ext_gpu.then_some(ext.gpu_power_w).flatten()),
+        gpu_fan_rpm: gpu
+            .fan_rpm
+            .or_else(|| allow_ext_gpu.then_some(ext.gpu_fan_rpm).flatten()),
         gpu_fan_pct: gpu.fan_pct,
         gpu_vram_used_gb: gpu.vram_used_gb,
         gpu_vram_total_gb: gpu.vram_total_gb,
         gpu_provider: gpu.provider.to_string(),
-        sensor_provider: ext.provider.to_string(),
+        sensor_provider,
     }
 }
 
@@ -432,7 +622,9 @@ mod tests {
 
         assert!(m.mem_usage_pct.is_finite());
         assert!((0.0..=100.0).contains(&m.mem_usage_pct));
-        assert!(m.mem_total_gb.is_finite() && m.mem_total_gb > 0.0);
+        if m.mem_valid {
+            assert!(m.mem_total_gb.is_finite() && m.mem_total_gb > 0.0);
+        }
         assert!(m.mem_used_gb.is_finite() && m.mem_used_gb >= 0.0);
         assert!(
             m.mem_used_gb <= m.mem_total_gb + 0.01,
@@ -493,10 +685,12 @@ mod tests {
             vram_used_gb: Some(2.5),
             vram_total_gb: Some(8.0),
             provider: "NVIDIA NVML",
+            multi_gpu: false,
         };
         let ext = ExternalSensorSample {
             provider: "HWiNFO64",
             cpu_temp_c: Some(55.0),
+            acpi_temp_c: Some(44.0),
             cpu_power_w: Some(42.5),
             cpu_fan_rpm: Some(1100),
             disk_temp_c: Some(39.0),
@@ -504,19 +698,25 @@ mod tests {
             gpu_hotspot_c: Some(79.0),
             gpu_power_w: Some(150.0),
             gpu_fan_rpm: Some(1650),
+            ..Default::default()
         };
 
         let merged = assemble_metrics(
             10.0,
+            true,
             Some(4.2),
             (50.0, 16.0, 32.0),
+            true,
             (100.0, 200.0, "NIC".to_string()),
+            true,
             (Some(1024.0), Some(2048.0)),
             (Some(85), true),
             gpu,
             ext,
         );
 
+        assert!(merged.cpu_usage_valid && merged.mem_valid && merged.net_valid);
+        assert_eq!(merged.acpi_temp_c, Some(44.0));
         assert_eq!(merged.gpu_temp_c, Some(61.0));
         assert_eq!(merged.gpu_hotspot_c, Some(79.0));
         assert_eq!(merged.gpu_power_w, Some(120.0));
@@ -533,8 +733,88 @@ mod tests {
     }
 
     #[test]
+    fn external_gpu_backfill_blocks_mismatched_or_unidentified_multi_gpu_sensors() {
+        let gpu_nv = GpuSample {
+            name: "NVIDIA GeForce RTX 4090".to_string(),
+            multi_gpu: true,
+            ..Default::default()
+        };
+
+        // 1. Mismatched AMD sensor must NOT backfill into NVIDIA dGPU
+        let ext_amd = ExternalSensorSample {
+            provider: "HWiNFO64",
+            gpu_temp_c: Some(41.0),
+            gpu_power_w: Some(18.0),
+            gpu_sensor_name: Some("GPU [#0]: AMD Radeon(TM) Graphics".to_string()),
+            ..Default::default()
+        };
+        let merged_mismatch = assemble_metrics(
+            0.0,
+            false,
+            None,
+            (0.0, 0.0, 0.0),
+            false,
+            (0.0, 0.0, String::new()),
+            false,
+            (None, None),
+            (None, false),
+            gpu_nv.clone(),
+            ext_amd,
+        );
+        assert_eq!(merged_mismatch.gpu_temp_c, None);
+        assert_eq!(merged_mismatch.gpu_power_w, None);
+
+        // 2. Unidentified external GPU on multi-GPU host must NOT backfill
+        let ext_anon = ExternalSensorSample {
+            provider: "AIDA64",
+            gpu_temp_c: Some(50.0),
+            gpu_sensor_name: None,
+            ..Default::default()
+        };
+        let merged_anon = assemble_metrics(
+            0.0,
+            false,
+            None,
+            (0.0, 0.0, 0.0),
+            false,
+            (0.0, 0.0, String::new()),
+            false,
+            (None, None),
+            (None, false),
+            gpu_nv.clone(),
+            ext_anon,
+        );
+        assert_eq!(merged_anon.gpu_temp_c, None);
+
+        // 3. Matching external GPU sensor name DOES backfill missing fields
+        let ext_nv = ExternalSensorSample {
+            provider: "HWiNFO64",
+            gpu_temp_c: Some(64.0),
+            gpu_hotspot_c: Some(76.0),
+            gpu_sensor_name: Some("GPU [#1]: NVIDIA GeForce RTX 4090".to_string()),
+            ..Default::default()
+        };
+        let merged_match = assemble_metrics(
+            0.0,
+            false,
+            None,
+            (0.0, 0.0, 0.0),
+            false,
+            (0.0, 0.0, String::new()),
+            false,
+            (None, None),
+            (None, false),
+            gpu_nv,
+            ext_nv,
+        );
+        assert_eq!(merged_match.gpu_temp_c, Some(64.0));
+        assert_eq!(merged_match.gpu_hotspot_c, Some(76.0));
+    }
+
+    #[test]
     fn hardware_collector_default_samples_sane_metrics() {
         let mut collector = HardwareCollector::default();
+        let _warm = collector.sample();
         thread::sleep(Duration::from_millis(60));
         let first = collector.sample();
         assert_metrics_sane(&first);
@@ -554,6 +834,7 @@ mod tests {
         assert!((first.mem_total_gb - second.mem_total_gb).abs() < 0.01);
         assert_eq!(first.gpu_name, second.gpu_name);
         assert_eq!(second.cpu_temp_c, None);
+        assert_eq!(second.acpi_temp_c, None);
         assert_eq!(second.cpu_power_w, None);
         assert_eq!(second.cpu_fan_rpm, None);
         assert_eq!(second.disk_temp_c, None);
@@ -569,19 +850,20 @@ mod tests {
             d_default,
             HardwareDemand {
                 cpu_usage: true,
-                cpu_freq: false,
                 memory: true,
                 network: true,
-                gpu_vendor: false,
-                gpu_usage_pdh: false,
-                gpu_vram: false,
-                disk_io: false,
-                sys_battery: false,
-                external_sensors: false,
+                ..HardwareDemand::none()
             }
         );
 
-        // Popup open enables all hardware metrics (respecting enable_external_sensors)
+        // Disabled hardware monitoring returns completely empty demand even with popup open
+        assert_eq!(
+            HardwareDemand::from_config_with_mode(&cfg, false, true),
+            HardwareDemand::none()
+        );
+        assert!(HardwareDemand::none().is_empty());
+
+        // Popup open with hardware enabled enables all hardware metrics
         assert_eq!(
             HardwareDemand::from_config(&cfg, true),
             HardwareDemand::all(true)
@@ -592,54 +874,49 @@ mod tests {
             HardwareDemand::all(false)
         );
 
-        // DevicesOnly hides hardware bar when popup closed -> everything off except cpu_usage & memory
+        // DevicesOnly hides hardware bar when popup closed -> completely none (no hardcoded CPU/MEM!)
         cfg.enable_external_sensors = true;
         cfg.layout_mode = LayoutMode::DevicesOnly;
         cfg.hardware_items = HwMetric::ALL.to_vec();
         assert_eq!(
             HardwareDemand::from_config(&cfg, false),
-            HardwareDemand {
-                cpu_usage: true,
-                cpu_freq: false,
-                memory: true,
-                network: false,
-                gpu_vendor: false,
-                gpu_usage_pdh: false,
-                gpu_vram: false,
-                disk_io: false,
-                sys_battery: false,
-                external_sensors: false,
-            }
+            HardwareDemand::none()
         );
-        // DevicesOnly with popup open still samples all
+        // DevicesOnly with popup open still samples all when hardware_enabled
         assert_eq!(
             HardwareDemand::from_config(&cfg, true),
             HardwareDemand::all(true)
         );
 
-        // Empty hardware_items with Combined layout
+        // Hidden zone visibility also yields HardwareDemand::none() when popup closed
+        cfg.layout_mode = LayoutMode::Combined;
+        cfg.combined_zone.visible = false;
+        assert_eq!(
+            HardwareDemand::from_config(&cfg, false),
+            HardwareDemand::none()
+        );
+        cfg.combined_zone.visible = true;
+
+        cfg.layout_mode = LayoutMode::Split;
+        cfg.hardware_zone.visible = false;
+        assert_eq!(
+            HardwareDemand::from_config(&cfg, false),
+            HardwareDemand::none()
+        );
+        cfg.hardware_zone.visible = true;
+
+        // Empty hardware_items with Combined layout -> completely none
         cfg.layout_mode = LayoutMode::Combined;
         cfg.hardware_items.clear();
         assert_eq!(
             HardwareDemand::from_config(&cfg, false),
-            HardwareDemand {
-                cpu_usage: true,
-                cpu_freq: false,
-                memory: true,
-                network: false,
-                gpu_vendor: false,
-                gpu_usage_pdh: false,
-                gpu_vram: false,
-                disk_io: false,
-                sys_battery: false,
-                external_sensors: false,
-            }
+            HardwareDemand::none()
         );
 
-        // Individual checkboxes
+        // Individual checkboxes (no hardcoded cpu_usage/memory)
         cfg.hardware_items = vec![HwMetric::CpuFreq];
-        assert!(HardwareDemand::from_config(&cfg, false).cpu_freq);
-        assert!(!HardwareDemand::from_config(&cfg, false).gpu_vendor);
+        let d_freq = HardwareDemand::from_config(&cfg, false);
+        assert!(d_freq.cpu_freq && !d_freq.cpu_usage && !d_freq.memory && !d_freq.gpu_vendor);
 
         cfg.hardware_items = vec![HwMetric::DiskRead];
         assert!(HardwareDemand::from_config(&cfg, false).disk_io);
@@ -651,6 +928,13 @@ mod tests {
         let d_vram = HardwareDemand::from_config(&cfg, false);
         assert!(d_vram.gpu_vendor && d_vram.gpu_vram);
         assert!(!d_vram.gpu_usage_pdh && !d_vram.external_sensors);
+        assert_eq!(
+            d_vram.gpu_demand(),
+            GpuDemand {
+                vram: true,
+                ..GpuDemand::none()
+            }
+        );
 
         cfg.hardware_items = vec![HwMetric::GpuUsage];
         let d_gpu_usage = HardwareDemand::from_config(&cfg, false);
@@ -659,8 +943,8 @@ mod tests {
 
         cfg.hardware_items = vec![HwMetric::GpuTemp];
         let d_gpu_temp = HardwareDemand::from_config(&cfg, false);
-        assert!(d_gpu_temp.gpu_vendor && d_gpu_temp.external_sensors);
-        assert!(!d_gpu_temp.gpu_usage_pdh && !d_gpu_temp.gpu_vram);
+        assert!(d_gpu_temp.gpu_vendor && d_gpu_temp.gpu_temp && d_gpu_temp.external_sensors);
+        assert!(!d_gpu_temp.gpu_usage_pdh && !d_gpu_temp.gpu_vram && !d_gpu_temp.gpu_power);
 
         cfg.enable_external_sensors = false;
         assert!(!HardwareDemand::from_config(&cfg, false).external_sensors);
@@ -668,7 +952,7 @@ mod tests {
         cfg.enable_external_sensors = true;
         cfg.hardware_items = vec![HwMetric::CpuTemp];
         let d_cpu_temp = HardwareDemand::from_config(&cfg, false);
-        assert!(d_cpu_temp.external_sensors);
+        assert!(d_cpu_temp.external_sensors && d_cpu_temp.cpu_temp);
         assert!(!d_cpu_temp.gpu_vendor);
     }
 
@@ -684,21 +968,15 @@ mod tests {
         let t0 = Instant::now();
         let minimal = HardwareDemand {
             cpu_usage: true,
-            cpu_freq: false,
             memory: true,
-            network: false,
-            gpu_vendor: false,
-            gpu_usage_pdh: false,
-            gpu_vram: false,
-            disk_io: false,
-            sys_battery: false,
-            external_sensors: false,
+            ..HardwareDemand::none()
         };
 
         // Minimal demand keeps heavy subsystems uninitialized
         let (m0, released0) = collector.sample_with_demand_at(minimal, t0, IDLE_RELEASE_GRACE);
         assert!(!released0);
-        assert!(m0.mem_total_gb > 0.0);
+        assert!(m0.mem_valid && m0.mem_total_gb > 0.0);
+        assert!(!m0.net_valid);
         assert!(collector.net.is_none());
         assert!(collector.gpu.is_none());
         assert!(collector.disk.is_none());
@@ -770,5 +1048,35 @@ mod tests {
             IDLE_RELEASE_GRACE,
         );
         assert!(!released7);
+    }
+
+    #[test]
+    fn empty_demand_and_release_all_immediately_release_every_subsystem() {
+        let mut collector = HardwareCollector::new_lazy();
+        let t0 = Instant::now();
+        let _ = collector.sample_with_demand_at(HardwareDemand::all(true), t0, IDLE_RELEASE_GRACE);
+        assert!(collector.net.is_some());
+        assert!(collector.gpu.is_some());
+        assert!(collector.disk.is_some());
+        assert!(collector.sensors.is_active());
+
+        // Empty demand immediately releases everything without waiting 30s grace
+        let (m_empty, released) =
+            collector.sample_with_demand_at(HardwareDemand::none(), t0, IDLE_RELEASE_GRACE);
+        assert!(released);
+        assert!(!m_empty.cpu_usage_valid);
+        assert!(!m_empty.mem_valid);
+        assert!(!m_empty.net_valid);
+        assert!(collector.net.is_none());
+        assert!(collector.gpu.is_none());
+        assert!(collector.disk.is_none());
+        assert!(!collector.cpu.has_freq_pdh());
+        assert!(!collector.sensors.is_active());
+
+        // Subsequent release_all / empty sample is idempotent
+        assert!(!collector.release_all());
+        let (_m_empty2, released2) =
+            collector.sample_with_demand_at(HardwareDemand::none(), t0, IDLE_RELEASE_GRACE);
+        assert!(!released2);
     }
 }

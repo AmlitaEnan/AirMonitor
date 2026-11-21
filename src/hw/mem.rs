@@ -2,17 +2,16 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-pub fn sample_memory() -> (f32, f32, f32) {
+pub fn sample_memory() -> Option<(f32, f32, f32)> {
     unsafe {
         let mut stat = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
             ..Default::default()
         };
         if GlobalMemoryStatusEx(&mut stat).is_ok() {
-            // HardwareMetrics::{mem_usage_pct, mem_used_gb, mem_total_gb} are f32 (not Option) in src/state.rs.
-            compute_memory_metrics(stat.ullTotalPhys, stat.ullAvailPhys).unwrap_or((0.0, 0.0, 0.0))
+            compute_memory_metrics(stat.ullTotalPhys, stat.ullAvailPhys)
         } else {
-            (0.0, 0.0, 0.0)
+            None
         }
     }
 }
@@ -50,5 +49,13 @@ mod tests {
             compute_memory_metrics(16 * gib, 20 * gib).expect("valid total");
         assert_eq!(pct_sat, 0.0);
         assert_eq!(used_sat, 0.0);
+    }
+
+    #[test]
+    fn live_sample_memory_returns_some_sane_values() {
+        let (pct, used_gb, total_gb) = sample_memory().expect("live memory sample");
+        assert!(pct.is_finite() && (0.0..=100.0).contains(&pct));
+        assert!(total_gb.is_finite() && total_gb > 0.0);
+        assert!(used_gb.is_finite() && used_gb >= 0.0 && used_gb <= total_gb + 0.01);
     }
 }
