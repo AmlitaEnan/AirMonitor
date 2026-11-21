@@ -101,23 +101,48 @@ jobs:
           $probeMb = [math]::Round($probeSize / 1MB, 2)
           $shaTable = ($lines | ForEach-Object { "- ``$_``" }) -join "`n"
 
-          $notesLines = @(
-            "## AirMonitor $tag"
-            ""
-            "极致轻量化的 Windows 10 / Windows 11 原生任务栏硬件监控与无线外设电量监视器（Rust + Win32 + Direct2D，免驱动、免管理员权限、静态 CRT 零运行库依赖）。"
-            ""
-            "### 下载说明"
-            "- **``AirMonitor.exe``**（约 $mainMb MB，$mainSize 字节）— 主程序，绿色单文件即开即用，支持任务栏浮条与系统托盘（日常使用仅下载此文件即可）。"
-            "- **``airmonitor-probe.exe``**（约 $probeMb MB，$probeSize 字节）— 命令行硬件与无线 HID 诊断工具，用于排查设备数据源或适配新外设。"
-            "- **``SHA256SUMS.txt``** — SHA-256 校验文件，供手动校验及应用内自动更新哈希完整性校验使用。"
-            ""
-            "### SHA-256 校验值"
-            $shaTable
-            ""
-            "### 使用提示"
-            "- 运行环境：Windows 10 / Windows 11（64 位），无需管理员权限。"
-            "- 由于个人开源发行的二进制未购买商业代码签名证书，首次运行从 GitHub 下载的 ``AirMonitor.exe`` 时，Windows SmartScreen 可能会弹出「未知发布者」提示，点「更多信息 → 仍要运行」即可；您也可以核对上方 SHA-256 校验值或直接从源码自行编译。"
-          )
+          $changelogSection = ""
+          if (Test-Path "CHANGELOG.md") {
+            $tagVer = $tag.Substring(1)
+            $escapedVer = [regex]::Escape($tagVer)
+            $clLines = Get-Content -Path "CHANGELOG.md" -Encoding UTF8
+            $collecting = $false
+            $sectionLines = New-Object System.Collections.Generic.List[string]
+            foreach ($line in $clLines) {
+              if (-not $collecting) {
+                if ($line -match "^##\s+\[?v?$escapedVer\]?(?:\s|$|-)") {
+                  $collecting = $true
+                }
+              } else {
+                if ($line -match "^##\s+") {
+                  break
+                }
+                $sectionLines.Add($line)
+              }
+            }
+            $changelogSection = ($sectionLines -join "`n").Trim()
+          }
+
+          $notesLines = New-Object System.Collections.Generic.List[string]
+          $notesLines.Add("## AirMonitor $tag")
+          $notesLines.Add("")
+          $notesLines.Add("极致轻量化的 Windows 10 / Windows 11 原生任务栏硬件监控与无线外设电量监视器（Rust + Win32 + Direct2D，免驱动、免管理员权限、静态 CRT 零运行库依赖）。")
+          $notesLines.Add("")
+          if (-not [string]::IsNullOrWhiteSpace($changelogSection)) {
+            $notesLines.Add($changelogSection)
+            $notesLines.Add("")
+          }
+          $notesLines.Add("### 下载说明")
+          $notesLines.Add("- **``AirMonitor.exe``**（约 $mainMb MB，$mainSize 字节）— 主程序，绿色单文件即开即用，支持任务栏浮条与系统托盘（日常使用仅下载此文件即可）。")
+          $notesLines.Add("- **``airmonitor-probe.exe``**（约 $probeMb MB，$probeSize 字节）— 命令行硬件与无线 HID 诊断工具（默认脱敏，排查外设可加 ``--verbose``）。")
+          $notesLines.Add("- **``SHA256SUMS.txt``** — SHA-256 校验文件，供手动校验及应用内自动更新哈希完整性校验使用。")
+          $notesLines.Add("")
+          $notesLines.Add("### SHA-256 校验值")
+          $notesLines.Add($shaTable)
+          $notesLines.Add("")
+          $notesLines.Add("### 使用提示")
+          $notesLines.Add("- 运行环境：Windows 10 / Windows 11（64 位），无需管理员权限。")
+          $notesLines.Add("- 由于个人开源发行的二进制未购买商业代码签名证书，首次运行从 GitHub 下载的 ``AirMonitor.exe`` 时，Windows SmartScreen 可能会弹出「未知发布者」提示，点「更多信息 → 仍要运行」即可；您也可以核对上方 SHA-256 校验值或直接从源码自行编译。")
           $notes = ($notesLines -join "`n") + "`n"
 
           [System.IO.File]::WriteAllText(
