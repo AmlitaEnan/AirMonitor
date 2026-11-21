@@ -20,14 +20,14 @@
 - **按需硬件采集与紧凑双行监控**：
   - 默认 2 列布局：第 1 列网络上行/下行（`B/K/M/G` 自动切换、固定 5 字符右对齐等宽，消除数字跳动），第 2 列 `CPU` / `MEM` 占用率。
   - 支持全部 **18 项硬件指标**自由勾选与 2 行所见即所得拖拽排布：`CpuUsage`、`CpuFreq`、`CpuTemp`、`CpuPower`、`CpuFan`、`MemUsage`、`NetUp`、`NetDown`、`DiskRead`、`DiskWrite`、`DiskTemp`、`SysBattery`、`GpuUsage`、`GpuTemp`、`GpuHotspot`、`GpuPower`、`GpuVram`、`GpuFan`。
-  - **按需初始化与空闲释放**：仅在指标被启用或浮窗打开时初始化对应高开销 PDH 查询/显卡接口，空闲 30 秒后自动释放句柄并收敛内存。
-  - **Win11 原生子窗口托管架构**：任务栏浮条通过 `SetParent(..., Shell_TrayWnd)` 托管为任务栏子窗口（`WS_CHILD | WS_CLIPSIBLINGS`），自动跟随系统明暗/高对比度主题与 Monitor DPI；支持 **4 种布局模式**（`Combined` 合并 / `Split` 分体 / `HardwareOnly` 仅硬件 / `DevicesOnly` 仅设备）、左右智能锚定（`Left` / `Right`）、`Ctrl + 左键拖动` 微调水平偏移、全屏自然遮挡与防抖（`GeometryStabilizer`）以及 `TaskbarCreated` 崩溃自恢复。
+  - **按需初始化、双区独立开关与空闲释放**：支持在设置页、概览页或托盘菜单独立开关「硬件监测」与「无线设备监测」。关闭硬件监测后后台立即释放 PDH/GPU/传感器句柄并停止周期唤醒；关闭无线监测后停止后台轮询与低电量提醒并释放设备缓存；仅在指标被启用或概览浮窗打开时初始化高开销接口，空闲 30 秒后自动释放句柄并收敛内存。
+  - **Win11 原生子窗口托管架构**：任务栏浮条通过 `SetParent(..., Shell_TrayWnd)` 托管为任务栏子窗口（`WS_CHILD | WS_CLIPSIBLINGS`），自动跟随系统明暗/高对比度主题与 Monitor DPI；支持 **4 种布局模式**（`Combined` 合并 / `Split` 分体 / `HardwareOnly` 仅硬件 / `DevicesOnly` 仅设备；双区均关闭时自动隐藏任务栏浮条）、左右智能锚定（`Left` / `Right`）、`Ctrl + 左键拖动` 微调水平偏移、全屏自然遮挡与防抖（`GeometryStabilizer`）以及 `TaskbarCreated` 崩溃自恢复。
 - **原生三标签浮窗与系统托盘**：
-  - 左键点击任务栏浮条或托盘图标弹出 Win11 圆角原生浮窗，包含三大标签页：
-    - **概览**：全量硬件遥测卡片（含数据源标识）、无线外设列表（支持单设备显隐与手动刷新）。
-    - **设置**：三子标签页——**显示指标**（2 行 WYSIWYG 拖拽网格 + 4 分组 18 项指标芯片）、**布局停靠**（4 模式 + 合并顺序 + 左右锚定与偏移步进）、**通用选项**（硬件刷新间隔 0.5–5.0s、外部传感器开关、隐藏无数据指标、低电量提醒阈值 5–50%、隐藏无电量设备、开机自启动）。
-    - **关于**：应用信息、GitHub 仓库/Releases 入口、应用内检查更新与一键下载替换（HTTPS 白名单 + SHA-256 + x64 PE 校验 + 原子替换自动回滚）及打开配置文件。
-  - 托盘与浮条右键菜单支持 4 种布局模式与排序切换、区域锚定、18 项硬件监控项勾选、立即刷新无线设备、开机自启动（`HKCU\...\Run`）、打开配置文件、关于/检查更新与退出。
+  - 左键点击任务栏浮条或托盘图标弹出 Win11 圆角原生浮窗（支持 `Tab` / `Shift+Tab`、方向键、`Enter` / `Space` 与 `Esc` 完整键盘导航），包含三大标签页：
+    - **概览**：全量硬件遥测卡片（含数据源标识、采集无效时诚实展示 `N/A`、独立标注「主板/ACPI 热区」）、无线外设列表（支持单设备显隐与手动刷新）；当硬件或无线区关闭时自动展示轻量的已关闭占位卡与「立即开启」入口。
+    - **设置**：三子标签页——**显示指标**（2 行 WYSIWYG 拖拽网格 + 4 分组 18 项指标芯片）、**布局停靠**（4 模式 + 合并顺序 + 左右锚定与偏移步进）、**通用选项**（硬件监测总开关、硬件刷新间隔 0.5–5.0s、外部传感器开关、隐藏无数据指标、无线设备监测总开关、低电量提醒阈值 5–50%、隐藏无电量设备、开机自启动）。
+    - **关于**：应用信息、GitHub 仓库/Releases 入口、应用内检查更新与可取消的一键下载替换（HTTPS 白名单 + 强制 `SHA256SUMS.txt` 校验 + 120s 超时/随时取消 + x64 PE 校验 + 原子替换自动回滚；缺少校验文件时禁用自动安装并引导手动下载）及打开配置文件。
+  - 托盘与浮条右键菜单支持「启用硬件监测」/「启用无线设备监测」独立开关、4 种布局模式与排序切换、区域锚定、18 项硬件监控项勾选、立即刷新无线设备、开机自启动（`HKCU\...\Run`）、打开配置文件、关于/检查更新与退出。
 - **多传输无线外设电量引擎**：
   - **Xbox 手柄**：通过 `LOAD_LIBRARY_SEARCH_SYSTEM32` 动态加载 `xinput1_4.dll` / `xinput1_3.dll` 查询 0..3 号手柄状态与电量。
   - **经典蓝牙 & BLE GATT**：通过 Windows PnP 查询 `DEVPKEY_Bluetooth_Battery` 与连接状态，支持 `BTHLEDEVICE` ↔ `BTHLE` MAC 节点自动关联。
@@ -87,13 +87,16 @@ cargo test
 # 2. 编译 Release 二进制（开启 size 优化 + LTO + strip）
 cargo build --release --bin AirMonitor --bin airmonitor-probe
 
-# 3. 运行硬件与无线诊断探针（排查硬件数据源、设备 VID/PID 与原始 HID 报文）
+# 3. 运行硬件与无线诊断探针（默认对设备 ID / MAC / 序列号及原始报文脱敏，方便安全分享日志）
 .\target\release\airmonitor-probe.exe
+
+# 3b. 如需排查原始设备 ID、MAC、序列号与完整 HID/BLE 载荷，传入 -v / --verbose
+.\target\release\airmonitor-probe.exe --verbose
 
 # 4. 运行主程序（任务栏常驻 + 系统托盘）
 .\target\release\AirMonitor.exe
 
-# 5. 无头自检模式（打印内存占用、空闲 CPU、GPU UMD 与探测到的设备数量后退出）
+# 5. 无头自检模式（只读配置，打印内存占用、空闲 CPU、GPU UMD 与探测到的设备数量后退出）
 .\target\release\AirMonitor.exe --smoke-test
 ```
 
@@ -102,7 +105,7 @@ cargo build --release --bin AirMonitor --bin airmonitor-probe
 ## 应用内检查更新与 Release 说明
 
 - 打开浮窗 **「关于」** 标签页（或托盘右键 **「关于 / 检查更新」**）可手动向 [GitHub Releases](https://github.com/AmlitaEnan/AirMonitor/releases) 检查最新版本。
-- 更新流程通过系统 `winhttp.dll` 强制 HTTPS 传输，校验下载 URL 白名单与重定向、文件体积区间、x64 可执行 PE 头以及 `SHA256SUMS.txt` / `airmonitor.exe.sha256`（存在时强制使用 Windows CNG `bcrypt.dll` 计算比对），随后执行原子替换并支持启动失败自动回滚；若程序所在目录为只读（如 `Program Files`），将自动引导至浏览器手动下载。
+- 更新流程通过系统 `winhttp.dll` 强制 HTTPS 传输，校验下载 URL 白名单与重定向、文件体积区间、x64 可执行 PE 头以及 `SHA256SUMS.txt` / `airmonitor.exe.sha256`（缺失校验文件时禁止应用内自动安装并引导至手动下载；存在时强制使用 Windows CNG `bcrypt.dll` 计算比对）。下载与校验阶段均支持 120 秒总超时控制及点击「取消更新」随时中断，随后执行原子替换并支持启动失败自动回滚（目录级互斥锁串行化保护）；若程序所在目录为只读（如 `Program Files`），将自动引导至浏览器手动下载。
 - **发布资产约定**：每次 GitHub Release 自动上传 `AirMonitor.exe`、`airmonitor-probe.exe` 及对应的 `SHA256SUMS.txt` 以启用完整哈希校验（应用内更新器大小写不敏感，兼容 `AirMonitor.exe` 与 `airmonitor.exe`）。
 - **SmartScreen 提示**：由于开源个人发行的二进制未购买商业 Authenticode 代码签名证书，首次运行从 GitHub 下载的 `AirMonitor.exe` 时 Windows SmartScreen 可能会弹出未知发布者提示；您也可以按上方命令从源码自行编译。
 
@@ -112,12 +115,12 @@ cargo build --release --bin AirMonitor --bin airmonitor-probe
 
 ### 1. 运行时配置 `config.toml`
 
-首次运行会自动创建配置文件（原子写入并在解析损坏时自动保留 `.bak` 备份），查找优先级为：
+首次运行（非 `--smoke-test` 只读模式）会自动生成默认 `config.toml`。配置采用原子写入与双备份恢复机制：每次正常保存前会将上一份有效配置写入 `config.toml.last_good.bak`；若 `config.toml` 损坏或解析失败，程序会将其原样备份为 `config.toml.corrupt.bak`（不覆盖原文件），并自动从 `.last_good.bak` 恢复（均不可用时回退至默认配置）。查找优先级为：
 1. `AirMonitor.exe` 同级目录下的 `config.toml`（绿色便携模式）
 2. `%APPDATA%\AirMonitor\config.toml`
 
 常用字段包括：
-- 布局与位置：`layout_mode`（`"combined"` / `"split"` / `"hardware_only"` / `"devices_only"`）、`combined_order`（`"devices_first"` / `"hardware_first"`）、`combined_zone` / `hardware_zone` / `devices_zone`（含 `anchor` / `offset_x` / `visible`）。
+- 双区总开关与布局：`hardware_enabled`（硬件监测总开关）、`wireless_enabled`（无线设备监测总开关）、`layout_mode`（`"combined"` / `"split"` / `"hardware_only"` / `"devices_only"`）、`combined_order`（`"devices_first"` / `"hardware_first"`）、`combined_zone` / `hardware_zone` / `devices_zone`（含 `anchor` / `offset_x` / `visible`）。
 - 硬件采集与显示：`hardware_items`、`hw_poll_interval_ms`（`500..=5000`）、`enable_external_sensors`、`hide_unavailable_metrics`。
 - 无线与系统：`low_battery_threshold`（`5..=50`）、`hide_unknown_battery_devices`、`hid_poll_interval_secs`（`10..=600`）、`autostart`、`device_aliases`、`hidden_devices`。
 

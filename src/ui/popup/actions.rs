@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, HwMetric};
+use crate::config::{AppConfig, HwMetric, LayoutMode};
 use crate::ui::popup::layout::{PopupAction, PopupTab, SettingsSubTab};
 use crate::ui::tray::{is_autostart_enabled, set_autostart};
 use crate::ui::SnapshotStore;
@@ -12,6 +12,7 @@ pub(crate) enum ActionEffect {
     RequestWirelessRefresh,
     CheckForUpdates,
     StartDownloadUpdate,
+    CancelUpdate,
     OpenUrl(String),
     OpenConfig,
     ConfigMutated {
@@ -48,6 +49,9 @@ pub(crate) struct DownloadTarget {
 }
 
 pub(crate) fn try_begin_download_update(status: &mut UpdateStatus) -> Option<DownloadTarget> {
+    if !status.can_auto_update() {
+        return None;
+    }
     match status {
         UpdateStatus::UpdateAvailable {
             latest,
@@ -78,10 +82,19 @@ pub(crate) fn apply_popup_action(action: PopupAction, state: &SnapshotStore) -> 
     match action {
         PopupAction::SwitchTab(tab) => ActionEffect::SwitchTab(tab),
         PopupAction::SwitchSettingsSubTab(sub_tab) => ActionEffect::SwitchSettingsSubTab(sub_tab),
+        PopupAction::ToggleHardwareEnabled => mutate_and_save(state, |cfg| {
+            cfg.set_hardware_enabled(!cfg.hardware_enabled);
+            (true, None)
+        }),
+        PopupAction::ToggleWirelessEnabled => mutate_and_save(state, |cfg| {
+            cfg.set_wireless_enabled(!cfg.wireless_enabled);
+            (true, None)
+        }),
         PopupAction::SelectMetricSlot(idx) => ActionEffect::SelectMetricSlot(idx),
         PopupAction::RefreshWireless => ActionEffect::RequestWirelessRefresh,
         PopupAction::CheckForUpdates => ActionEffect::CheckForUpdates,
         PopupAction::StartDownloadUpdate => ActionEffect::StartDownloadUpdate,
+        PopupAction::CancelUpdate => ActionEffect::CancelUpdate,
         PopupAction::OpenUrl(url) => ActionEffect::OpenUrl(url),
         PopupAction::OpenConfig => ActionEffect::OpenConfig,
         PopupAction::ToggleHiddenDevice(id) => mutate_and_save(state, |cfg| {
@@ -143,7 +156,23 @@ pub(crate) fn apply_popup_action(action: PopupAction, state: &SnapshotStore) -> 
             (changed, Some(2))
         }),
         PopupAction::SetLayout(mode, order) => mutate_and_save(state, |cfg| {
-            cfg.layout_mode = mode;
+            match mode {
+                LayoutMode::Combined | LayoutMode::Split => {
+                    cfg.set_hardware_enabled(true);
+                    cfg.set_wireless_enabled(true);
+                    cfg.layout_mode = mode;
+                }
+                LayoutMode::HardwareOnly => {
+                    cfg.layout_mode = LayoutMode::HardwareOnly;
+                    cfg.set_hardware_enabled(true);
+                    cfg.set_wireless_enabled(false);
+                }
+                LayoutMode::DevicesOnly => {
+                    cfg.layout_mode = LayoutMode::DevicesOnly;
+                    cfg.set_hardware_enabled(false);
+                    cfg.set_wireless_enabled(true);
+                }
+            }
             if let Some(o) = order {
                 cfg.combined_order = o;
             }
@@ -792,5 +821,80 @@ mod tests {
         let snap = store.read_snapshot().unwrap();
         assert_eq!(snap.config.hardware_zone.anchor, AnchorEdge::Right);
         assert_eq!(snap.config.devices_zone.anchor, AnchorEdge::Left);
+    }
+
+    #[test]
+    fn zone_enable_toggles_and_layout_sync_work() {
+        crate::config::set_read_only_mode(true);
+        let store = SnapshotStore::new(AppConfig::default());
+
+        assert!(matches!(
+            apply_popup_action(PopupAction::ToggleHardwareEnabled, &store),
+            ActionEffect::ConfigMutated { .. }
+        ));
+        let snap1 = store.read_snapshot().unwrap();
+        assert!(!snap1.config.hardware_enabled);
+        assert!(snap1.config.wireless_enabled);
+        assert_eq!(
+            snap1.config.effective_layout_mode(),
+            Some(LayoutMode::DevicesOnly)
+        );
+
+        assert!(matches!(
+            apply_popup_action(PopupAction::ToggleWirelessEnabled, &store),
+            ActionEffect::ConfigMutated { .. }
+        ));
+        let snap2 = store.read_snapshot().unwrap();
+        assert!(!snap2.config.hardware_enabled);
+        assert!(!snap2.config.wireless_enabled);
+        assert_eq!(snap2.config.effective_layout_mode(), None);
+
+        // SetLayout(HardwareOnly) enables hardware and disables wireless.
+        assert!(matches!(
+            apply_popup_action(
+                PopupAction::SetLayout(LayoutMode::HardwareOnly, None),
+                &store
+            ),
+            ActionEffect::ConfigMutated { .. }
+        ));
+        let snap3 = store.read_snapshot().unwrap();
+        assert!(snap3.config.hardware_enabled);
+        assert!(!snap3.config.wireless_enabled);
+
+        // SetLayout(Combined) re-enables both zones.
+        assert!(matches!(
+            apply_popup_action(PopupAction::SetLayout(LayoutMode::Combined, None), &store),
+            ActionEffect::ConfigMutated { .. }
+        ));
+        let snap4 = store.read_snapshot().unwrap();
+        assert!(snap4.config.hardware_enabled);
+        assert!(snap4.config.wireless_enabled);
+    }
+
+    #[test]
+    fn missing_sha256_blocks_auto_download_and_cancel_maps_cleanly() {
+        crate::config::set_read_only_mode(true);
+        let store = SnapshotStore::new(AppConfig::default());
+        assert!(matches!(
+            apply_popup_action(PopupAction::CancelUpdate, &store),
+            ActionEffect::CancelUpdate
+        ));
+
+        let mut avail_no_sha = UpdateStatus::UpdateAvailable {
+            current: "0.1.0".into(),
+            latest: "0.2.0".into(),
+            release_url: crate::updater::RELEASES_URL.into(),
+            published_at: None,
+            download_url: Some(
+                "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/airmonitor.exe"
+                    .into(),
+            ),
+            asset_name: Some("airmonitor.exe".into()),
+            asset_size: Some(1_100_000),
+            sha256_url: None,
+        };
+        assert!(!avail_no_sha.can_auto_update());
+        assert!(try_begin_download_update(&mut avail_no_sha).is_none());
+        assert!(matches!(avail_no_sha, UpdateStatus::UpdateAvailable { .. }));
     }
 }

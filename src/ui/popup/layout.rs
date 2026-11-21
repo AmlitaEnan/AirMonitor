@@ -17,6 +17,7 @@ pub(crate) const HW_CARD_TOP_PAD: f32 = 10.0;
 pub(crate) const HW_CARD_HEADER_H: f32 = 24.0;
 pub(crate) const HW_ROW_CPU_H: f32 = 22.0;
 pub(crate) const HW_ROW_CPU_EXT_H: f32 = 20.0;
+pub(crate) const HW_ROW_ACPI_H: f32 = 20.0;
 pub(crate) const HW_ROW_MEM_H: f32 = 22.0;
 pub(crate) const HW_ROW_NIC_H: f32 = 20.0;
 pub(crate) const HW_ROW_NET_H: f32 = 20.0;
@@ -109,12 +110,64 @@ pub(crate) const METRIC_GROUPS: &[MetricGroup] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlId {
+    Tab(PopupTab),
+    SettingsSubTab(SettingsSubTab),
+    OverviewToggleHardware,
+    OverviewRefreshWireless,
+    OverviewToggleWireless,
+    DeviceToggleHidden(String),
+    SettingsMetricsToggleHardware,
+    ResetDefaultMetrics,
+    MetricSlot(usize),
+    MetricMoveLeft,
+    MetricSwapRow,
+    MetricMoveRight,
+    MetricRemove,
+    MetricChip(HwMetric),
+    LayoutMode(LayoutMode),
+    CombinedOrder(CombinedOrder),
+    ZoneAnchor {
+        is_devices: bool,
+        is_combined: bool,
+        anchor: AnchorEdge,
+    },
+    ZoneOffsetStep {
+        is_devices: bool,
+        is_combined: bool,
+        delta: i32,
+    },
+    ZoneOffsetReset {
+        is_devices: bool,
+        is_combined: bool,
+    },
+    GeneralToggleHardware,
+    HwPollStep(i8),
+    ToggleExternalSensors,
+    ToggleHideUnavailableMetrics,
+    GeneralToggleWireless,
+    LowBatteryStep(i8),
+    ToggleHideUnknownBattery,
+    ToggleAutostart,
+    AboutRepo,
+    AboutReleases,
+    AboutCheckUpdates,
+    AboutAutoUpdate,
+    AboutManualDownload,
+    AboutCancelUpdate,
+    AboutOpenConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PopupAction {
     SwitchTab(PopupTab),
     SwitchSettingsSubTab(SettingsSubTab),
+    ToggleHardwareEnabled,
+    ToggleWirelessEnabled,
     RefreshWireless,
     CheckForUpdates,
     StartDownloadUpdate,
+    CancelUpdate,
     OpenUrl(String),
     OpenConfig,
     ToggleHiddenDevice(String),
@@ -149,9 +202,29 @@ pub(crate) enum PopupAction {
     ToggleAutostart,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct HitBox {
+    pub id: ControlId,
     pub rect: D2D_RECT_F,
     pub action: PopupAction,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FocusItem {
+    pub id: ControlId,
+    pub rect: D2D_RECT_F,
+    pub action: PopupAction,
+    pub in_viewport: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusNavDir {
+    Next,
+    Prev,
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 pub(crate) struct DeviceCardLayout {
@@ -162,10 +235,63 @@ pub(crate) struct DeviceCardLayout {
 pub(crate) struct HwCardSpec {
     pub provider_summary: String,
     pub cpu_ext_line: Option<String>,
+    pub acpi_temp_line: Option<String>,
     pub disk_line: Option<String>,
     pub sys_battery_line: Option<String>,
     pub gpu_items: Vec<(&'static str, String)>,
     pub card_h: f32,
+}
+
+pub(crate) fn format_overview_cpu_value(hw: &HardwareMetrics) -> String {
+    let freq = hw
+        .cpu_freq_ghz
+        .filter(|f| f.is_finite())
+        .map(|f| format!("{:.2} GHz", f));
+    if hw.cpu_usage_valid && hw.cpu_usage_pct.is_finite() {
+        let freq_str = freq.unwrap_or_else(|| "--".to_string());
+        format!("{:.1}%  ({})", hw.cpu_usage_pct, freq_str)
+    } else if let Some(freq_str) = freq {
+        format!("N/A  ({})", freq_str)
+    } else {
+        "N/A".to_string()
+    }
+}
+
+pub(crate) fn format_overview_mem_value(hw: &HardwareMetrics) -> String {
+    if hw.mem_valid
+        && hw.mem_usage_pct.is_finite()
+        && hw.mem_used_gb.is_finite()
+        && hw.mem_total_gb.is_finite()
+    {
+        format!(
+            "{:.1}%  ({:.1} / {:.1} GB)",
+            hw.mem_usage_pct, hw.mem_used_gb, hw.mem_total_gb
+        )
+    } else {
+        "N/A".to_string()
+    }
+}
+
+pub(crate) fn format_overview_nic_value(hw: &HardwareMetrics) -> &str {
+    if !hw.net_valid {
+        "N/A"
+    } else if hw.net_adapter_name.is_empty() {
+        "未连接"
+    } else {
+        &hw.net_adapter_name
+    }
+}
+
+pub(crate) fn format_overview_net_value(hw: &HardwareMetrics) -> String {
+    if hw.net_valid {
+        format!(
+            "↑ {}   ↓ {}",
+            format_speed_full(hw.net_up_bps),
+            format_speed_full(hw.net_down_bps)
+        )
+    } else {
+        "↑ N/A   ↓ N/A".to_string()
+    }
 }
 
 pub(crate) fn build_hw_card_spec(hw: &HardwareMetrics) -> HwCardSpec {
@@ -192,6 +318,14 @@ pub(crate) fn build_hw_card_spec(hw: &HardwareMetrics) -> HwCardSpec {
         None
     } else {
         Some(cpu_ext_parts.join(" · "))
+    };
+
+    let acpi_temp_line = if hw.cpu_temp_c.is_none() {
+        hw.acpi_temp_c
+            .filter(|v| v.is_finite())
+            .map(|t| format!("{:.0}°C", t))
+    } else {
+        None
     };
 
     let mut disk_parts = Vec::with_capacity(3);
@@ -260,6 +394,9 @@ pub(crate) fn build_hw_card_spec(hw: &HardwareMetrics) -> HwCardSpec {
     if cpu_ext_line.is_some() {
         card_h += HW_ROW_CPU_EXT_H;
     }
+    if acpi_temp_line.is_some() {
+        card_h += HW_ROW_ACPI_H;
+    }
     if disk_line.is_some() {
         card_h += HW_ROW_DISK_H;
     }
@@ -270,6 +407,7 @@ pub(crate) fn build_hw_card_spec(hw: &HardwareMetrics) -> HwCardSpec {
     HwCardSpec {
         provider_summary,
         cpu_ext_line,
+        acpi_temp_line,
         disk_line,
         sys_battery_line,
         gpu_items,
@@ -281,8 +419,11 @@ pub(crate) struct OverviewLayout {
     pub card_w: f32,
     pub hw_spec: HwCardSpec,
     pub hw_card_rect: D2D_RECT_F,
+    pub hw_enable_btn_rect: Option<D2D_RECT_F>,
     pub wireless_header_y: f32,
-    pub refresh_rect: D2D_RECT_F,
+    pub refresh_rect: Option<D2D_RECT_F>,
+    pub wireless_disabled_rect: Option<D2D_RECT_F>,
+    pub wireless_enable_btn_rect: Option<D2D_RECT_F>,
     pub empty_rect: Option<D2D_RECT_F>,
     pub device_cards: Vec<DeviceCardLayout>,
     pub content_bottom: f32,
@@ -295,6 +436,8 @@ pub(crate) struct MetricGroupLayout {
 }
 
 pub(crate) struct SettingsMetricsLayout {
+    pub disabled_banner_rect: Option<D2D_RECT_F>,
+    pub disabled_enable_btn_rect: Option<D2D_RECT_F>,
     pub grid_card_rect: D2D_RECT_F,
     pub grid_title_rect: D2D_RECT_F,
     pub grid_subtitle_rect: D2D_RECT_F,
@@ -337,6 +480,7 @@ pub(crate) struct SettingsLayoutModeLayout {
     pub dock_card_rect: D2D_RECT_F,
     pub dock_title_rect: D2D_RECT_F,
     pub dock_subtitle_rect: D2D_RECT_F,
+    pub disabled_box_rect: Option<D2D_RECT_F>,
     pub zones: Vec<ZoneBoxLayout>,
 }
 
@@ -350,6 +494,8 @@ pub(crate) struct GeneralRowLayout {
 pub(crate) struct SettingsGeneralLayout {
     pub collect_card_rect: D2D_RECT_F,
     pub collect_title_rect: D2D_RECT_F,
+    pub hw_enabled_row: GeneralRowLayout,
+    pub collect_div0_y: f32,
     pub poll_row: GeneralRowLayout,
     pub collect_div1_y: f32,
     pub ext_sensors_row: GeneralRowLayout,
@@ -357,6 +503,8 @@ pub(crate) struct SettingsGeneralLayout {
     pub hide_unavail_row: GeneralRowLayout,
     pub device_card_rect: D2D_RECT_F,
     pub device_title_rect: D2D_RECT_F,
+    pub wl_enabled_row: GeneralRowLayout,
+    pub device_div0_y: f32,
     pub low_bat_row: GeneralRowLayout,
     pub device_div1_y: f32,
     pub hide_unknown_row: GeneralRowLayout,
@@ -367,7 +515,7 @@ pub(crate) struct SettingsGeneralLayout {
 pub(crate) enum SettingsBodyLayout {
     Metrics(SettingsMetricsLayout),
     Layout(SettingsLayoutModeLayout),
-    General(SettingsGeneralLayout),
+    General(Box<SettingsGeneralLayout>),
 }
 
 pub(crate) struct SettingsLayout {
@@ -393,6 +541,7 @@ pub(crate) struct AboutLayout {
     pub update_meta_rect: Option<D2D_RECT_F>,
     pub update_prompt_rect: Option<D2D_RECT_F>,
     pub progress_bar_rect: Option<D2D_RECT_F>,
+    pub cancel_update_btn_rect: Option<D2D_RECT_F>,
     pub auto_update_btn_rect: Option<D2D_RECT_F>,
     pub manual_download_btn_rect: Option<D2D_RECT_F>,
     pub download_btn_rect: Option<D2D_RECT_F>,
@@ -456,59 +605,105 @@ pub(crate) fn compute_overview_layout(
     let card_w = (logical_w - PAD_X * 2.0).max(1.0);
 
     let hw_spec = build_hw_card_spec(&snapshot.hw);
-    let hw_card_h = hw_spec.card_h;
-    let hw_card_rect = D2D_RECT_F {
-        left: PAD_X,
-        top: y,
-        right: PAD_X + card_w,
-        bottom: y + hw_card_h,
-    };
-    y += hw_card_h + 10.0;
-
-    let wireless_header_y = y;
-    let refresh_rect = D2D_RECT_F {
-        left: PAD_X + card_w - 74.0,
-        top: y,
-        right: PAD_X + card_w,
-        bottom: y + 24.0,
-    };
-    y += 28.0;
-
-    let visible_devices = overview_visible_devices(snapshot);
-    let mut empty_rect = None;
-    let mut device_cards = Vec::with_capacity(visible_devices.len());
-    if visible_devices.is_empty() {
-        empty_rect = Some(D2D_RECT_F {
+    let (hw_card_rect, hw_enable_btn_rect) = if snapshot.config.hardware_enabled {
+        let hw_card_h = hw_spec.card_h;
+        let rect = D2D_RECT_F {
             left: PAD_X,
             top: y,
             right: PAD_X + card_w,
-            bottom: y + 48.0,
-        });
-        y += 56.0;
+            bottom: y + hw_card_h,
+        };
+        y += hw_card_h + 10.0;
+        (rect, None)
     } else {
-        for (index, dev) in visible_devices {
-            let mut card_h = if dev.sub_batteries.is_some() {
-                78.0
-            } else {
-                56.0
-            };
-            if dev
-                .detail_note
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
-            {
-                card_h += 18.0;
-            }
-            device_cards.push(DeviceCardLayout {
-                index,
-                rect: D2D_RECT_F {
-                    left: PAD_X,
-                    top: y,
-                    right: PAD_X + card_w,
-                    bottom: y + card_h,
-                },
+        let card_h = 58.0;
+        let rect = D2D_RECT_F {
+            left: PAD_X,
+            top: y,
+            right: PAD_X + card_w,
+            bottom: y + card_h,
+        };
+        let btn = D2D_RECT_F {
+            left: rect.right - CARD_PAD - 76.0,
+            top: y + (card_h - 26.0) * 0.5,
+            right: rect.right - CARD_PAD,
+            bottom: y + (card_h + 26.0) * 0.5,
+        };
+        y += card_h + 10.0;
+        (rect, Some(btn))
+    };
+
+    let wireless_header_y = y;
+    let refresh_rect = if snapshot.config.wireless_enabled {
+        Some(D2D_RECT_F {
+            left: PAD_X + card_w - 74.0,
+            top: y,
+            right: PAD_X + card_w,
+            bottom: y + 24.0,
+        })
+    } else {
+        None
+    };
+    y += 28.0;
+
+    let mut wireless_disabled_rect = None;
+    let mut wireless_enable_btn_rect = None;
+    let mut empty_rect = None;
+    let mut device_cards = Vec::new();
+
+    if !snapshot.config.wireless_enabled {
+        let card_h = 58.0;
+        let rect = D2D_RECT_F {
+            left: PAD_X,
+            top: y,
+            right: PAD_X + card_w,
+            bottom: y + card_h,
+        };
+        let btn = D2D_RECT_F {
+            left: rect.right - CARD_PAD - 76.0,
+            top: y + (card_h - 26.0) * 0.5,
+            right: rect.right - CARD_PAD,
+            bottom: y + (card_h + 26.0) * 0.5,
+        };
+        wireless_disabled_rect = Some(rect);
+        wireless_enable_btn_rect = Some(btn);
+        y += card_h + 8.0;
+    } else {
+        let visible_devices = overview_visible_devices(snapshot);
+        device_cards.reserve(visible_devices.len());
+        if visible_devices.is_empty() {
+            empty_rect = Some(D2D_RECT_F {
+                left: PAD_X,
+                top: y,
+                right: PAD_X + card_w,
+                bottom: y + 48.0,
             });
-            y += card_h + 8.0;
+            y += 56.0;
+        } else {
+            for (index, dev) in visible_devices {
+                let mut card_h = if dev.sub_batteries.is_some() {
+                    78.0
+                } else {
+                    56.0
+                };
+                if dev
+                    .detail_note
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                {
+                    card_h += 18.0;
+                }
+                device_cards.push(DeviceCardLayout {
+                    index,
+                    rect: D2D_RECT_F {
+                        left: PAD_X,
+                        top: y,
+                        right: PAD_X + card_w,
+                        bottom: y + card_h,
+                    },
+                });
+                y += card_h + 8.0;
+            }
         }
     }
 
@@ -516,8 +711,11 @@ pub(crate) fn compute_overview_layout(
         card_w,
         hw_spec,
         hw_card_rect,
+        hw_enable_btn_rect,
         wireless_header_y,
         refresh_rect,
+        wireless_disabled_rect,
+        wireless_enable_btn_rect,
         empty_rect,
         device_cards,
         content_bottom: y + 4.0,
@@ -546,6 +744,26 @@ pub(crate) fn compute_settings_layout(
 
     let (body, content_bottom) = match sub_tab {
         SettingsSubTab::Metrics => {
+            let (disabled_banner_rect, disabled_enable_btn_rect) =
+                if !snapshot.config.hardware_enabled {
+                    let banner = D2D_RECT_F {
+                        left: PAD_X,
+                        top: y,
+                        right: PAD_X + card_w,
+                        bottom: y + 44.0,
+                    };
+                    let btn = D2D_RECT_F {
+                        left: inner_r - 72.0,
+                        top: y + 9.0,
+                        right: inner_r,
+                        bottom: y + 35.0,
+                    };
+                    y += 44.0 + 10.0;
+                    (Some(banner), Some(btn))
+                } else {
+                    (None, None)
+                };
+
             let items = &snapshot.config.hardware_items;
 
             // Card 1: 2-row WYSIWYG taskbar grid + spatial action bar
@@ -743,6 +961,8 @@ pub(crate) fn compute_settings_layout(
             let bottom = chips_card_rect.bottom + 10.0;
             (
                 SettingsBodyLayout::Metrics(SettingsMetricsLayout {
+                    disabled_banner_rect,
+                    disabled_enable_btn_rect,
                     grid_card_rect,
                     grid_title_rect,
                     grid_subtitle_rect,
@@ -787,8 +1007,9 @@ pub(crate) fn compute_settings_layout(
             };
             ly += 32.0;
 
+            let effective_mode = snapshot.config.effective_layout_mode();
             let (order_divider_y, order_label_rect, order_dev_first_rect, order_hw_first_rect) =
-                if snapshot.config.layout_mode == LayoutMode::Combined {
+                if effective_mode == Some(LayoutMode::Combined) {
                     let div_y = ly + 8.0;
                     ly += 15.0;
                     let lbl = D2D_RECT_F {
@@ -843,13 +1064,25 @@ pub(crate) fn compute_settings_layout(
             };
             dy += 40.0;
 
-            let active_zones: &[(&'static str, bool, bool)] = match snapshot.config.layout_mode {
-                LayoutMode::Combined => &[("合并浮条", false, true)],
-                LayoutMode::Split => &[("硬件区", false, false), ("无线设备区", true, false)],
-                LayoutMode::HardwareOnly => &[("硬件区", false, false)],
-                LayoutMode::DevicesOnly => &[("无线设备区", true, false)],
+            let active_zones: &[(&'static str, bool, bool)] = match effective_mode {
+                Some(LayoutMode::Combined) => &[("合并浮条", false, true)],
+                Some(LayoutMode::Split) => &[("硬件区", false, false), ("无线设备区", true, false)],
+                Some(LayoutMode::HardwareOnly) => &[("硬件区", false, false)],
+                Some(LayoutMode::DevicesOnly) => &[("无线设备区", true, false)],
+                None => &[],
             };
             let mut zones = Vec::with_capacity(active_zones.len());
+            let mut disabled_box_rect = None;
+            if active_zones.is_empty() {
+                let box_h = 52.0;
+                disabled_box_rect = Some(D2D_RECT_F {
+                    left: inner_x,
+                    top: dy,
+                    right: inner_r,
+                    bottom: dy + box_h,
+                });
+                dy += box_h;
+            }
             for (zi, &(label, is_devices, is_combined)) in active_zones.iter().enumerate() {
                 if zi > 0 {
                     dy += 8.0;
@@ -940,6 +1173,7 @@ pub(crate) fn compute_settings_layout(
                     dock_card_rect,
                     dock_title_rect,
                     dock_subtitle_rect,
+                    disabled_box_rect,
                     zones,
                 }),
                 bottom,
@@ -987,6 +1221,10 @@ pub(crate) fn compute_settings_layout(
                 bottom: cy + 20.0,
             };
             cy += 26.0;
+            let hw_enabled_row = make_row(cy, 38.0, 20.0);
+            cy += 34.0;
+            let collect_div0_y = cy + 6.0;
+            cy += 13.0;
             let poll_row = make_row(cy, 104.0, 24.0);
             cy += 34.0;
             let collect_div1_y = cy + 6.0;
@@ -1015,6 +1253,10 @@ pub(crate) fn compute_settings_layout(
                 bottom: dy + 20.0,
             };
             dy += 26.0;
+            let wl_enabled_row = make_row(dy, 38.0, 20.0);
+            dy += 34.0;
+            let device_div0_y = dy + 6.0;
+            dy += 13.0;
             let low_bat_row = make_row(dy, 104.0, 24.0);
             dy += 34.0;
             let device_div1_y = dy + 6.0;
@@ -1033,9 +1275,11 @@ pub(crate) fn compute_settings_layout(
             };
             let bottom = device_card_rect.bottom + 10.0;
             (
-                SettingsBodyLayout::General(SettingsGeneralLayout {
+                SettingsBodyLayout::General(Box::new(SettingsGeneralLayout {
                     collect_card_rect,
                     collect_title_rect,
+                    hw_enabled_row,
+                    collect_div0_y,
                     poll_row,
                     collect_div1_y,
                     ext_sensors_row,
@@ -1043,12 +1287,14 @@ pub(crate) fn compute_settings_layout(
                     hide_unavail_row,
                     device_card_rect,
                     device_title_rect,
+                    wl_enabled_row,
+                    device_div0_y,
                     low_bat_row,
                     device_div1_y,
                     hide_unknown_row,
                     device_div2_y,
                     autostart_row,
-                }),
+                })),
                 bottom,
             )
         }
@@ -1119,6 +1365,7 @@ pub(crate) fn compute_about_layout(
     let mut update_meta_rect = None;
     let mut update_prompt_rect = None;
     let mut progress_bar_rect = None;
+    let mut cancel_update_btn_rect = None;
     let mut auto_update_btn_rect = None;
     let mut manual_download_btn_rect = None;
     let mut download_btn_rect = None;
@@ -1135,7 +1382,6 @@ pub(crate) fn compute_about_layout(
         ),
         UpdateStatus::UpdateAvailable {
             published_at,
-            download_url,
             asset_size,
             ..
         } => {
@@ -1165,7 +1411,7 @@ pub(crate) fn compute_about_layout(
                 bottom: prompt_top + 18.0,
             });
             let btn_top = prompt_top + 22.0;
-            if download_url.is_some() && self_update_writable {
+            if status.can_auto_update() && self_update_writable {
                 let gap = 8.0;
                 let auto_w = ((inner_r - inner_x - gap) * 0.6).round();
                 auto_update_btn_rect = Some(D2D_RECT_F {
@@ -1190,9 +1436,29 @@ pub(crate) fn compute_about_layout(
             }
             (status_rect, btn_top + 26.0)
         }
-        UpdateStatus::Downloading { .. }
-        | UpdateStatus::Verifying { .. }
-        | UpdateStatus::Applying { .. } => {
+        UpdateStatus::Downloading { .. } | UpdateStatus::Verifying { .. } => {
+            let status_rect = D2D_RECT_F {
+                left: inner_x,
+                top: status_top,
+                right: inner_r,
+                bottom: status_top + 20.0,
+            };
+            progress_bar_rect = Some(D2D_RECT_F {
+                left: inner_x,
+                top: status_top + 25.0,
+                right: inner_r,
+                bottom: status_top + 32.0,
+            });
+            let btn_top = status_top + 40.0;
+            cancel_update_btn_rect = Some(D2D_RECT_F {
+                left: inner_x,
+                top: btn_top,
+                right: inner_r,
+                bottom: btn_top + 26.0,
+            });
+            (status_rect, btn_top + 26.0)
+        }
+        UpdateStatus::Applying { .. } => {
             let status_rect = D2D_RECT_F {
                 left: inner_x,
                 top: status_top,
@@ -1268,6 +1534,7 @@ pub(crate) fn compute_about_layout(
         update_meta_rect,
         update_prompt_rect,
         progress_bar_rect,
+        cancel_update_btn_rect,
         auto_update_btn_rect,
         manual_download_btn_rect,
         download_btn_rect,
@@ -1333,22 +1600,174 @@ pub fn compute_popup_rect(
     }
 }
 
-pub(crate) fn hit_test_boxes(
+pub(crate) fn hit_test_box(
     hit_boxes: &[HitBox],
     dpi: u32,
     px_x: i32,
     px_y: i32,
-) -> Option<usize> {
+) -> Option<&HitBox> {
     let scale = dpi.max(96) as f32 / 96.0;
     let lx = px_x as f32 / scale;
     let ly = px_y as f32 / scale;
-    hit_boxes.iter().position(|hb| {
+    hit_boxes.iter().find(|hb| {
         lx >= hb.rect.left && lx <= hb.rect.right && ly >= hb.rect.top && ly <= hb.rect.bottom
     })
 }
 
-pub(crate) fn hit_test_pt(hit_boxes: &[HitBox], dpi: u32, pt: POINT) -> Option<usize> {
-    hit_test_boxes(hit_boxes, dpi, pt.x, pt.y)
+pub(crate) fn hit_test_box_id(
+    hit_boxes: &[HitBox],
+    dpi: u32,
+    px_x: i32,
+    px_y: i32,
+) -> Option<ControlId> {
+    hit_test_box(hit_boxes, dpi, px_x, px_y).map(|hb| hb.id.clone())
+}
+
+pub(crate) fn hit_test_pt_id(hit_boxes: &[HitBox], dpi: u32, pt: POINT) -> Option<ControlId> {
+    hit_test_box_id(hit_boxes, dpi, pt.x, pt.y)
+}
+
+pub(crate) fn next_focus_index(
+    items: &[FocusItem],
+    current_id: Option<&ControlId>,
+    dir: FocusNavDir,
+) -> Option<usize> {
+    let len = items.len();
+    if len == 0 {
+        return None;
+    }
+    let curr_idx = current_id.and_then(|id| items.iter().position(|item| &item.id == id));
+    match (curr_idx, dir) {
+        (None, FocusNavDir::Next | FocusNavDir::Down | FocusNavDir::Right) => Some(0),
+        (None, FocusNavDir::Prev | FocusNavDir::Up | FocusNavDir::Left) => Some(len - 1),
+        (Some(i), FocusNavDir::Next) => Some((i + 1) % len),
+        (Some(i), FocusNavDir::Prev) => Some((i + len - 1) % len),
+        (Some(i), FocusNavDir::Right) => {
+            let curr = &items[i].rect;
+            let cx = (curr.left + curr.right) * 0.5;
+            let cy = (curr.top + curr.bottom) * 0.5;
+            let best = items
+                .iter()
+                .enumerate()
+                .filter(|&(j, item)| {
+                    if j == i {
+                        return false;
+                    }
+                    let r = &item.rect;
+                    let cand_cx = (r.left + r.right) * 0.5;
+                    cand_cx > cx + 2.0 && r.top < curr.bottom - 1.0 && r.bottom > curr.top + 1.0
+                })
+                .min_by(|(_, a), (_, b)| {
+                    let score = |r: &D2D_RECT_F| {
+                        let acx = (r.left + r.right) * 0.5;
+                        let acy = (r.top + r.bottom) * 0.5;
+                        (acx - cx) + (acy - cy).abs() * 3.0
+                    };
+                    score(&a.rect).total_cmp(&score(&b.rect))
+                })
+                .map(|(j, _)| j);
+            Some(best.unwrap_or((i + 1) % len))
+        }
+        (Some(i), FocusNavDir::Left) => {
+            let curr = &items[i].rect;
+            let cx = (curr.left + curr.right) * 0.5;
+            let cy = (curr.top + curr.bottom) * 0.5;
+            let best = items
+                .iter()
+                .enumerate()
+                .filter(|&(j, item)| {
+                    if j == i {
+                        return false;
+                    }
+                    let r = &item.rect;
+                    let cand_cx = (r.left + r.right) * 0.5;
+                    cand_cx < cx - 2.0 && r.top < curr.bottom - 1.0 && r.bottom > curr.top + 1.0
+                })
+                .min_by(|(_, a), (_, b)| {
+                    let score = |r: &D2D_RECT_F| {
+                        let acx = (r.left + r.right) * 0.5;
+                        let acy = (r.top + r.bottom) * 0.5;
+                        (cx - acx) + (acy - cy).abs() * 3.0
+                    };
+                    score(&a.rect).total_cmp(&score(&b.rect))
+                })
+                .map(|(j, _)| j);
+            Some(best.unwrap_or((i + len - 1) % len))
+        }
+        (Some(i), FocusNavDir::Down) => {
+            let curr = &items[i].rect;
+            let cx = (curr.left + curr.right) * 0.5;
+            let cy = (curr.top + curr.bottom) * 0.5;
+            let best = items
+                .iter()
+                .enumerate()
+                .filter(|&(j, item)| {
+                    if j == i {
+                        return false;
+                    }
+                    let r = &item.rect;
+                    let cand_cy = (r.top + r.bottom) * 0.5;
+                    cand_cy > cy + 2.0
+                })
+                .min_by(|(_, a), (_, b)| {
+                    let score = |r: &D2D_RECT_F| {
+                        let acx = (r.left + r.right) * 0.5;
+                        let acy = (r.top + r.bottom) * 0.5;
+                        (acy - cy) * 2.0 + (acx - cx).abs()
+                    };
+                    score(&a.rect).total_cmp(&score(&b.rect))
+                })
+                .map(|(j, _)| j);
+            Some(best.unwrap_or((i + 1) % len))
+        }
+        (Some(i), FocusNavDir::Up) => {
+            let curr = &items[i].rect;
+            let cx = (curr.left + curr.right) * 0.5;
+            let cy = (curr.top + curr.bottom) * 0.5;
+            let best = items
+                .iter()
+                .enumerate()
+                .filter(|&(j, item)| {
+                    if j == i {
+                        return false;
+                    }
+                    let r = &item.rect;
+                    let cand_cy = (r.top + r.bottom) * 0.5;
+                    cand_cy < cy - 2.0
+                })
+                .min_by(|(_, a), (_, b)| {
+                    let score = |r: &D2D_RECT_F| {
+                        let acx = (r.left + r.right) * 0.5;
+                        let acy = (r.top + r.bottom) * 0.5;
+                        (cy - acy) * 2.0 + (acx - cx).abs()
+                    };
+                    score(&a.rect).total_cmp(&score(&b.rect))
+                })
+                .map(|(j, _)| j);
+            Some(best.unwrap_or((i + len - 1) % len))
+        }
+    }
+}
+
+pub(crate) fn compute_scroll_for_focus(
+    scroll_y: f32,
+    max_scroll_y: f32,
+    item: &FocusItem,
+    logical_h: f32,
+) -> f32 {
+    if !item.in_viewport {
+        return scroll_y.clamp(0.0, max_scroll_y);
+    }
+    let view_top = HEADER_HEIGHT + 6.0;
+    let view_bottom = (logical_h - 6.0).max(view_top + 1.0);
+    let delta = if item.rect.top < view_top {
+        item.rect.top - view_top
+    } else if item.rect.bottom > view_bottom {
+        item.rect.bottom - view_bottom
+    } else {
+        0.0
+    };
+    (scroll_y + delta).clamp(0.0, max_scroll_y)
 }
 
 pub(crate) fn hit_test_metric_slot(
@@ -1557,7 +1976,9 @@ mod tests {
             assert!((l.content_bottom - measured).abs() < 0.01);
         }
 
-        // Layout sub-tab adapts cleanly across layout modes.
+        // Layout sub-tab adapts cleanly across effective layout modes.
+        snap.config.set_hardware_enabled(true);
+        snap.config.set_wireless_enabled(true);
         snap.config.layout_mode = LayoutMode::Combined;
         let layout_combined_h = measure_content_height(
             PopupTab::Settings,
@@ -1566,7 +1987,8 @@ mod tests {
             &idle,
             false,
         );
-        snap.config.layout_mode = LayoutMode::HardwareOnly;
+        snap.config.set_hardware_enabled(true);
+        snap.config.set_wireless_enabled(false);
         let layout_hw_only_h = measure_content_height(
             PopupTab::Settings,
             SettingsSubTab::Layout,
@@ -1574,7 +1996,8 @@ mod tests {
             &idle,
             false,
         );
-        snap.config.layout_mode = LayoutMode::DevicesOnly;
+        snap.config.set_hardware_enabled(false);
+        snap.config.set_wireless_enabled(true);
         let layout_dev_only_h = measure_content_height(
             PopupTab::Settings,
             SettingsSubTab::Layout,
@@ -1586,6 +2009,8 @@ mod tests {
         // Combined adds divider+label+buttons (+63px) over single-zone without order block.
         assert!((layout_combined_h - (layout_hw_only_h + 63.0)).abs() < 0.01);
 
+        snap.config.set_hardware_enabled(true);
+        snap.config.set_wireless_enabled(true);
         snap.config.layout_mode = LayoutMode::Split;
         let layout_split_h = measure_content_height(
             PopupTab::Settings,
@@ -1596,6 +2021,17 @@ mod tests {
         );
         // Split has no order block (-63px vs combined) and 2 zone boxes (+78px vs 1 box).
         assert!((layout_split_h - (layout_hw_only_h + 78.0)).abs() < 0.01);
+
+        // Both disabled -> Layout sub-tab renders disabled placeholder box cleanly.
+        snap.config.set_hardware_enabled(false);
+        snap.config.set_wireless_enabled(false);
+        let both_off_l =
+            compute_settings_layout(&snap, SettingsSubTab::Layout, POPUP_WIDTH_LOGICAL, 0.0);
+        let SettingsBodyLayout::Layout(both_off) = both_off_l.body else {
+            panic!("expected Layout body");
+        };
+        assert!(both_off.zones.is_empty());
+        assert!(both_off.disabled_box_rect.is_some());
     }
 
     #[test]
@@ -1688,7 +2124,7 @@ mod tests {
             let h = measure_content_height(PopupTab::Settings, sub_tab, &snap, &idle, false);
             assert!((h - l0.content_bottom).abs() < 0.01);
         }
-        // Layout & General fit cleanly within fixed 468 DIP popup height without clipping.
+        // Layout fits cleanly within fixed 468 DIP popup height; General scrolls cleanly with dual-zone switches.
         assert!(
             measure_content_height(
                 PopupTab::Settings,
@@ -1705,7 +2141,7 @@ mod tests {
                 &snap,
                 &idle,
                 false
-            ) <= POPUP_FIXED_HEIGHT_LOGICAL
+            ) > POPUP_FIXED_HEIGHT_LOGICAL
         );
     }
 
@@ -1791,7 +2227,10 @@ mod tests {
             ),
             asset_name: Some("airmonitor.exe".into()),
             asset_size: Some(1_153_433),
-            sha256_url: None,
+            sha256_url: Some(
+                "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/SHA256SUMS.txt"
+                    .into(),
+            ),
         };
         let avail_auto_h = measure_content_height(
             PopupTab::About,
@@ -1811,7 +2250,7 @@ mod tests {
         assert!((avail_auto_h - (avail_no_meta_h + 18.0)).abs() < 0.01);
         assert!((avail_manual_h - avail_auto_h).abs() < 0.01);
 
-        // Writable dir + download_url -> dual side-by-side buttons.
+        // Writable dir + download_url + sha256_url -> dual side-by-side buttons.
         let layout_auto = compute_about_layout(&avail_with_meta, true, POPUP_WIDTH_LOGICAL, 0.0);
         assert!(layout_auto.update_meta_rect.is_some());
         assert!(layout_auto.update_prompt_rect.is_some());
@@ -1823,14 +2262,34 @@ mod tests {
         assert!(layout_auto.update_card_rect.bottom < layout_auto.maint_card_rect.top);
         assert!(layout_auto.maint_card_rect.bottom < layout_auto.content_bottom);
 
-        // Read-only dir or missing download_url -> single full-width fallback button.
+        // Missing sha256_url -> auto-update button is hidden even when writable; manual fallback shown.
+        let avail_missing_sha = UpdateStatus::UpdateAvailable {
+            current: "0.1.0".into(),
+            latest: "0.2.0".into(),
+            release_url: "https://github.com/AmlitaEnan/AirMonitor/releases/tag/v0.2.0".into(),
+            published_at: Some("2026-11-20T12:00:00Z".into()),
+            download_url: Some(
+                "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/airmonitor.exe"
+                    .into(),
+            ),
+            asset_name: Some("airmonitor.exe".into()),
+            asset_size: Some(1_153_433),
+            sha256_url: None,
+        };
+        let layout_missing_sha =
+            compute_about_layout(&avail_missing_sha, true, POPUP_WIDTH_LOGICAL, 0.0);
+        assert!(layout_missing_sha.auto_update_btn_rect.is_none());
+        assert!(layout_missing_sha.manual_download_btn_rect.is_none());
+        assert!(layout_missing_sha.download_btn_rect.is_some());
+
+        // Read-only dir -> single full-width fallback button.
         let layout_readonly =
             compute_about_layout(&avail_with_meta, false, POPUP_WIDTH_LOGICAL, 0.0);
         assert!(layout_readonly.auto_update_btn_rect.is_none());
         assert!(layout_readonly.manual_download_btn_rect.is_none());
         assert!(layout_readonly.download_btn_rect.is_some());
 
-        // Downloading / Verifying / Applying add +14px for progress bar over single-line states.
+        // Downloading / Verifying add +46px (progress bar + cancel button) over single-line states.
         for progress_status in [
             UpdateStatus::Downloading {
                 latest: "0.2.0".into(),
@@ -1838,9 +2297,6 @@ mod tests {
                 total_bytes: Some(1_048_576),
             },
             UpdateStatus::Verifying {
-                latest: "0.2.0".into(),
-            },
-            UpdateStatus::Applying {
                 latest: "0.2.0".into(),
             },
         ] {
@@ -1851,11 +2307,28 @@ mod tests {
                 &progress_status,
                 true,
             );
-            assert!((h - (idle_h + 14.0)).abs() < 0.01);
+            assert!((h - (idle_h + 46.0)).abs() < 0.01);
             let layout_prog =
                 compute_about_layout(&progress_status, true, POPUP_WIDTH_LOGICAL, 0.0);
             assert!(layout_prog.progress_bar_rect.is_some());
+            assert!(layout_prog.cancel_update_btn_rect.is_some());
         }
+
+        // Applying adds +14px for progress bar without cancel button.
+        let applying = UpdateStatus::Applying {
+            latest: "0.2.0".into(),
+        };
+        let applying_h = measure_content_height(
+            PopupTab::About,
+            SettingsSubTab::Metrics,
+            &snap,
+            &applying,
+            true,
+        );
+        assert!((applying_h - (idle_h + 14.0)).abs() < 0.01);
+        let layout_applying = compute_about_layout(&applying, true, POPUP_WIDTH_LOGICAL, 0.0);
+        assert!(layout_applying.progress_bar_rect.is_some());
+        assert!(layout_applying.cancel_update_btn_rect.is_none());
     }
 
     #[test]
@@ -1956,5 +2429,175 @@ mod tests {
         assert!(
             (compute_popup_height_dip(mon_1080p, 96) - POPUP_FIXED_HEIGHT_LOGICAL).abs() < 0.01
         );
+    }
+
+    #[test]
+    fn overview_honest_na_and_acpi_thermal_display() {
+        let mut unavail = HardwareMetrics::unavailable();
+        assert_eq!(format_overview_cpu_value(&unavail), "N/A");
+        assert_eq!(format_overview_mem_value(&unavail), "N/A");
+        assert_eq!(format_overview_nic_value(&unavail), "N/A");
+        assert_eq!(format_overview_net_value(&unavail), "↑ N/A   ↓ N/A");
+
+        // CPU usage invalid with valid frequency preserves frequency while marking usage N/A.
+        unavail.cpu_freq_ghz = Some(3.60);
+        assert_eq!(format_overview_cpu_value(&unavail), "N/A  (3.60 GHz)");
+
+        // ACPI thermal shown only when cpu_temp_c is None, and increases card height.
+        let base_spec = build_hw_card_spec(&unavail);
+        assert_eq!(base_spec.acpi_temp_line, None);
+        unavail.acpi_temp_c = Some(54.2);
+        let acpi_spec = build_hw_card_spec(&unavail);
+        assert_eq!(acpi_spec.acpi_temp_line.as_deref(), Some("54°C"));
+        assert!((acpi_spec.card_h - (base_spec.card_h + HW_ROW_ACPI_H)).abs() < 0.01);
+
+        // When cpu_temp_c is available, acpi_temp_line is suppressed to avoid duplicate/misleading row.
+        unavail.cpu_temp_c = Some(61.0);
+        let cpu_spec = build_hw_card_spec(&unavail);
+        assert_eq!(cpu_spec.acpi_temp_line, None);
+    }
+
+    #[test]
+    fn overview_disabled_zone_placeholders_and_refresh_hiding() {
+        let mut cfg = AppConfig::default();
+        cfg.set_hardware_enabled(false);
+        cfg.set_wireless_enabled(false);
+        let snap = MonitorSnapshot::new(cfg);
+
+        let layout = compute_overview_layout(&snap, POPUP_WIDTH_LOGICAL, 0.0);
+        assert!(layout.hw_enable_btn_rect.is_some());
+        assert!(layout.refresh_rect.is_none());
+        assert!(layout.wireless_disabled_rect.is_some());
+        assert!(layout.wireless_enable_btn_rect.is_some());
+        assert!(layout.empty_rect.is_none());
+        assert!(layout.device_cards.is_empty());
+    }
+
+    #[test]
+    fn keyboard_focus_navigation_and_auto_scroll() {
+        let items = vec![
+            FocusItem {
+                id: ControlId::Tab(PopupTab::Overview),
+                rect: D2D_RECT_F {
+                    left: 200.0,
+                    top: 8.0,
+                    right: 248.0,
+                    bottom: 34.0,
+                },
+                action: PopupAction::SwitchTab(PopupTab::Overview),
+                in_viewport: false,
+            },
+            FocusItem {
+                id: ControlId::Tab(PopupTab::Settings),
+                rect: D2D_RECT_F {
+                    left: 253.0,
+                    top: 8.0,
+                    right: 301.0,
+                    bottom: 34.0,
+                },
+                action: PopupAction::SwitchTab(PopupTab::Settings),
+                in_viewport: false,
+            },
+            FocusItem {
+                id: ControlId::MetricChip(HwMetric::CpuUsage),
+                rect: D2D_RECT_F {
+                    left: 26.0,
+                    top: 120.0,
+                    right: 120.0,
+                    bottom: 146.0,
+                },
+                action: PopupAction::ToggleMetric(HwMetric::CpuUsage),
+                in_viewport: true,
+            },
+            FocusItem {
+                id: ControlId::MetricChip(HwMetric::MemUsage),
+                rect: D2D_RECT_F {
+                    left: 126.0,
+                    top: 120.0,
+                    right: 220.0,
+                    bottom: 146.0,
+                },
+                action: PopupAction::ToggleMetric(HwMetric::MemUsage),
+                in_viewport: true,
+            },
+            FocusItem {
+                id: ControlId::MetricChip(HwMetric::DiskTemp),
+                rect: D2D_RECT_F {
+                    left: 26.0,
+                    top: 520.0,
+                    right: 120.0,
+                    bottom: 546.0,
+                },
+                action: PopupAction::ToggleMetric(HwMetric::DiskTemp),
+                in_viewport: true,
+            },
+        ];
+
+        assert_eq!(next_focus_index(&items, None, FocusNavDir::Next), Some(0));
+        assert_eq!(next_focus_index(&items, None, FocusNavDir::Prev), Some(4));
+        assert_eq!(
+            next_focus_index(
+                &items,
+                Some(&ControlId::Tab(PopupTab::Overview)),
+                FocusNavDir::Right
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            next_focus_index(
+                &items,
+                Some(&ControlId::Tab(PopupTab::Settings)),
+                FocusNavDir::Left
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            next_focus_index(
+                &items,
+                Some(&ControlId::MetricChip(HwMetric::CpuUsage)),
+                FocusNavDir::Right
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            next_focus_index(
+                &items,
+                Some(&ControlId::MetricChip(HwMetric::CpuUsage)),
+                FocusNavDir::Down
+            ),
+            Some(4)
+        );
+        assert_eq!(
+            next_focus_index(
+                &items,
+                Some(&ControlId::MetricChip(HwMetric::DiskTemp)),
+                FocusNavDir::Next
+            ),
+            Some(0)
+        );
+
+        // Header item does not scroll body.
+        assert_eq!(
+            compute_scroll_for_focus(40.0, 120.0, &items[0], 468.0),
+            40.0
+        );
+        // Off-screen bottom item (bottom = 546, view_bottom = 462) scrolls down by 84px.
+        let scrolled_down = compute_scroll_for_focus(0.0, 120.0, &items[4], 468.0);
+        assert!((scrolled_down - 84.0).abs() < 0.01);
+
+        // Off-screen top item (top = 20 < HEADER_HEIGHT + 6 = 48) scrolls up by 28px.
+        let top_clipped = FocusItem {
+            id: ControlId::MetricChip(HwMetric::CpuUsage),
+            rect: D2D_RECT_F {
+                left: 26.0,
+                top: 20.0,
+                right: 120.0,
+                bottom: 46.0,
+            },
+            action: PopupAction::ToggleMetric(HwMetric::CpuUsage),
+            in_viewport: true,
+        };
+        let scrolled_up = compute_scroll_for_focus(80.0, 120.0, &top_clipped, 468.0);
+        assert!((scrolled_up - 52.0).abs() < 0.01);
     }
 }

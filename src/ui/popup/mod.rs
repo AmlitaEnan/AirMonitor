@@ -5,7 +5,7 @@ pub mod widgets;
 use std::cell::RefCell;
 use std::mem::size_of;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN,
+    VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow,
@@ -45,8 +46,9 @@ use crate::ui::popup::actions::{
     apply_popup_action, try_begin_download_update, try_begin_update_check, ActionEffect,
 };
 use crate::ui::popup::layout::{
-    compute_popup_height_dip, compute_popup_rect, hit_test_boxes, hit_test_metric_slot,
-    hit_test_pt, HitBox, MetricSlotRect, PopupAction, PopupTab, SettingsSubTab,
+    compute_popup_height_dip, compute_popup_rect, compute_scroll_for_focus, hit_test_box,
+    hit_test_box_id, hit_test_metric_slot, hit_test_pt_id, next_focus_index, ControlId, FocusItem,
+    FocusNavDir, HitBox, MetricSlotRect, PopupAction, PopupTab, SettingsSubTab,
     POPUP_WIDTH_LOGICAL,
 };
 use crate::ui::popup::widgets::{draw_popup_scene, PopupFonts, SceneInput};
@@ -89,6 +91,222 @@ pub fn register_popup_class(hinstance: HINSTANCE) -> windows::core::Result<()> {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct PopupInteraction {
+    pub scroll_y: f32,
+    pub max_scroll_y: f32,
+    pub hovered_id: Option<ControlId>,
+    pub pressed_id: Option<ControlId>,
+    pub focused_id: Option<ControlId>,
+    pub hit_boxes: Vec<HitBox>,
+    pub focus_items: Vec<FocusItem>,
+    pub metric_slot_rects: Vec<MetricSlotRect>,
+    pub drag_metric_from: Option<usize>,
+    pub drag_metric_start_px: POINT,
+    pub drag_metric_active: bool,
+    pub drag_metric_hover: Option<usize>,
+}
+
+pub(crate) struct LButtonUpOutcome {
+    pub need_release: bool,
+    pub action: Option<PopupAction>,
+    pub need_rerender_on_cancel: bool,
+}
+
+impl PopupInteraction {
+    pub(crate) fn clear_metric_drag(&mut self) -> bool {
+        let had = self.drag_metric_from.is_some()
+            || self.drag_metric_active
+            || self.drag_metric_hover.is_some();
+        self.drag_metric_from = None;
+        self.drag_metric_start_px = POINT::default();
+        self.drag_metric_active = false;
+        self.drag_metric_hover = None;
+        had
+    }
+
+    pub(crate) fn reset_all(&mut self, clear_focus: bool) {
+        self.scroll_y = 0.0;
+        self.hovered_id = None;
+        self.pressed_id = None;
+        if clear_focus {
+            self.focused_id = None;
+        }
+        self.clear_metric_drag();
+    }
+
+    pub(crate) fn clear_geometry(&mut self) {
+        self.hit_boxes.clear();
+        self.focus_items.clear();
+        self.metric_slot_rects.clear();
+    }
+
+    pub(crate) fn on_mouse_move(&mut self, dpi: u32, x: i32, y: i32) -> bool {
+        let next_hover = hit_test_box_id(&self.hit_boxes, dpi, x, y);
+        if let Some(from_idx) = self.drag_metric_from {
+            let dx = x - self.drag_metric_start_px.x;
+            let dy = y - self.drag_metric_start_px.y;
+            let mut just_activated = false;
+            if !self.drag_metric_active && (dx * dx + dy * dy >= 25) {
+                self.drag_metric_active = true;
+                self.pressed_id = None;
+                just_activated = true;
+            }
+            if self.drag_metric_active {
+                let next_drag_hover = hit_test_metric_slot(&self.metric_slot_rects, dpi, x, y)
+                    .filter(|&idx| idx != from_idx);
+                if just_activated
+                    || next_drag_hover != self.drag_metric_hover
+                    || next_hover != self.hovered_id
+                {
+                    self.drag_metric_hover = next_drag_hover;
+                    self.hovered_id = next_hover;
+                    return true;
+                }
+                return false;
+            }
+        }
+        if next_hover != self.hovered_id {
+            self.hovered_id = next_hover;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn on_mouse_leave(&mut self) -> bool {
+        self.hovered_id.take().is_some()
+    }
+
+    pub(crate) fn on_lbutton_down(
+        &mut self,
+        dpi: u32,
+        x: i32,
+        y: i32,
+        allow_metric_drag: bool,
+    ) -> (bool, bool) {
+        let hit = hit_test_box_id(&self.hit_boxes, dpi, x, y);
+        let slot_hit = if allow_metric_drag {
+            hit_test_metric_slot(&self.metric_slot_rects, dpi, x, y)
+        } else {
+            None
+        };
+        if let Some(slot_idx) = slot_hit {
+            self.drag_metric_from = Some(slot_idx);
+            self.drag_metric_start_px = POINT { x, y };
+            self.drag_metric_active = false;
+            self.drag_metric_hover = None;
+        } else {
+            self.clear_metric_drag();
+        }
+
+        let need_capture = hit.is_some() || slot_hit.is_some();
+        let need_rerender = if need_capture {
+            self.hovered_id = hit.clone();
+            self.pressed_id = hit;
+            self.focused_id = None;
+            true
+        } else {
+            self.focused_id.take().is_some()
+        };
+        (need_capture, need_rerender)
+    }
+
+    pub(crate) fn on_lbutton_up(&mut self, dpi: u32, x: i32, y: i32) -> LButtonUpOutcome {
+        let drag_from = self.drag_metric_from;
+        let was_drag_active = self.drag_metric_active;
+        self.clear_metric_drag();
+
+        let was_pressed = self.pressed_id.take();
+        let hit = hit_test_box(&self.hit_boxes, dpi, x, y);
+        self.hovered_id = hit.map(|hb| hb.id.clone());
+
+        let action = if was_drag_active {
+            drag_from.map(|from_idx| {
+                let drop_target = hit_test_metric_slot(&self.metric_slot_rects, dpi, x, y)
+                    .filter(|&to_idx| to_idx != from_idx);
+                if let Some(to_idx) = drop_target {
+                    PopupAction::SwapMetricSlots(from_idx, to_idx)
+                } else {
+                    PopupAction::SelectMetricSlot(from_idx)
+                }
+            })
+        } else {
+            match (was_pressed.as_ref(), hit) {
+                (Some(pressed_id), Some(hb)) if *pressed_id == hb.id => Some(hb.action.clone()),
+                _ => None,
+            }
+        };
+
+        if action.is_some() {
+            self.focused_id = None;
+        }
+
+        LButtonUpOutcome {
+            need_release: was_pressed.is_some() || drag_from.is_some(),
+            need_rerender_on_cancel: action.is_none() && (was_pressed.is_some() || was_drag_active),
+            action,
+        }
+    }
+
+    pub(crate) fn on_capture_changed(&mut self) -> bool {
+        let had_press = self.pressed_id.take().is_some();
+        let had_drag = self.clear_metric_drag();
+        had_press || had_drag
+    }
+
+    pub(crate) fn on_mouse_wheel(&mut self, delta: f32) -> (bool, bool) {
+        let had_press = self.pressed_id.take().is_some();
+        let had_drag = self.clear_metric_drag();
+        let step = -(delta / 120.0) * 30.0;
+        let next = (self.scroll_y + step).clamp(0.0, self.max_scroll_y);
+        let scrolled = (next - self.scroll_y).abs() > 0.1;
+        if scrolled {
+            self.scroll_y = next;
+        }
+        (scrolled, had_press || had_drag)
+    }
+
+    pub(crate) fn move_focus(&mut self, dir: FocusNavDir, logical_h: f32) -> bool {
+        let Some(next_idx) = next_focus_index(&self.focus_items, self.focused_id.as_ref(), dir)
+        else {
+            return false;
+        };
+        let item = self.focus_items[next_idx].clone();
+        self.focused_id = Some(item.id.clone());
+        self.scroll_y =
+            compute_scroll_for_focus(self.scroll_y, self.max_scroll_y, &item, logical_h);
+        true
+    }
+
+    pub(crate) fn focused_action(&self) -> Option<PopupAction> {
+        let id = self.focused_id.as_ref()?;
+        self.focus_items
+            .iter()
+            .find(|item| &item.id == id)
+            .map(|item| item.action.clone())
+    }
+}
+
+pub(crate) fn cancel_active_update(
+    update_status: &Mutex<UpdateStatus>,
+    cancel_flag: &AtomicBool,
+    update_gen: &AtomicU64,
+) -> bool {
+    let mut guard = update_status.lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(
+        *guard,
+        UpdateStatus::Downloading { .. } | UpdateStatus::Verifying { .. }
+    ) {
+        cancel_flag.store(true, Ordering::Release);
+        update_gen.fetch_add(1, Ordering::AcqRel);
+        *guard = UpdateStatus::Error("已取消更新，可点击「检查更新」重试".to_string());
+        true
+    } else {
+        false
+    }
+}
+
 pub struct PopupManager {
     pub hwnd: HWND,
     host_hwnd: HWND,
@@ -107,17 +325,8 @@ pub struct PopupManager {
     active_tab: PopupTab,
     settings_sub_tab: SettingsSubTab,
     selected_metric_idx: Option<usize>,
-    scroll_y: f32,
-    max_scroll_y: f32,
-    hovered_idx: Option<usize>,
-    pressed_idx: Option<usize>,
     tracking_leave: bool,
-    hit_boxes: Vec<HitBox>,
-    metric_slot_rects: Vec<MetricSlotRect>,
-    drag_metric_from: Option<usize>,
-    drag_metric_start_px: POINT,
-    drag_metric_active: bool,
-    drag_metric_hover: Option<usize>,
+    interaction: PopupInteraction,
     dpi: u32,
     width_px: i32,
     height_px: i32,
@@ -135,6 +344,8 @@ pub struct PopupManager {
     surface: WindowSurface,
     fonts: PopupFonts,
     update_status: Arc<Mutex<UpdateStatus>>,
+    update_cancel_flag: Arc<AtomicBool>,
+    update_gen: Arc<AtomicU64>,
     self_update_writable: bool,
     last_save_error: Option<String>,
 }
@@ -227,17 +438,8 @@ impl PopupManager {
                 active_tab: PopupTab::Overview,
                 settings_sub_tab: SettingsSubTab::Metrics,
                 selected_metric_idx: Some(2),
-                scroll_y: 0.0,
-                max_scroll_y: 0.0,
-                hovered_idx: None,
-                pressed_idx: None,
                 tracking_leave: false,
-                hit_boxes: Vec::new(),
-                metric_slot_rects: Vec::new(),
-                drag_metric_from: None,
-                drag_metric_start_px: POINT::default(),
-                drag_metric_active: false,
-                drag_metric_hover: None,
+                interaction: PopupInteraction::default(),
                 dpi: 96,
                 width_px: 1,
                 height_px: 1,
@@ -255,6 +457,8 @@ impl PopupManager {
                 surface: WindowSurface::new(),
                 fonts,
                 update_status: Arc::new(Mutex::new(UpdateStatus::Idle)),
+                update_cancel_flag: Arc::new(AtomicBool::new(false)),
+                update_gen: Arc::new(AtomicU64::new(0)),
                 self_update_writable: false,
                 last_save_error: None,
             }));
@@ -392,10 +596,7 @@ impl PopupManager {
                 p.anchor_click_y = click_y;
                 if p.active_tab != tab {
                     p.active_tab = tab;
-                    p.scroll_y = 0.0;
-                    p.hovered_idx = None;
-                    p.pressed_idx = None;
-                    p.clear_metric_drag();
+                    p.interaction.reset_all(true);
                 }
                 if tab == PopupTab::Settings {
                     p.cached_autostart = is_autostart_enabled();
@@ -518,6 +719,9 @@ impl PopupManager {
             let Ok(mut p) = cell.try_borrow_mut() else {
                 return;
             };
+            p.update_cancel_flag.store(true, Ordering::Release);
+            p.update_gen.fetch_add(1, Ordering::AcqRel);
+            p.update_cancel_flag = Arc::new(AtomicBool::new(false));
             p.prepare_hide();
             p.popup_open.store(false, Ordering::Release);
             p.popup_overview_open.store(false, Ordering::Release);
@@ -613,17 +817,6 @@ impl PopupManager {
         }
     }
 
-    fn clear_metric_drag(&mut self) -> bool {
-        let had = self.drag_metric_from.is_some()
-            || self.drag_metric_active
-            || self.drag_metric_hover.is_some();
-        self.drag_metric_from = None;
-        self.drag_metric_start_px = POINT::default();
-        self.drag_metric_active = false;
-        self.drag_metric_hover = None;
-        had
-    }
-
     fn clamp_selected_metric_for_snapshot(&mut self, snap: &MonitorSnapshot) {
         let len = snap.config.hardware_items.len();
         self.selected_metric_idx = if len == 0 {
@@ -649,10 +842,7 @@ impl PopupManager {
 
         self.width_px = (rect.right - rect.left).max(1);
         self.height_px = (rect.bottom - rect.top).max(1);
-        self.scroll_y = 0.0;
-        self.hovered_idx = None;
-        self.pressed_idx = None;
-        self.clear_metric_drag();
+        self.interaction.reset_all(true);
         self.clamp_selected_metric_for_snapshot(&snap);
         self.visible = true;
         self.shown_at = Some(Instant::now());
@@ -676,12 +866,9 @@ impl PopupManager {
         self.visible = false;
         self.shown_at = None;
         self.last_hidden_at = Some(Instant::now());
-        self.hovered_idx = None;
-        self.pressed_idx = None;
-        self.clear_metric_drag();
+        self.interaction.reset_all(true);
         self.tracking_leave = false;
-        self.hit_boxes.clear();
-        self.metric_slot_rects.clear();
+        self.interaction.clear_geometry();
         self.cached_snapshot = None;
         self.last_rendered_rev = None;
         // Release temporary DIB/render target so closed popup consumes minimal idle RAM.
@@ -770,8 +957,7 @@ impl PopupManager {
         let update_status = self.snapshot_update_status();
 
         self.clamp_selected_metric_for_snapshot(snapshot);
-        self.hit_boxes.clear();
-        self.metric_slot_rects.clear();
+        self.interaction.clear_geometry();
 
         for attempt in 0..2 {
             let Ok((rt, base_rt, brush)) = self.ensure_render_target(self.dpi) else {
@@ -788,6 +974,9 @@ impl PopupManager {
                     return;
                 }
                 rt.BeginDraw();
+                let hovered_id = self.interaction.hovered_id.clone();
+                let pressed_id = self.interaction.pressed_id.clone();
+                let focused_id = self.interaction.focused_id.clone();
                 let mut scene = SceneInput {
                     rt: &base_rt,
                     brush: &brush,
@@ -801,19 +990,21 @@ impl PopupManager {
                     active_tab: self.active_tab,
                     settings_sub_tab: self.settings_sub_tab,
                     selected_metric_idx: self.selected_metric_idx,
-                    drag_metric_from: self.drag_metric_from,
-                    drag_metric_active: self.drag_metric_active,
-                    drag_metric_hover: self.drag_metric_hover,
+                    drag_metric_from: self.interaction.drag_metric_from,
+                    drag_metric_active: self.interaction.drag_metric_active,
+                    drag_metric_hover: self.interaction.drag_metric_hover,
                     cached_autostart: self.cached_autostart,
                     has_dwm_border: self.has_dwm_border,
                     logical_w,
                     logical_h,
-                    hovered_idx: self.hovered_idx,
-                    pressed_idx: self.pressed_idx,
-                    scroll_y: &mut self.scroll_y,
-                    max_scroll_y: &mut self.max_scroll_y,
-                    hit_boxes: &mut self.hit_boxes,
-                    metric_slot_rects: &mut self.metric_slot_rects,
+                    hovered_id: hovered_id.as_ref(),
+                    pressed_id: pressed_id.as_ref(),
+                    focused_id: focused_id.as_ref(),
+                    scroll_y: &mut self.interaction.scroll_y,
+                    max_scroll_y: &mut self.interaction.max_scroll_y,
+                    hit_boxes: &mut self.interaction.hit_boxes,
+                    focus_items: &mut self.interaction.focus_items,
+                    metric_slot_rects: &mut self.interaction.metric_slot_rects,
                     utf16_buf: &mut self.utf16_buf,
                 };
                 draw_popup_scene(&mut scene);
@@ -823,8 +1014,7 @@ impl PopupManager {
                         self.render_target = None;
                         self.base_rt = None;
                         self.brush = None;
-                        self.hit_boxes.clear();
-                        self.metric_slot_rects.clear();
+                        self.interaction.clear_geometry();
                     }
                     Err(_) => break,
                 }
@@ -835,6 +1025,7 @@ impl PopupManager {
     fn execute_action(
         &mut self,
         action: crate::ui::popup::layout::PopupAction,
+        from_keyboard: bool,
     ) -> (bool, Option<RECT>, Option<PostBorrowAction>) {
         match apply_popup_action(action, &self.state) {
             ActionEffect::None => (false, None, None),
@@ -847,10 +1038,7 @@ impl PopupManager {
                         self.self_update_writable = is_self_update_dir_writable();
                     }
                     self.sync_popup_open(true);
-                    self.scroll_y = 0.0;
-                    self.hovered_idx = None;
-                    self.pressed_idx = None;
-                    self.clear_metric_drag();
+                    self.interaction.reset_all(!from_keyboard);
                     let resize_rect = self
                         .cached_snapshot
                         .clone()
@@ -862,10 +1050,7 @@ impl PopupManager {
             ActionEffect::SwitchSettingsSubTab(sub_tab) => {
                 if self.settings_sub_tab != sub_tab {
                     self.settings_sub_tab = sub_tab;
-                    self.scroll_y = 0.0;
-                    self.hovered_idx = None;
-                    self.pressed_idx = None;
-                    self.clear_metric_drag();
+                    self.interaction.reset_all(!from_keyboard);
                     let resize_rect = self
                         .cached_snapshot
                         .clone()
@@ -894,16 +1079,20 @@ impl PopupManager {
                     return (false, None, None);
                 }
 
+                let my_gen = self.update_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                let gen_arc = Arc::clone(&self.update_gen);
                 let status_arc = Arc::clone(&self.update_status);
                 let host_raw = self.host_hwnd.0 as isize;
                 if let Err(err) = std::thread::Builder::new()
                     .name("update-checker".to_string())
                     .spawn(move || {
                         let result = crate::updater::check_latest_release();
-                        if let Ok(mut guard) = status_arc.lock() {
-                            *guard = result;
+                        if gen_arc.load(Ordering::Acquire) == my_gen {
+                            if let Ok(mut guard) = status_arc.lock() {
+                                *guard = result;
+                            }
+                            post_host_message(host_raw, WM_APP_UPDATE_STATUS);
                         }
-                        post_host_message(host_raw, WM_APP_UPDATE_STATUS);
                     })
                 {
                     if let Ok(mut guard) = self.update_status.lock() {
@@ -926,18 +1115,33 @@ impl PopupManager {
                     return (false, None, None);
                 };
 
+                self.update_cancel_flag.store(true, Ordering::Release);
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                self.update_cancel_flag = Arc::clone(&cancel_flag);
+                let my_gen = self.update_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                let gen_arc = Arc::clone(&self.update_gen);
+
                 let status_arc = Arc::clone(&self.update_status);
                 let host_raw = self.host_hwnd.0 as isize;
+                let cancel_for_cb = Arc::clone(&cancel_flag);
+                let gen_for_cb = Arc::clone(&gen_arc);
                 if let Err(err) = std::thread::Builder::new()
                     .name("update-downloader".to_string())
                     .spawn(move || {
                         let progress_arc = Arc::clone(&status_arc);
-                        let res = crate::updater::download_and_apply_update(
+                        let res = crate::updater::download_and_apply_update_cancellable(
                             &target.latest,
                             &target.download_url,
                             target.asset_name.as_deref(),
                             target.sha256_url.as_deref(),
+                            &cancel_flag,
+                            crate::updater::DEFAULT_UPDATE_TIMEOUT,
                             move |next_status| {
+                                if cancel_for_cb.load(Ordering::Acquire)
+                                    || gen_for_cb.load(Ordering::Acquire) != my_gen
+                                {
+                                    return;
+                                }
                                 if let Ok(mut guard) = progress_arc.lock() {
                                     *guard = next_status;
                                 }
@@ -946,13 +1150,19 @@ impl PopupManager {
                         );
                         match res {
                             Ok(()) => {
-                                post_host_message(host_raw, WM_APP_UPDATE_RESTART);
+                                if gen_arc.load(Ordering::Acquire) == my_gen {
+                                    post_host_message(host_raw, WM_APP_UPDATE_RESTART);
+                                }
                             }
                             Err(msg) => {
-                                if let Ok(mut guard) = status_arc.lock() {
-                                    *guard = UpdateStatus::Error(msg);
+                                if !cancel_flag.load(Ordering::Acquire)
+                                    && gen_arc.load(Ordering::Acquire) == my_gen
+                                {
+                                    if let Ok(mut guard) = status_arc.lock() {
+                                        *guard = UpdateStatus::Error(msg);
+                                    }
+                                    post_host_message(host_raw, WM_APP_UPDATE_STATUS);
                                 }
-                                post_host_message(host_raw, WM_APP_UPDATE_STATUS);
                             }
                         }
                     })
@@ -967,6 +1177,21 @@ impl PopupManager {
                     .clone()
                     .and_then(|snap| self.recalculate_rect_if_needed(&snap));
                 (self.rerender_cached(), resize_rect, None)
+            }
+            ActionEffect::CancelUpdate => {
+                if cancel_active_update(
+                    &self.update_status,
+                    &self.update_cancel_flag,
+                    &self.update_gen,
+                ) {
+                    let resize_rect = self
+                        .cached_snapshot
+                        .clone()
+                        .and_then(|snap| self.recalculate_rect_if_needed(&snap));
+                    (self.rerender_cached(), resize_rect, None)
+                } else {
+                    (false, None, None)
+                }
             }
             ActionEffect::OpenUrl(url) => (false, None, Some(PostBorrowAction::OpenUrl(url))),
             ActionEffect::OpenConfig => {
@@ -1037,6 +1262,34 @@ fn apply_resize_and_invalidate(hwnd: HWND, resize_rect: Option<RECT>, need_inval
     }
 }
 
+fn finish_post_action(
+    hwnd: HWND,
+    cell: &RefCell<PopupManager>,
+    resize_rect: Option<RECT>,
+    need_invalidate: bool,
+    post_action: Option<PostBorrowAction>,
+) {
+    apply_resize_and_invalidate(hwnd, resize_rect, need_invalidate);
+    if let Some(post_act) = post_action {
+        let err = match post_act {
+            PostBorrowAction::OpenUrl(url) => crate::updater::open_repo_url(&url).err(),
+            PostBorrowAction::OpenConfig(snap) => {
+                crate::ui::tray::open_config_in_editor(&snap).err()
+            }
+        };
+        if let Some(err_msg) = err {
+            if let Ok(mut p) = cell.try_borrow_mut() {
+                let host_hwnd = p.host_hwnd;
+                p.last_save_error = Some(err_msg);
+                drop(p);
+                unsafe {
+                    let _ = PostMessageW(host_hwnd, WM_APP_CONFIG_CHANGED, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    }
+}
+
 fn finish_hide(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1069,7 +1322,8 @@ unsafe extern "system" fn popup_wnd_proc(
     if msg == WM_SETCURSOR {
         if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
             if let Ok(popup) = cell.try_borrow() {
-                let cursor = if (popup.hovered_idx.is_some() || popup.drag_metric_active)
+                let cursor = if (popup.interaction.hovered_id.is_some()
+                    || popup.interaction.drag_metric_active)
                     && !popup.hand_cursor.0.is_null()
                 {
                     popup.hand_cursor
@@ -1134,12 +1388,56 @@ unsafe extern "system" fn popup_wnd_proc(
             return LRESULT(0);
         }
         WM_KEYDOWN => {
-            if wparam.0 as u16 == VK_ESCAPE.0 {
+            let vk = wparam.0 as u16;
+            if vk == VK_ESCAPE.0 {
                 let hide_hwnd = popup.prepare_hide();
                 drop(popup);
                 if let Some(h) = hide_hwnd {
                     finish_hide(h);
                 }
+                return LRESULT(0);
+            }
+            let nav_dir = if vk == VK_TAB.0 {
+                let shift_down = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+                Some(if shift_down {
+                    FocusNavDir::Prev
+                } else {
+                    FocusNavDir::Next
+                })
+            } else if vk == VK_LEFT.0 {
+                Some(FocusNavDir::Left)
+            } else if vk == VK_RIGHT.0 {
+                Some(FocusNavDir::Right)
+            } else if vk == VK_UP.0 {
+                Some(FocusNavDir::Up)
+            } else if vk == VK_DOWN.0 {
+                Some(FocusNavDir::Down)
+            } else {
+                None
+            };
+            if let Some(dir) = nav_dir {
+                let scale = popup.dpi.max(96) as f32 / 96.0;
+                let logical_h = popup.height_px as f32 / scale;
+                let need_invalidate = if popup.interaction.move_focus(dir, logical_h) {
+                    popup.rerender_cached()
+                } else {
+                    false
+                };
+                drop(popup);
+                if need_invalidate {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                return LRESULT(0);
+            }
+            if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
+                let action = popup.interaction.focused_action();
+                let (need_invalidate, resize_rect, post_action) = if let Some(act) = action {
+                    popup.execute_action(act, true)
+                } else {
+                    (false, None, None)
+                };
+                drop(popup);
+                finish_post_action(hwnd, cell, resize_rect, need_invalidate, post_action);
                 return LRESULT(0);
             }
         }
@@ -1152,39 +1450,8 @@ unsafe extern "system" fn popup_wnd_proc(
             };
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let next_hover = hit_test_boxes(&popup.hit_boxes, popup.dpi, x, y);
-
-            let need_invalidate = if let Some(from_idx) = popup.drag_metric_from {
-                let dx = x - popup.drag_metric_start_px.x;
-                let dy = y - popup.drag_metric_start_px.y;
-                let mut just_activated = false;
-                if !popup.drag_metric_active && (dx * dx + dy * dy >= 25) {
-                    popup.drag_metric_active = true;
-                    popup.pressed_idx = None;
-                    just_activated = true;
-                }
-                if popup.drag_metric_active {
-                    let next_drag_hover =
-                        hit_test_metric_slot(&popup.metric_slot_rects, popup.dpi, x, y)
-                            .filter(|&idx| idx != from_idx);
-                    if just_activated
-                        || next_drag_hover != popup.drag_metric_hover
-                        || next_hover != popup.hovered_idx
-                    {
-                        popup.drag_metric_hover = next_drag_hover;
-                        popup.hovered_idx = next_hover;
-                        popup.rerender_cached()
-                    } else {
-                        false
-                    }
-                } else if next_hover != popup.hovered_idx {
-                    popup.hovered_idx = next_hover;
-                    popup.rerender_cached()
-                } else {
-                    false
-                }
-            } else if next_hover != popup.hovered_idx {
-                popup.hovered_idx = next_hover;
+            let dpi = popup.dpi;
+            let need_invalidate = if popup.interaction.on_mouse_move(dpi, x, y) {
                 popup.rerender_cached()
             } else {
                 false
@@ -1207,8 +1474,7 @@ unsafe extern "system" fn popup_wnd_proc(
         }
         WM_MOUSELEAVE => {
             popup.tracking_leave = false;
-            let need_invalidate = if popup.hovered_idx.is_some() {
-                popup.hovered_idx = None;
+            let need_invalidate = if popup.interaction.on_mouse_leave() {
                 popup.rerender_cached()
             } else {
                 false
@@ -1222,27 +1488,12 @@ unsafe extern "system" fn popup_wnd_proc(
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let hit = hit_test_boxes(&popup.hit_boxes, popup.dpi, x, y);
-            let slot_hit = if popup.active_tab == PopupTab::Settings
-                && popup.settings_sub_tab == SettingsSubTab::Metrics
-            {
-                hit_test_metric_slot(&popup.metric_slot_rects, popup.dpi, x, y)
-            } else {
-                None
-            };
-            if let Some(slot_idx) = slot_hit {
-                popup.drag_metric_from = Some(slot_idx);
-                popup.drag_metric_start_px = POINT { x, y };
-                popup.drag_metric_active = false;
-                popup.drag_metric_hover = None;
-            } else {
-                popup.clear_metric_drag();
-            }
-
-            let need_capture = hit.is_some() || slot_hit.is_some();
-            let need_invalidate = if need_capture {
-                popup.hovered_idx = hit;
-                popup.pressed_idx = hit;
+            let dpi = popup.dpi;
+            let allow_drag = popup.active_tab == PopupTab::Settings
+                && popup.settings_sub_tab == SettingsSubTab::Metrics;
+            let (need_capture, need_rerender) =
+                popup.interaction.on_lbutton_down(dpi, x, y, allow_drag);
+            let need_invalidate = if need_rerender {
                 popup.rerender_cached()
             } else {
                 false
@@ -1260,40 +1511,12 @@ unsafe extern "system" fn popup_wnd_proc(
         WM_LBUTTONUP => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let drag_from = popup.drag_metric_from;
-            let was_drag_active = popup.drag_metric_active;
-            popup.clear_metric_drag();
+            let dpi = popup.dpi;
+            let outcome = popup.interaction.on_lbutton_up(dpi, x, y);
 
-            let was_pressed = popup.pressed_idx.take();
-            let hit = hit_test_boxes(&popup.hit_boxes, popup.dpi, x, y);
-            popup.hovered_idx = hit;
-
-            let action = if was_drag_active {
-                drag_from.map(|from_idx| {
-                    let drop_target =
-                        hit_test_metric_slot(&popup.metric_slot_rects, popup.dpi, x, y)
-                            .filter(|&to_idx| to_idx != from_idx);
-                    if let Some(to_idx) = drop_target {
-                        PopupAction::SwapMetricSlots(from_idx, to_idx)
-                    } else {
-                        PopupAction::SelectMetricSlot(from_idx)
-                    }
-                })
-            } else {
-                match (was_pressed, hit) {
-                    (Some(p_idx), Some(h_idx)) if p_idx == h_idx => {
-                        popup.hit_boxes.get(h_idx).map(|hb| hb.action.clone())
-                    }
-                    // Fallback if LBUTTONUP arrived without prior LBUTTONDOWN capture (e.g. synthetic tests).
-                    (None, Some(h_idx)) => popup.hit_boxes.get(h_idx).map(|hb| hb.action.clone()),
-                    _ => None,
-                }
-            };
-
-            let need_release = was_pressed.is_some() || drag_from.is_some();
-            let (need_invalidate, resize_rect, post_action) = if let Some(act) = action {
-                popup.execute_action(act)
-            } else if was_pressed.is_some() || was_drag_active {
+            let (need_invalidate, resize_rect, post_action) = if let Some(act) = outcome.action {
+                popup.execute_action(act, false)
+            } else if outcome.need_rerender_on_cancel {
                 (popup.rerender_cached(), None, None)
             } else {
                 (false, None, None)
@@ -1302,33 +1525,14 @@ unsafe extern "system" fn popup_wnd_proc(
             // Release RefCell borrow BEFORE ReleaseCapture() (sends WM_CAPTURECHANGED),
             // SetWindowPos() (sends WM_SIZE/WM_WINDOWPOSCHANGED), or ShellExecuteW().
             drop(popup);
-            if need_release {
+            if outcome.need_release {
                 let _ = ReleaseCapture();
             }
-            apply_resize_and_invalidate(hwnd, resize_rect, need_invalidate);
-            if let Some(post_act) = post_action {
-                let err = match post_act {
-                    PostBorrowAction::OpenUrl(url) => crate::updater::open_repo_url(&url).err(),
-                    PostBorrowAction::OpenConfig(snap) => {
-                        crate::ui::tray::open_config_in_editor(&snap).err()
-                    }
-                };
-                if let Some(err_msg) = err {
-                    if let Ok(mut p) = cell.try_borrow_mut() {
-                        let host_hwnd = p.host_hwnd;
-                        p.last_save_error = Some(err_msg);
-                        drop(p);
-                        let _ =
-                            PostMessageW(host_hwnd, WM_APP_CONFIG_CHANGED, WPARAM(0), LPARAM(0));
-                    }
-                }
-            }
+            finish_post_action(hwnd, cell, resize_rect, need_invalidate, post_action);
             return LRESULT(0);
         }
         WM_CAPTURECHANGED => {
-            let had_press = popup.pressed_idx.take().is_some();
-            let had_drag = popup.clear_metric_drag();
-            let need_invalidate = if had_press || had_drag {
+            let need_invalidate = if popup.interaction.on_capture_changed() {
                 popup.rerender_cached()
             } else {
                 false
@@ -1341,24 +1545,23 @@ unsafe extern "system" fn popup_wnd_proc(
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32;
-            let step = -(delta / 120.0) * 30.0;
-            let next = (popup.scroll_y + step).clamp(0.0, popup.max_scroll_y);
-            let need_invalidate = if (next - popup.scroll_y).abs() > 0.1 {
-                popup.scroll_y = next;
-                let mut ok = popup.rerender_cached();
-                // Re-evaluate hover hit-test against the newly scrolled hit_boxes so hover stays aligned.
-                let mut pt = POINT::default();
-                if GetCursorPos(&mut pt).is_ok() && ScreenToClient(hwnd, &mut pt).as_bool() {
-                    let next_hover = hit_test_pt(&popup.hit_boxes, popup.dpi, pt);
-                    if next_hover != popup.hovered_idx {
-                        popup.hovered_idx = next_hover;
-                        ok = popup.rerender_cached() || ok;
-                    }
-                }
-                ok
+            let (scrolled, cancelled_press) = popup.interaction.on_mouse_wheel(delta);
+            let mut need_invalidate = if scrolled || cancelled_press {
+                popup.rerender_cached()
             } else {
                 false
             };
+            if scrolled {
+                // Re-evaluate hover hit-test against the newly scrolled hit_boxes so hover stays aligned.
+                let mut pt = POINT::default();
+                if GetCursorPos(&mut pt).is_ok() && ScreenToClient(hwnd, &mut pt).as_bool() {
+                    let next_hover = hit_test_pt_id(&popup.interaction.hit_boxes, popup.dpi, pt);
+                    if next_hover != popup.interaction.hovered_id {
+                        popup.interaction.hovered_id = next_hover;
+                        need_invalidate = popup.rerender_cached() || need_invalidate;
+                    }
+                }
+            }
             drop(popup);
             if need_invalidate {
                 let _ = InvalidateRect(hwnd, None, false);
@@ -1374,8 +1577,7 @@ unsafe extern "system" fn popup_wnd_proc(
             return LRESULT(0);
         }
         WM_APP_POPUP_DEFERRED_REFRESH => {
-            popup.pressed_idx = None;
-            popup.clear_metric_drag();
+            popup.interaction.on_capture_changed();
             let need_invalidate = popup.rerender_cached();
             drop(popup);
             if need_invalidate {
@@ -1454,5 +1656,190 @@ fn monitor_info_for_point(pt: POINT, fallback_dpi: u32) -> (RECT, RECT, u32) {
     unsafe {
         let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         monitor_info_from_hmon(hmon, fallback_dpi)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+
+    fn make_hit_box(id: ControlId, action: PopupAction, top: f32, bottom: f32) -> HitBox {
+        HitBox {
+            id,
+            rect: D2D_RECT_F {
+                left: 20.0,
+                top,
+                right: 340.0,
+                bottom,
+            },
+            action,
+        }
+    }
+
+    #[test]
+    fn stable_click_id_prevents_misclick_after_snapshot_reorder() {
+        let mut inter = PopupInteraction {
+            hit_boxes: vec![
+                make_hit_box(
+                    ControlId::DeviceToggleHidden("dev-a".into()),
+                    PopupAction::ToggleHiddenDevice("dev-a".into()),
+                    100.0,
+                    130.0,
+                ),
+                make_hit_box(
+                    ControlId::DeviceToggleHidden("dev-b".into()),
+                    PopupAction::ToggleHiddenDevice("dev-b".into()),
+                    150.0,
+                    180.0,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        // Press on dev-a (index 0, y=115).
+        let (need_cap, _) = inter.on_lbutton_down(96, 100, 115, false);
+        assert!(need_cap);
+        assert_eq!(
+            inter.pressed_id,
+            Some(ControlId::DeviceToggleHidden("dev-a".into()))
+        );
+
+        // Background snapshot update removes dev-a, so dev-b shifts into index 0 at y=100..130!
+        inter.hit_boxes = vec![make_hit_box(
+            ControlId::DeviceToggleHidden("dev-b".into()),
+            PopupAction::ToggleHiddenDevice("dev-b".into()),
+            100.0,
+            130.0,
+        )];
+
+        // Releasing at y=115 MUST NOT trigger dev-b despite identical array index 0 and rect!
+        let outcome = inter.on_lbutton_up(96, 100, 115);
+        assert!(outcome.action.is_none());
+        assert!(outcome.need_release);
+        assert!(outcome.need_rerender_on_cancel);
+        assert_eq!(inter.pressed_id, None);
+    }
+
+    #[test]
+    fn lbutton_up_without_prior_press_never_triggers_action() {
+        let mut inter = PopupInteraction {
+            hit_boxes: vec![make_hit_box(
+                ControlId::OverviewRefreshWireless,
+                PopupAction::RefreshWireless,
+                100.0,
+                130.0,
+            )],
+            ..Default::default()
+        };
+
+        let outcome = inter.on_lbutton_up(96, 100, 115);
+        assert!(outcome.action.is_none());
+        assert!(!outcome.need_release);
+        assert!(!outcome.need_rerender_on_cancel);
+    }
+
+    #[test]
+    fn capture_changed_and_wheel_cancel_pressed_state() {
+        let mut inter = PopupInteraction {
+            max_scroll_y: 100.0,
+            hit_boxes: vec![make_hit_box(
+                ControlId::OverviewRefreshWireless,
+                PopupAction::RefreshWireless,
+                100.0,
+                130.0,
+            )],
+            ..Default::default()
+        };
+
+        inter.on_lbutton_down(96, 100, 115, false);
+        assert!(inter.on_capture_changed());
+        assert_eq!(inter.pressed_id, None);
+        assert!(inter.on_lbutton_up(96, 100, 115).action.is_none());
+
+        inter.on_lbutton_down(96, 100, 115, false);
+        let (scrolled, cancelled) = inter.on_mouse_wheel(-120.0);
+        assert!(scrolled);
+        assert!(cancelled);
+        assert_eq!(inter.pressed_id, None);
+        assert!(inter.on_lbutton_up(96, 100, 115).action.is_none());
+    }
+
+    #[test]
+    fn keyboard_focus_traversal_and_activation_via_interaction() {
+        let mut inter = PopupInteraction {
+            max_scroll_y: 120.0,
+            focus_items: vec![
+                FocusItem {
+                    id: ControlId::Tab(PopupTab::Overview),
+                    rect: D2D_RECT_F {
+                        left: 200.0,
+                        top: 8.0,
+                        right: 248.0,
+                        bottom: 34.0,
+                    },
+                    action: PopupAction::SwitchTab(PopupTab::Overview),
+                    in_viewport: false,
+                },
+                FocusItem {
+                    id: ControlId::OverviewToggleHardware,
+                    rect: D2D_RECT_F {
+                        left: 260.0,
+                        top: 520.0,
+                        right: 336.0,
+                        bottom: 546.0,
+                    },
+                    action: PopupAction::ToggleHardwareEnabled,
+                    in_viewport: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(inter.move_focus(FocusNavDir::Next, 468.0));
+        assert_eq!(inter.focused_id, Some(ControlId::Tab(PopupTab::Overview)));
+        assert_eq!(
+            inter.focused_action(),
+            Some(PopupAction::SwitchTab(PopupTab::Overview))
+        );
+
+        assert!(inter.move_focus(FocusNavDir::Next, 468.0));
+        assert_eq!(inter.focused_id, Some(ControlId::OverviewToggleHardware));
+        assert_eq!(
+            inter.focused_action(),
+            Some(PopupAction::ToggleHardwareEnabled)
+        );
+        assert!((inter.scroll_y - 84.0).abs() < 0.01);
+
+        assert!(inter.move_focus(FocusNavDir::Prev, 468.0));
+        assert_eq!(inter.focused_id, Some(ControlId::Tab(PopupTab::Overview)));
+    }
+
+    #[test]
+    fn cancel_active_update_sets_flag_bumps_gen_and_allows_retry() {
+        let status = Mutex::new(UpdateStatus::Downloading {
+            latest: "0.2.0".into(),
+            downloaded_bytes: 512,
+            total_bytes: Some(1024),
+        });
+        let flag = AtomicBool::new(false);
+        let gen = AtomicU64::new(1);
+
+        assert!(cancel_active_update(&status, &flag, &gen));
+        assert!(flag.load(Ordering::Acquire));
+        assert_eq!(gen.load(Ordering::Acquire), 2);
+        let mut guard = status.lock().unwrap();
+        assert!(matches!(*guard, UpdateStatus::Error(_)));
+        assert!(try_begin_update_check(&mut guard));
+        assert_eq!(*guard, UpdateStatus::Checking);
+        drop(guard);
+
+        // Applying or Idle cannot be cancelled.
+        *status.lock().unwrap() = UpdateStatus::Applying {
+            latest: "0.2.0".into(),
+        };
+        let flag2 = AtomicBool::new(false);
+        assert!(!cancel_active_update(&status, &flag2, &gen));
+        assert!(!flag2.load(Ordering::Acquire));
     }
 }

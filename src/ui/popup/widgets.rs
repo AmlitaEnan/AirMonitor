@@ -13,13 +13,15 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 
 use crate::config::{AnchorEdge, CombinedOrder, HwMetric, LayoutMode};
-use crate::state::{format_speed_full, MonitorSnapshot, SubBatteries, WirelessDevice};
+use crate::state::{MonitorSnapshot, SubBatteries, WirelessDevice};
 use crate::ui::popup::layout::{
     compute_about_layout, compute_overview_layout, compute_settings_layout, format_bytes_compact,
-    format_update_meta, measure_content_height, HitBox, MetricSlotRect, PopupAction, PopupTab,
-    SettingsBodyLayout, SettingsSubTab, CARD_PAD, HEADER_HEIGHT, HW_DIVIDER_GAP, HW_GPU_ROW_H,
-    HW_GPU_TITLE_H, HW_PRE_DIVIDER_GAP, HW_ROW_BAT_H, HW_ROW_CPU_EXT_H, HW_ROW_CPU_H,
-    HW_ROW_DISK_H, HW_ROW_MEM_H, HW_ROW_NET_H, HW_ROW_NIC_H, PAD_X,
+    format_overview_cpu_value, format_overview_mem_value, format_overview_net_value,
+    format_overview_nic_value, format_update_meta, measure_content_height, ControlId, FocusItem,
+    HitBox, MetricSlotRect, PopupAction, PopupTab, SettingsBodyLayout, SettingsSubTab, CARD_PAD,
+    HEADER_HEIGHT, HW_DIVIDER_GAP, HW_GPU_ROW_H, HW_GPU_TITLE_H, HW_PRE_DIVIDER_GAP, HW_ROW_ACPI_H,
+    HW_ROW_BAT_H, HW_ROW_CPU_EXT_H, HW_ROW_CPU_H, HW_ROW_DISK_H, HW_ROW_MEM_H, HW_ROW_NET_H,
+    HW_ROW_NIC_H, PAD_X,
 };
 use crate::ui::renderer::{draw_device_icon_with_factory, format_device_battery, format_hw_metric};
 use crate::ui::text::{create_text_format, draw_text_clipped};
@@ -195,11 +197,13 @@ pub(crate) struct SceneInput<'a> {
     pub has_dwm_border: bool,
     pub logical_w: f32,
     pub logical_h: f32,
-    pub hovered_idx: Option<usize>,
-    pub pressed_idx: Option<usize>,
+    pub hovered_id: Option<&'a ControlId>,
+    pub pressed_id: Option<&'a ControlId>,
+    pub focused_id: Option<&'a ControlId>,
     pub scroll_y: &'a mut f32,
     pub max_scroll_y: &'a mut f32,
     pub hit_boxes: &'a mut Vec<HitBox>,
+    pub focus_items: &'a mut Vec<FocusItem>,
     pub metric_slot_rects: &'a mut Vec<MetricSlotRect>,
     pub utf16_buf: &'a mut Vec<u16>,
 }
@@ -335,6 +339,7 @@ unsafe fn draw_header(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
     draw_pill_button(
         ctx,
         p,
+        ControlId::Tab(PopupTab::Overview),
         overview_rect,
         "概览",
         ctx.active_tab == PopupTab::Overview,
@@ -344,6 +349,7 @@ unsafe fn draw_header(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
     draw_pill_button(
         ctx,
         p,
+        ControlId::Tab(PopupTab::Settings),
         settings_rect,
         "设置",
         ctx.active_tab == PopupTab::Settings,
@@ -353,6 +359,7 @@ unsafe fn draw_header(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
     draw_pill_button(
         ctx,
         p,
+        ControlId::Tab(PopupTab::About),
         about_rect,
         "关于",
         ctx.active_tab == PopupTab::About,
@@ -379,177 +386,262 @@ unsafe fn draw_header(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
 unsafe fn draw_overview_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
     let layout = compute_overview_layout(ctx.snapshot, ctx.logical_w, *ctx.scroll_y);
 
-    // Card 1: Hardware Telemetry
+    // Card 1: Hardware Telemetry (or disabled placeholder)
     draw_card(ctx.rt, ctx.brush, p, layout.hw_card_rect);
 
     let inner_x = PAD_X + CARD_PAD;
     let inner_r = PAD_X + layout.card_w - CARD_PAD;
-    let mut cy = layout.hw_card_rect.top + 10.0;
 
-    draw_text_clipped(
-        ctx.rt,
-        ctx.brush,
-        ctx.utf16_buf,
-        "硬件遥测",
-        &ctx.fonts.section_fmt,
-        &p.text_primary,
-        D2D_RECT_F {
-            left: inner_x,
-            top: cy,
-            right: inner_x + 76.0,
-            bottom: cy + 20.0,
-        },
-    );
-    draw_text_clipped(
-        ctx.rt,
-        ctx.brush,
-        ctx.utf16_buf,
-        &layout.hw_spec.provider_summary,
-        &ctx.fonts.small_right_fmt,
-        &p.text_muted,
-        D2D_RECT_F {
-            left: inner_x + 76.0,
-            top: cy + 2.0,
-            right: inner_r,
-            bottom: cy + 20.0,
-        },
-    );
-    cy += 24.0;
-
-    let hw = &ctx.snapshot.hw;
-    let cpu_freq = hw
-        .cpu_freq_ghz
-        .map(|f| format!("{:.2} GHz", f))
-        .unwrap_or_else(|| "--".to_string());
-    draw_kv_row(
-        ctx,
-        p,
-        (inner_x, inner_r),
-        cy,
-        "CPU",
-        &format!("{:.1}%  ({})", hw.cpu_usage_pct, cpu_freq),
-    );
-    cy += HW_ROW_CPU_H;
-
-    if let Some(cpu_ext) = &layout.hw_spec.cpu_ext_line {
-        draw_kv_row(ctx, p, (inner_x, inner_r), cy, "详情", cpu_ext);
-        cy += HW_ROW_CPU_EXT_H;
-    }
-
-    draw_kv_row(
-        ctx,
-        p,
-        (inner_x, inner_r),
-        cy,
-        "内存",
-        &format!(
-            "{:.1}%  ({:.1} / {:.1} GB)",
-            hw.mem_usage_pct, hw.mem_used_gb, hw.mem_total_gb
-        ),
-    );
-    cy += HW_ROW_MEM_H;
-
-    let nic = if hw.net_adapter_name.is_empty() {
-        "未连接"
-    } else {
-        &hw.net_adapter_name
-    };
-    draw_kv_row(ctx, p, (inner_x, inner_r), cy, "网卡", nic);
-    cy += HW_ROW_NIC_H;
-
-    draw_kv_row(
-        ctx,
-        p,
-        (inner_x, inner_r),
-        cy,
-        "网速",
-        &format!(
-            "↑ {}   ↓ {}",
-            format_speed_full(hw.net_up_bps),
-            format_speed_full(hw.net_down_bps)
-        ),
-    );
-    cy += HW_ROW_NET_H;
-
-    if let Some(disk_line) = &layout.hw_spec.disk_line {
-        draw_kv_row(ctx, p, (inner_x, inner_r), cy, "磁盘", disk_line);
-        cy += HW_ROW_DISK_H;
-    }
-
-    if let Some(bat_line) = &layout.hw_spec.sys_battery_line {
-        draw_kv_row(ctx, p, (inner_x, inner_r), cy, "电池", bat_line);
-        cy += HW_ROW_BAT_H;
-    }
-
-    cy += HW_PRE_DIVIDER_GAP;
-    ctx.brush.SetColor(&p.divider);
-    ctx.rt.DrawLine(
-        D2D_POINT_2F { x: inner_x, y: cy },
-        D2D_POINT_2F { x: inner_r, y: cy },
-        ctx.brush,
-        1.0,
-        None,
-    );
-    cy += HW_DIVIDER_GAP;
-
-    let gpu_title = if hw.gpu_name.is_empty() {
-        "GPU: --"
-    } else {
-        &hw.gpu_name
-    };
-    draw_text_clipped(
-        ctx.rt,
-        ctx.brush,
-        ctx.utf16_buf,
-        gpu_title,
-        &ctx.fonts.body_bold_fmt,
-        &p.text_primary,
-        D2D_RECT_F {
-            left: inner_x,
-            top: cy,
-            right: inner_r,
-            bottom: cy + 18.0,
-        },
-    );
-    cy += HW_GPU_TITLE_H;
-
-    let mid_x = (inner_x + inner_r) * 0.5 - 6.0;
-    let right_col_x = mid_x + 14.0;
-    for pair in layout.hw_spec.gpu_items.chunks(2) {
-        let (k1, v1) = &pair[0];
-        draw_kv_row(ctx, p, (inner_x, mid_x), cy, k1, v1);
-        if let Some((k2, v2)) = pair.get(1) {
-            draw_kv_row(ctx, p, (right_col_x, inner_r), cy, k2, v2);
+    if !ctx.snapshot.config.hardware_enabled {
+        let text_r = layout
+            .hw_enable_btn_rect
+            .map_or(inner_r, |b| (b.left - 10.0).max(inner_x + 1.0));
+        draw_text_clipped(
+            ctx.rt,
+            ctx.brush,
+            ctx.utf16_buf,
+            "硬件监测已关闭",
+            &ctx.fonts.body_bold_fmt,
+            &p.text_primary,
+            D2D_RECT_F {
+                left: inner_x,
+                top: layout.hw_card_rect.top + 11.0,
+                right: text_r,
+                bottom: layout.hw_card_rect.top + 29.0,
+            },
+        );
+        draw_text_clipped(
+            ctx.rt,
+            ctx.brush,
+            ctx.utf16_buf,
+            "后台硬件采集已停止并释放资源",
+            &ctx.fonts.small_fmt,
+            &p.text_muted,
+            D2D_RECT_F {
+                left: inner_x,
+                top: layout.hw_card_rect.top + 31.0,
+                right: text_r,
+                bottom: layout.hw_card_rect.top + 48.0,
+            },
+        );
+        if let Some(btn_rect) = layout.hw_enable_btn_rect {
+            draw_pill_button(
+                ctx,
+                p,
+                ControlId::OverviewToggleHardware,
+                btn_rect,
+                "立即开启",
+                true,
+                PopupAction::ToggleHardwareEnabled,
+                true,
+            );
         }
-        cy += HW_GPU_ROW_H;
+    } else {
+        let mut cy = layout.hw_card_rect.top + 10.0;
+
+        draw_text_clipped(
+            ctx.rt,
+            ctx.brush,
+            ctx.utf16_buf,
+            "硬件遥测",
+            &ctx.fonts.section_fmt,
+            &p.text_primary,
+            D2D_RECT_F {
+                left: inner_x,
+                top: cy,
+                right: inner_x + 76.0,
+                bottom: cy + 20.0,
+            },
+        );
+        draw_text_clipped(
+            ctx.rt,
+            ctx.brush,
+            ctx.utf16_buf,
+            &layout.hw_spec.provider_summary,
+            &ctx.fonts.small_right_fmt,
+            &p.text_muted,
+            D2D_RECT_F {
+                left: inner_x + 76.0,
+                top: cy + 2.0,
+                right: inner_r,
+                bottom: cy + 20.0,
+            },
+        );
+        cy += 24.0;
+
+        let hw = &ctx.snapshot.hw;
+        let cpu_val = format_overview_cpu_value(hw);
+        draw_kv_row(ctx, p, (inner_x, inner_r), cy, "CPU", &cpu_val);
+        cy += HW_ROW_CPU_H;
+
+        if let Some(cpu_ext) = &layout.hw_spec.cpu_ext_line {
+            draw_kv_row(ctx, p, (inner_x, inner_r), cy, "详情", cpu_ext);
+            cy += HW_ROW_CPU_EXT_H;
+        }
+
+        if let Some(acpi_temp) = &layout.hw_spec.acpi_temp_line {
+            draw_kv_row_with_key_width(
+                ctx,
+                p,
+                (inner_x, inner_r),
+                cy,
+                "主板/ACPI 热区",
+                acpi_temp,
+                114.0,
+            );
+            cy += HW_ROW_ACPI_H;
+        }
+
+        let mem_val = format_overview_mem_value(hw);
+        draw_kv_row(ctx, p, (inner_x, inner_r), cy, "内存", &mem_val);
+        cy += HW_ROW_MEM_H;
+
+        let nic = format_overview_nic_value(hw);
+        draw_kv_row(ctx, p, (inner_x, inner_r), cy, "网卡", nic);
+        cy += HW_ROW_NIC_H;
+
+        let net_val = format_overview_net_value(hw);
+        draw_kv_row(ctx, p, (inner_x, inner_r), cy, "网速", &net_val);
+        cy += HW_ROW_NET_H;
+
+        if let Some(disk_line) = &layout.hw_spec.disk_line {
+            draw_kv_row(ctx, p, (inner_x, inner_r), cy, "磁盘", disk_line);
+            cy += HW_ROW_DISK_H;
+        }
+
+        if let Some(bat_line) = &layout.hw_spec.sys_battery_line {
+            draw_kv_row(ctx, p, (inner_x, inner_r), cy, "电池", bat_line);
+            cy += HW_ROW_BAT_H;
+        }
+
+        cy += HW_PRE_DIVIDER_GAP;
+        ctx.brush.SetColor(&p.divider);
+        ctx.rt.DrawLine(
+            D2D_POINT_2F { x: inner_x, y: cy },
+            D2D_POINT_2F { x: inner_r, y: cy },
+            ctx.brush,
+            1.0,
+            None,
+        );
+        cy += HW_DIVIDER_GAP;
+
+        let gpu_title = if hw.gpu_name.is_empty() {
+            "GPU: --"
+        } else {
+            &hw.gpu_name
+        };
+        draw_text_clipped(
+            ctx.rt,
+            ctx.brush,
+            ctx.utf16_buf,
+            gpu_title,
+            &ctx.fonts.body_bold_fmt,
+            &p.text_primary,
+            D2D_RECT_F {
+                left: inner_x,
+                top: cy,
+                right: inner_r,
+                bottom: cy + 18.0,
+            },
+        );
+        cy += HW_GPU_TITLE_H;
+
+        let mid_x = (inner_x + inner_r) * 0.5 - 6.0;
+        let right_col_x = mid_x + 14.0;
+        for pair in layout.hw_spec.gpu_items.chunks(2) {
+            let (k1, v1) = &pair[0];
+            draw_kv_row(ctx, p, (inner_x, mid_x), cy, k1, v1);
+            if let Some((k2, v2)) = pair.get(1) {
+                draw_kv_row(ctx, p, (right_col_x, inner_r), cy, k2, v2);
+            }
+            cy += HW_GPU_ROW_H;
+        }
     }
 
-    // Wireless section header + Refresh button
+    // Wireless section header + optional Refresh button
+    let wl_header_text = if ctx.snapshot.config.wireless_enabled {
+        format!("无线设备 ({})", layout.device_cards.len())
+    } else {
+        "无线设备".to_string()
+    };
+    let wl_header_right = layout
+        .refresh_rect
+        .map_or(PAD_X + layout.card_w, |r| r.left - 8.0);
     draw_text_clipped(
         ctx.rt,
         ctx.brush,
         ctx.utf16_buf,
-        &format!("无线设备 ({})", layout.device_cards.len()),
+        &wl_header_text,
         &ctx.fonts.section_fmt,
         &p.text_primary,
         D2D_RECT_F {
             left: PAD_X + 2.0,
             top: layout.wireless_header_y + 2.0,
-            right: layout.refresh_rect.left - 8.0,
+            right: wl_header_right,
             bottom: layout.wireless_header_y + 24.0,
         },
     );
-    draw_pill_button(
-        ctx,
-        p,
-        layout.refresh_rect,
-        "刷新设备",
-        false,
-        PopupAction::RefreshWireless,
-        true,
-    );
+    if let Some(refresh_rect) = layout.refresh_rect {
+        draw_pill_button(
+            ctx,
+            p,
+            ControlId::OverviewRefreshWireless,
+            refresh_rect,
+            "刷新设备",
+            false,
+            PopupAction::RefreshWireless,
+            true,
+        );
+    }
 
-    if let Some(empty_rect) = layout.empty_rect {
+    if let Some(disabled_rect) = layout.wireless_disabled_rect {
+        draw_card(ctx.rt, ctx.brush, p, disabled_rect);
+        let text_r = layout
+            .wireless_enable_btn_rect
+            .map_or(disabled_rect.right - CARD_PAD, |b| {
+                (b.left - 10.0).max(disabled_rect.left + CARD_PAD + 1.0)
+            });
+        draw_text_clipped(
+            ctx.rt,
+            ctx.brush,
+            ctx.utf16_buf,
+            "无线设备监测已关闭",
+            &ctx.fonts.body_bold_fmt,
+            &p.text_primary,
+            D2D_RECT_F {
+                left: disabled_rect.left + CARD_PAD,
+                top: disabled_rect.top + 11.0,
+                right: text_r,
+                bottom: disabled_rect.top + 29.0,
+            },
+        );
+        draw_text_clipped(
+            ctx.rt,
+            ctx.brush,
+            ctx.utf16_buf,
+            "后台无线轮询与低电量提醒已暂停",
+            &ctx.fonts.small_fmt,
+            &p.text_muted,
+            D2D_RECT_F {
+                left: disabled_rect.left + CARD_PAD,
+                top: disabled_rect.top + 31.0,
+                right: text_r,
+                bottom: disabled_rect.top + 48.0,
+            },
+        );
+        if let Some(btn_rect) = layout.wireless_enable_btn_rect {
+            draw_pill_button(
+                ctx,
+                p,
+                ControlId::OverviewToggleWireless,
+                btn_rect,
+                "立即开启",
+                true,
+                PopupAction::ToggleWirelessEnabled,
+                true,
+            );
+        }
+    } else if let Some(empty_rect) = layout.empty_rect {
         draw_card(ctx.rt, ctx.brush, p, empty_rect);
         draw_text_clipped(
             ctx.rt,
@@ -665,6 +757,7 @@ unsafe fn draw_device_card_contents(
     draw_pill_button(
         ctx,
         p,
+        ControlId::DeviceToggleHidden(dev.id.clone()),
         hide_rect,
         if is_hidden { "显示" } else { "隐藏" },
         is_hidden,
@@ -794,16 +887,19 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
         layout.sub_nav_rect,
         [
             (
+                ControlId::SettingsSubTab(SettingsSubTab::Metrics),
                 "显示指标",
                 ctx.settings_sub_tab == SettingsSubTab::Metrics,
                 PopupAction::SwitchSettingsSubTab(SettingsSubTab::Metrics),
             ),
             (
+                ControlId::SettingsSubTab(SettingsSubTab::Layout),
                 "布局停靠",
                 ctx.settings_sub_tab == SettingsSubTab::Layout,
                 PopupAction::SwitchSettingsSubTab(SettingsSubTab::Layout),
             ),
             (
+                ControlId::SettingsSubTab(SettingsSubTab::General),
                 "通用选项",
                 ctx.settings_sub_tab == SettingsSubTab::General,
                 PopupAction::SwitchSettingsSubTab(SettingsSubTab::General),
@@ -813,6 +909,37 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
 
     match &layout.body {
         SettingsBodyLayout::Metrics(m) => {
+            if let (Some(banner_rect), Some(btn_rect)) =
+                (m.disabled_banner_rect, m.disabled_enable_btn_rect)
+            {
+                draw_card(ctx.rt, ctx.brush, p, banner_rect);
+                let inner_x = banner_rect.left + CARD_PAD;
+                draw_text_clipped(
+                    ctx.rt,
+                    ctx.brush,
+                    ctx.utf16_buf,
+                    "硬件监测已关闭，开启后以下指标配置生效",
+                    &ctx.fonts.small_fmt,
+                    &p.orange,
+                    D2D_RECT_F {
+                        left: inner_x,
+                        top: banner_rect.top,
+                        right: (btn_rect.left - 8.0).max(inner_x + 1.0),
+                        bottom: banner_rect.bottom,
+                    },
+                );
+                draw_pill_button(
+                    ctx,
+                    p,
+                    ControlId::SettingsMetricsToggleHardware,
+                    btn_rect,
+                    "立即开启",
+                    true,
+                    PopupAction::ToggleHardwareEnabled,
+                    true,
+                );
+            }
+
             // Card 1: WYSIWYG 2-row horizontal taskbar grid + spatial action bar
             draw_card(ctx.rt, ctx.brush, p, m.grid_card_rect);
             draw_text_clipped(
@@ -824,18 +951,24 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 &p.text_primary,
                 m.grid_title_rect,
             );
+            let (grid_sub_text, grid_sub_color) = if cfg.hardware_enabled {
+                ("格子位置与任务栏上下/左右完全一致", &p.text_muted)
+            } else {
+                ("硬件监测已关闭 · 仅预览排布，开启后生效", &p.orange)
+            };
             draw_text_clipped(
                 ctx.rt,
                 ctx.brush,
                 ctx.utf16_buf,
-                "格子位置与任务栏上下/左右完全一致",
+                grid_sub_text,
                 &ctx.fonts.small_fmt,
-                &p.text_muted,
+                grid_sub_color,
                 m.grid_subtitle_rect,
             );
             draw_pill_button(
                 ctx,
                 p,
+                ControlId::ResetDefaultMetrics,
                 m.reset_btn_rect,
                 "恢复默认",
                 false,
@@ -878,8 +1011,8 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                         && !is_drag_src;
                     let is_selected = sel == Some(slot.index);
 
-                    let hit_idx = ctx.hit_boxes.len();
-                    let hovered = !ctx.drag_metric_active && ctx.hovered_idx == Some(hit_idx);
+                    let slot_id = ControlId::MetricSlot(slot.index);
+                    let hovered = !ctx.drag_metric_active && ctx.hovered_id == Some(&slot_id);
 
                     let cell_rr = D2D1_ROUNDED_RECT {
                         rect: slot.rect,
@@ -1005,8 +1138,12 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                             rect: clipped,
                         });
                     }
+                    if ctx.focused_id == Some(&slot_id) {
+                        draw_focus_ring(ctx, p, slot.rect, 6.0);
+                    }
                     register_hit(
                         ctx,
+                        slot_id,
                         slot.rect,
                         PopupAction::SelectMetricSlot(slot.index),
                         true,
@@ -1045,6 +1182,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             draw_action_pill(
                 ctx,
                 p,
+                ControlId::MetricMoveLeft,
                 m.act_left_rect,
                 "← 左移",
                 can_left,
@@ -1054,6 +1192,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             draw_action_pill(
                 ctx,
                 p,
+                ControlId::MetricSwapRow,
                 m.act_swap_row_rect,
                 "⇅ 上下",
                 can_swap_row,
@@ -1063,6 +1202,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             draw_action_pill(
                 ctx,
                 p,
+                ControlId::MetricMoveRight,
                 m.act_right_rect,
                 "右移 →",
                 can_right,
@@ -1072,6 +1212,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             draw_action_pill(
                 ctx,
                 p,
+                ControlId::MetricRemove,
                 m.act_remove_rect,
                 "× 移除",
                 can_remove,
@@ -1118,6 +1259,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             }
         }
         SettingsBodyLayout::Layout(l) => {
+            let effective_mode = cfg.effective_layout_mode();
             // Card 1: Display mode
             draw_card(ctx.rt, ctx.brush, p, l.mode_card_rect);
             draw_text_clipped(
@@ -1129,13 +1271,20 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 &p.text_primary,
                 l.mode_title_rect,
             );
+            let (mode_sub_text, mode_sub_color) = match (cfg.hardware_enabled, cfg.wireless_enabled)
+            {
+                (false, false) => ("硬件与无线监测均已关闭，任务栏浮条已隐藏", &p.orange),
+                (false, true) => ("硬件监测已关闭（当前任务栏仅显示无线设备区）", &p.orange),
+                (true, false) => ("无线监测已关闭（当前任务栏仅显示硬件区）", &p.orange),
+                (true, true) => ("选择任务栏硬件监控与无线电量的组合方式", &p.text_muted),
+            };
             draw_text_clipped(
                 ctx.rt,
                 ctx.brush,
                 ctx.utf16_buf,
-                "选择任务栏硬件监控与无线电量的组合方式",
+                mode_sub_text,
                 &ctx.fonts.small_fmt,
-                &p.text_muted,
+                mode_sub_color,
                 l.mode_subtitle_rect,
             );
             draw_segmented_bar(
@@ -1144,23 +1293,27 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 l.mode_seg_rect,
                 [
                     (
+                        ControlId::LayoutMode(LayoutMode::Combined),
                         "合并",
-                        cfg.layout_mode == LayoutMode::Combined,
+                        effective_mode == Some(LayoutMode::Combined),
                         PopupAction::SetLayout(LayoutMode::Combined, None),
                     ),
                     (
+                        ControlId::LayoutMode(LayoutMode::Split),
                         "分体",
-                        cfg.layout_mode == LayoutMode::Split,
+                        effective_mode == Some(LayoutMode::Split),
                         PopupAction::SetLayout(LayoutMode::Split, None),
                     ),
                     (
+                        ControlId::LayoutMode(LayoutMode::HardwareOnly),
                         "仅硬件",
-                        cfg.layout_mode == LayoutMode::HardwareOnly,
+                        effective_mode == Some(LayoutMode::HardwareOnly),
                         PopupAction::SetLayout(LayoutMode::HardwareOnly, None),
                     ),
                     (
+                        ControlId::LayoutMode(LayoutMode::DevicesOnly),
                         "仅设备",
-                        cfg.layout_mode == LayoutMode::DevicesOnly,
+                        effective_mode == Some(LayoutMode::DevicesOnly),
                         PopupAction::SetLayout(LayoutMode::DevicesOnly, None),
                     ),
                 ],
@@ -1198,6 +1351,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 draw_pill_button(
                     ctx,
                     p,
+                    ControlId::CombinedOrder(CombinedOrder::DevicesFirst),
                     dev_rect,
                     "设备在左 · 硬件在右",
                     cfg.combined_order == CombinedOrder::DevicesFirst,
@@ -1207,6 +1361,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 draw_pill_button(
                     ctx,
                     p,
+                    ControlId::CombinedOrder(CombinedOrder::HardwareFirst),
                     hw_rect,
                     "硬件在左 · 设备在右",
                     cfg.combined_order == CombinedOrder::HardwareFirst,
@@ -1239,6 +1394,27 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 l.dock_subtitle_rect,
             );
 
+            if let Some(disabled_box) = l.disabled_box_rect {
+                let d_rr = D2D1_ROUNDED_RECT {
+                    rect: disabled_box,
+                    radiusX: 6.0,
+                    radiusY: 6.0,
+                };
+                ctx.brush.SetColor(&p.track_bg);
+                ctx.rt.FillRoundedRectangle(&d_rr, ctx.brush);
+                ctx.brush.SetColor(&p.card_border);
+                ctx.rt.DrawRoundedRectangle(&d_rr, ctx.brush, 1.0, None);
+                draw_text_clipped(
+                    ctx.rt,
+                    ctx.brush,
+                    ctx.utf16_buf,
+                    "硬件与无线设备监测均已关闭，任务栏无停靠浮条",
+                    &ctx.fonts.small_center_fmt,
+                    &p.text_muted,
+                    disabled_box,
+                );
+            }
+
             for z in &l.zones {
                 let zone_cfg = if z.is_combined {
                     &cfg.combined_zone
@@ -1269,6 +1445,11 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 draw_pill_button(
                     ctx,
                     p,
+                    ControlId::ZoneAnchor {
+                        is_devices: z.is_devices,
+                        is_combined: z.is_combined,
+                        anchor: AnchorEdge::Left,
+                    },
                     z.left_anchor_rect,
                     "左锚",
                     zone_cfg.anchor == AnchorEdge::Left,
@@ -1282,6 +1463,11 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 draw_pill_button(
                     ctx,
                     p,
+                    ControlId::ZoneAnchor {
+                        is_devices: z.is_devices,
+                        is_combined: z.is_combined,
+                        anchor: AnchorEdge::Right,
+                    },
                     z.right_anchor_rect,
                     "右锚",
                     zone_cfg.anchor == AnchorEdge::Right,
@@ -1307,10 +1493,20 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                     p,
                     z.stepper_rect,
                     &format!("{}px", zone_cfg.offset_x),
+                    ControlId::ZoneOffsetStep {
+                        is_devices: z.is_devices,
+                        is_combined: z.is_combined,
+                        delta: -4,
+                    },
                     PopupAction::StepOffset {
                         is_devices: z.is_devices,
                         is_combined: z.is_combined,
                         delta: -4,
+                    },
+                    ControlId::ZoneOffsetStep {
+                        is_devices: z.is_devices,
+                        is_combined: z.is_combined,
+                        delta: 4,
                     },
                     PopupAction::StepOffset {
                         is_devices: z.is_devices,
@@ -1321,6 +1517,10 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 draw_pill_button(
                     ctx,
                     p,
+                    ControlId::ZoneOffsetReset {
+                        is_devices: z.is_devices,
+                        is_combined: z.is_combined,
+                    },
                     z.reset_rect,
                     "归零",
                     false,
@@ -1344,6 +1544,38 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 &p.text_primary,
                 g.collect_title_rect,
             );
+            draw_toggle_switch(
+                ctx,
+                p,
+                ControlId::GeneralToggleHardware,
+                g.hw_enabled_row.row_rect,
+                g.hw_enabled_row.title_rect,
+                g.hw_enabled_row.subtitle_rect,
+                g.hw_enabled_row.control_rect,
+                "硬件监测",
+                if cfg.hardware_enabled {
+                    "开启任务栏与浮窗硬件遥测采集"
+                } else {
+                    "已关闭：后台硬件采集已停止并释放资源"
+                },
+                cfg.hardware_enabled,
+                PopupAction::ToggleHardwareEnabled,
+            );
+
+            ctx.brush.SetColor(&p.divider);
+            ctx.rt.DrawLine(
+                D2D_POINT_2F {
+                    x: g.collect_title_rect.left,
+                    y: g.collect_div0_y,
+                },
+                D2D_POINT_2F {
+                    x: g.collect_title_rect.right,
+                    y: g.collect_div0_y,
+                },
+                ctx.brush,
+                1.0,
+                None,
+            );
             draw_text_clipped(
                 ctx.rt,
                 ctx.brush,
@@ -1357,9 +1589,17 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 ctx.rt,
                 ctx.brush,
                 ctx.utf16_buf,
-                "间隔越长，后台唤醒越少",
+                if cfg.hardware_enabled {
+                    "间隔越长，后台唤醒越少"
+                } else {
+                    "硬件监测已关闭，开启后恢复轮询"
+                },
                 &ctx.fonts.small_fmt,
-                &p.text_muted,
+                if cfg.hardware_enabled {
+                    &p.text_muted
+                } else {
+                    &p.orange
+                },
                 g.poll_row.subtitle_rect,
             );
             draw_stepper(
@@ -1367,7 +1607,9 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 p,
                 g.poll_row.control_rect,
                 &format!("{:.1}s", cfg.hw_poll_interval_ms as f64 / 1000.0),
+                ControlId::HwPollStep(-1),
                 PopupAction::StepHwPollInterval(-1),
+                ControlId::HwPollStep(1),
                 PopupAction::StepHwPollInterval(1),
             );
 
@@ -1388,6 +1630,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             draw_toggle_switch(
                 ctx,
                 p,
+                ControlId::ToggleExternalSensors,
                 g.ext_sensors_row.row_rect,
                 g.ext_sensors_row.title_rect,
                 g.ext_sensors_row.subtitle_rect,
@@ -1415,6 +1658,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             draw_toggle_switch(
                 ctx,
                 p,
+                ControlId::ToggleHideUnavailableMetrics,
                 g.hide_unavail_row.row_rect,
                 g.hide_unavail_row.title_rect,
                 g.hide_unavail_row.subtitle_rect,
@@ -1436,6 +1680,38 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 &p.text_primary,
                 g.device_title_rect,
             );
+            draw_toggle_switch(
+                ctx,
+                p,
+                ControlId::GeneralToggleWireless,
+                g.wl_enabled_row.row_rect,
+                g.wl_enabled_row.title_rect,
+                g.wl_enabled_row.subtitle_rect,
+                g.wl_enabled_row.control_rect,
+                "无线设备监测",
+                if cfg.wireless_enabled {
+                    "轮询 2.4G / 蓝牙 / Xbox 无线外设电量"
+                } else {
+                    "已关闭：后台无线轮询已停止并释放资源"
+                },
+                cfg.wireless_enabled,
+                PopupAction::ToggleWirelessEnabled,
+            );
+
+            ctx.brush.SetColor(&p.divider);
+            ctx.rt.DrawLine(
+                D2D_POINT_2F {
+                    x: g.device_title_rect.left,
+                    y: g.device_div0_y,
+                },
+                D2D_POINT_2F {
+                    x: g.device_title_rect.right,
+                    y: g.device_div0_y,
+                },
+                ctx.brush,
+                1.0,
+                None,
+            );
             draw_text_clipped(
                 ctx.rt,
                 ctx.brush,
@@ -1449,9 +1725,17 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 ctx.rt,
                 ctx.brush,
                 ctx.utf16_buf,
-                "低于该电量时弹窗并变色警告",
+                if !cfg.wireless_enabled {
+                    "无线监测已关闭，低电量提醒已暂停"
+                } else {
+                    "低于该电量时弹窗并变色警告"
+                },
                 &ctx.fonts.small_fmt,
-                &p.text_muted,
+                if !cfg.wireless_enabled {
+                    &p.orange
+                } else {
+                    &p.text_muted
+                },
                 g.low_bat_row.subtitle_rect,
             );
             draw_stepper(
@@ -1459,7 +1743,9 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 p,
                 g.low_bat_row.control_rect,
                 &format!("{}%", cfg.low_battery_threshold),
+                ControlId::LowBatteryStep(-5),
                 PopupAction::StepLowThreshold(-5),
+                ControlId::LowBatteryStep(5),
                 PopupAction::StepLowThreshold(5),
             );
 
@@ -1480,6 +1766,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             draw_toggle_switch(
                 ctx,
                 p,
+                ControlId::ToggleHideUnknownBattery,
                 g.hide_unknown_row.row_rect,
                 g.hide_unknown_row.title_rect,
                 g.hide_unknown_row.subtitle_rect,
@@ -1507,6 +1794,7 @@ unsafe fn draw_settings_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             draw_toggle_switch(
                 ctx,
                 p,
+                ControlId::ToggleAutostart,
                 g.autostart_row.row_rect,
                 g.autostart_row.title_rect,
                 g.autostart_row.subtitle_rect,
@@ -1612,6 +1900,7 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
     draw_pill_button(
         ctx,
         p,
+        ControlId::AboutRepo,
         layout.repo_btn_rect,
         "GitHub 主页",
         false,
@@ -1621,6 +1910,7 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
     draw_pill_button(
         ctx,
         p,
+        ControlId::AboutReleases,
         layout.releases_btn_rect,
         "查看 Releases",
         false,
@@ -1659,6 +1949,7 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
         draw_pill_button(
             ctx,
             p,
+            ControlId::AboutCheckUpdates,
             layout.check_btn_rect,
             check_label,
             false,
@@ -1719,6 +2010,7 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             published_at,
             download_url,
             asset_size,
+            sha256_url,
             ..
         } => {
             draw_text_clipped(
@@ -1744,14 +2036,28 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                     meta_rect,
                 );
             }
+            let has_download = download_url.is_some();
+            let has_sha = sha256_url.as_deref().is_some_and(|s| !s.trim().is_empty())
+                && ctx.update_status.can_auto_update();
+            let can_auto = ctx.update_status.can_auto_update() && ctx.self_update_writable;
             if let Some(prompt_rect) = layout.update_prompt_rect {
-                let can_auto = download_url.is_some() && ctx.self_update_writable;
-                let prompt = if can_auto {
-                    "是否自动下载更新并重启应用？"
-                } else if download_url.is_none() {
-                    "当前版本未附带直装程序，请前往 GitHub 手动下载"
+                let (prompt, prompt_color) = if can_auto {
+                    ("是否自动下载更新并重启应用？", &p.text_secondary)
+                } else if !has_download {
+                    (
+                        "当前版本未附带直装程序，请前往 GitHub 手动下载",
+                        &p.text_secondary,
+                    )
+                } else if !has_sha {
+                    (
+                        "该版本缺少 SHA-256 校验文件，请前往发布页手动下载",
+                        &p.orange,
+                    )
                 } else {
-                    "当前程序目录无写入权限，请点击前往手动下载"
+                    (
+                        "当前程序目录无写入权限，请点击前往手动下载",
+                        &p.text_secondary,
+                    )
                 };
                 draw_text_clipped(
                     ctx.rt,
@@ -1759,7 +2065,7 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                     ctx.utf16_buf,
                     prompt,
                     &ctx.fonts.small_fmt,
-                    &p.text_secondary,
+                    prompt_color,
                     prompt_rect,
                 );
             }
@@ -1769,6 +2075,7 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 draw_pill_button(
                     ctx,
                     p,
+                    ControlId::AboutAutoUpdate,
                     auto_rect,
                     "立即下载并更新",
                     true,
@@ -1778,6 +2085,7 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                 draw_pill_button(
                     ctx,
                     p,
+                    ControlId::AboutManualDownload,
                     manual_rect,
                     "手动下载",
                     false,
@@ -1785,11 +2093,17 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
                     true,
                 );
             } else if let Some(dl_rect) = layout.download_btn_rect {
+                let btn_label = if has_download && !has_sha {
+                    "手动下载".to_string()
+                } else {
+                    format!("手动下载 v{}", latest)
+                };
                 draw_pill_button(
                     ctx,
                     p,
+                    ControlId::AboutManualDownload,
                     dl_rect,
-                    &format!("前往下载 v{}", latest),
+                    &btn_label,
                     true,
                     PopupAction::OpenUrl(release_url.clone()),
                     true,
@@ -1814,6 +2128,18 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             if let Some(bar_rect) = layout.progress_bar_rect {
                 draw_progress_bar(ctx.rt, ctx.brush, p.track_bg, p.accent, bar_rect, ratio);
             }
+            if let Some(cancel_rect) = layout.cancel_update_btn_rect {
+                draw_pill_button(
+                    ctx,
+                    p,
+                    ControlId::AboutCancelUpdate,
+                    cancel_rect,
+                    "取消更新",
+                    false,
+                    PopupAction::CancelUpdate,
+                    true,
+                );
+            }
         }
         UpdateStatus::Verifying { latest } => {
             draw_text_clipped(
@@ -1827,6 +2153,18 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
             );
             if let Some(bar_rect) = layout.progress_bar_rect {
                 draw_progress_bar(ctx.rt, ctx.brush, p.track_bg, p.accent, bar_rect, 1.0);
+            }
+            if let Some(cancel_rect) = layout.cancel_update_btn_rect {
+                draw_pill_button(
+                    ctx,
+                    p,
+                    ControlId::AboutCancelUpdate,
+                    cancel_rect,
+                    "取消更新",
+                    false,
+                    PopupAction::CancelUpdate,
+                    true,
+                );
             }
         }
         UpdateStatus::Applying { latest } => {
@@ -1870,6 +2208,7 @@ unsafe fn draw_about_tab(ctx: &mut SceneInput<'_>, p: &PopupPalette) {
     draw_pill_button(
         ctx,
         p,
+        ControlId::AboutOpenConfig,
         layout.open_config_btn_rect,
         "打开配置文件",
         false,
@@ -1960,7 +2299,7 @@ unsafe fn draw_segmented_bar<const N: usize>(
     ctx: &mut SceneInput<'_>,
     p: &PopupPalette,
     rect: D2D_RECT_F,
-    segments: [(&str, bool, PopupAction); N],
+    segments: [(ControlId, &str, bool, PopupAction); N],
 ) {
     let track_rr = D2D1_ROUNDED_RECT {
         rect,
@@ -1978,7 +2317,7 @@ unsafe fn draw_segmented_bar<const N: usize>(
         (rect.right - rect.left - pad * 2.0 - gap * (N.saturating_sub(1) as f32)).max(1.0);
     let seg_w = inner_w / (N as f32);
 
-    for (i, (label, selected, action)) in segments.into_iter().enumerate() {
+    for (i, (id, label, selected, action)) in segments.into_iter().enumerate() {
         let left = rect.left + pad + (i as f32) * (seg_w + gap);
         let seg_rect = D2D_RECT_F {
             left,
@@ -1992,9 +2331,8 @@ unsafe fn draw_segmented_bar<const N: usize>(
             radiusY: 6.0,
         };
 
-        let idx = ctx.hit_boxes.len();
-        let hovered = ctx.hovered_idx == Some(idx);
-        let pressed = ctx.pressed_idx == Some(idx) && hovered;
+        let hovered = ctx.hovered_id == Some(&id);
+        let pressed = ctx.pressed_id == Some(&id) && hovered;
 
         let text_color = if selected {
             ctx.brush.SetColor(&p.card_bg);
@@ -2042,7 +2380,10 @@ unsafe fn draw_segmented_bar<const N: usize>(
             text_color,
             seg_rect,
         );
-        register_hit(ctx, seg_rect, action, true);
+        if ctx.focused_id == Some(&id) {
+            draw_focus_ring(ctx, p, seg_rect, 6.0);
+        }
+        register_hit(ctx, id, seg_rect, action, true);
     }
 }
 
@@ -2050,6 +2391,7 @@ unsafe fn draw_segmented_bar<const N: usize>(
 unsafe fn draw_toggle_switch(
     ctx: &mut SceneInput<'_>,
     p: &PopupPalette,
+    id: ControlId,
     row_rect: D2D_RECT_F,
     title_rect: D2D_RECT_F,
     subtitle_rect: D2D_RECT_F,
@@ -2059,9 +2401,8 @@ unsafe fn draw_toggle_switch(
     checked: bool,
     action: PopupAction,
 ) {
-    let idx = ctx.hit_boxes.len();
-    let hovered = ctx.hovered_idx == Some(idx);
-    let pressed = ctx.pressed_idx == Some(idx) && hovered;
+    let hovered = ctx.hovered_id == Some(&id);
+    let pressed = ctx.pressed_id == Some(&id) && hovered;
 
     if pressed || hovered {
         let row_hl = if pressed {
@@ -2157,15 +2498,21 @@ unsafe fn draw_toggle_switch(
         );
     }
 
-    register_hit(ctx, row_rect, action, true);
+    if ctx.focused_id == Some(&id) {
+        draw_focus_ring(ctx, p, row_rect, 6.0);
+    }
+    register_hit(ctx, id, row_rect, action, true);
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_stepper(
     ctx: &mut SceneInput<'_>,
     p: &PopupPalette,
     rect: D2D_RECT_F,
     value_text: &str,
+    dec_id: ControlId,
     dec_action: PopupAction,
+    inc_id: ControlId,
     inc_action: PopupAction,
 ) {
     let outer_rr = D2D1_ROUNDED_RECT {
@@ -2199,10 +2546,12 @@ unsafe fn draw_stepper(
         bottom: rect.bottom,
     };
 
-    for (btn_rect, label, action) in [(dec_rect, "−", dec_action), (inc_rect, "+", inc_action)] {
-        let idx = ctx.hit_boxes.len();
-        let hovered = ctx.hovered_idx == Some(idx);
-        let pressed = ctx.pressed_idx == Some(idx) && hovered;
+    for (id, btn_rect, label, action) in [
+        (dec_id, dec_rect, "−", dec_action),
+        (inc_id, inc_rect, "+", inc_action),
+    ] {
+        let hovered = ctx.hovered_id == Some(&id);
+        let pressed = ctx.pressed_id == Some(&id) && hovered;
         let (bg, fg) = p.pill_colors(false, hovered, pressed);
         ctx.brush.SetColor(&bg);
         ctx.rt.FillRoundedRectangle(
@@ -2222,7 +2571,10 @@ unsafe fn draw_stepper(
             &fg,
             btn_rect,
         );
-        register_hit(ctx, btn_rect, action, true);
+        if ctx.focused_id == Some(&id) {
+            draw_focus_ring(ctx, p, btn_rect, 4.0);
+        }
+        register_hit(ctx, id, btn_rect, action, true);
     }
 
     draw_text_clipped(
@@ -2240,6 +2592,7 @@ unsafe fn draw_stepper(
 unsafe fn draw_action_pill(
     ctx: &mut SceneInput<'_>,
     p: &PopupPalette,
+    id: ControlId,
     rect: D2D_RECT_F,
     label: &str,
     enabled: bool,
@@ -2272,9 +2625,8 @@ unsafe fn draw_action_pill(
         return;
     }
 
-    let idx = ctx.hit_boxes.len();
-    let hovered = ctx.hovered_idx == Some(idx);
-    let pressed = ctx.pressed_idx == Some(idx) && hovered;
+    let hovered = ctx.hovered_id == Some(&id);
+    let pressed = ctx.pressed_id == Some(&id) && hovered;
     let (bg, fg) = if danger && (hovered || pressed) && !ctx.theme.is_high_contrast() {
         let danger_bg = composite_over(
             rgba(248, 113, 113, if pressed { 0.30 } else { 0.20 }),
@@ -2285,7 +2637,10 @@ unsafe fn draw_action_pill(
         p.pill_colors(false, hovered, pressed)
     };
     draw_pill_visual(ctx, rect, label, bg, fg);
-    register_hit(ctx, rect, action, true);
+    if ctx.focused_id == Some(&id) {
+        draw_focus_ring(ctx, p, rect, 6.0);
+    }
+    register_hit(ctx, id, rect, action, true);
 }
 
 unsafe fn draw_metric_chip(
@@ -2296,9 +2651,9 @@ unsafe fn draw_metric_chip(
     on: bool,
     available: bool,
 ) {
-    let idx = ctx.hit_boxes.len();
-    let hovered = ctx.hovered_idx == Some(idx);
-    let pressed = ctx.pressed_idx == Some(idx) && hovered;
+    let id = ControlId::MetricChip(metric);
+    let hovered = ctx.hovered_id == Some(&id);
+    let pressed = ctx.pressed_id == Some(&id) && hovered;
     let rr = D2D1_ROUNDED_RECT {
         rect,
         radiusX: 6.0,
@@ -2387,7 +2742,10 @@ unsafe fn draw_metric_chip(
         &fg,
         icon_rect,
     );
-    register_hit(ctx, rect, PopupAction::ToggleMetric(metric), true);
+    if ctx.focused_id == Some(&id) {
+        draw_focus_ring(ctx, p, rect, 6.0);
+    }
+    register_hit(ctx, id, rect, PopupAction::ToggleMetric(metric), true);
 }
 
 unsafe fn draw_static_pill(
@@ -2428,30 +2786,73 @@ unsafe fn draw_pill_visual(
     );
 }
 
+unsafe fn draw_focus_ring(
+    ctx: &mut SceneInput<'_>,
+    p: &PopupPalette,
+    rect: D2D_RECT_F,
+    radius: f32,
+) {
+    let inner_rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: rect.left - 0.5,
+            top: rect.top - 0.5,
+            right: rect.right + 0.5,
+            bottom: rect.bottom + 0.5,
+        },
+        radiusX: radius + 0.5,
+        radiusY: radius + 0.5,
+    };
+    ctx.brush.SetColor(&p.bg);
+    ctx.rt.DrawRoundedRectangle(&inner_rr, ctx.brush, 1.5, None);
+
+    let outer_rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: rect.left - 1.5,
+            top: rect.top - 1.5,
+            right: rect.right + 1.5,
+            bottom: rect.bottom + 1.5,
+        },
+        radiusX: radius + 1.5,
+        radiusY: radius + 1.5,
+    };
+    ctx.brush.SetColor(&p.text_primary);
+    ctx.rt.DrawRoundedRectangle(&outer_rr, ctx.brush, 2.0, None);
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_pill_button(
     ctx: &mut SceneInput<'_>,
     p: &PopupPalette,
+    id: ControlId,
     rect: D2D_RECT_F,
     label: &str,
     active: bool,
     action: PopupAction,
     in_viewport: bool,
 ) {
-    let idx = ctx.hit_boxes.len();
-    let hovered = ctx.hovered_idx == Some(idx);
-    let pressed = ctx.pressed_idx == Some(idx) && hovered;
+    let hovered = ctx.hovered_id == Some(&id);
+    let pressed = ctx.pressed_id == Some(&id) && hovered;
     let (bg, fg) = p.pill_colors(active, hovered, pressed);
     draw_pill_visual(ctx, rect, label, bg, fg);
-    register_hit(ctx, rect, action, in_viewport);
+    if ctx.focused_id == Some(&id) {
+        draw_focus_ring(ctx, p, rect, 6.0);
+    }
+    register_hit(ctx, id, rect, action, in_viewport);
 }
 
 fn register_hit(
     ctx: &mut SceneInput<'_>,
+    id: ControlId,
     rect: D2D_RECT_F,
     action: PopupAction,
     in_viewport: bool,
 ) {
+    ctx.focus_items.push(FocusItem {
+        id: id.clone(),
+        rect,
+        action: action.clone(),
+        in_viewport,
+    });
     if in_viewport {
         let max_y = ctx.logical_h.max(HEADER_HEIGHT);
         let clipped = D2D_RECT_F {
@@ -2464,11 +2865,12 @@ fn register_hit(
             return;
         }
         ctx.hit_boxes.push(HitBox {
+            id,
             rect: clipped,
             action,
         });
     } else {
-        ctx.hit_boxes.push(HitBox { rect, action });
+        ctx.hit_boxes.push(HitBox { id, rect, action });
     }
 }
 
@@ -2492,10 +2894,22 @@ unsafe fn draw_card(
 unsafe fn draw_kv_row(
     ctx: &mut SceneInput<'_>,
     p: &PopupPalette,
+    range: (f32, f32),
+    y: f32,
+    key: &str,
+    val: &str,
+) {
+    draw_kv_row_with_key_width(ctx, p, range, y, key, val, 46.0);
+}
+
+unsafe fn draw_kv_row_with_key_width(
+    ctx: &mut SceneInput<'_>,
+    p: &PopupPalette,
     (x0, x1): (f32, f32),
     y: f32,
     key: &str,
     val: &str,
+    key_w: f32,
 ) {
     draw_text_clipped(
         ctx.rt,
@@ -2507,7 +2921,7 @@ unsafe fn draw_kv_row(
         D2D_RECT_F {
             left: x0,
             top: y,
-            right: x0 + 46.0,
+            right: (x0 + key_w).min(x1),
             bottom: y + 18.0,
         },
     );
@@ -2519,7 +2933,7 @@ unsafe fn draw_kv_row(
         &ctx.fonts.mono_fmt,
         &p.text_primary,
         D2D_RECT_F {
-            left: x0 + 42.0,
+            left: (x0 + key_w - 4.0).min(x1),
             top: y,
             right: x1,
             bottom: y + 18.0,
@@ -2673,8 +3087,11 @@ mod tests {
             let mut snap = MonitorSnapshot::new(AppConfig::default());
             snap.config.hardware_items.push(HwMetric::CpuFreq); // odd (5 items) -> tests empty slot
             let mut hit_boxes = Vec::new();
+            let mut focus_items = Vec::new();
             let mut slot_rects = Vec::new();
             let mut utf16_buf = Vec::new();
+            let hovered_id = ControlId::Tab(PopupTab::Settings);
+            let focused_id = ControlId::ResetDefaultMetrics;
 
             for theme in [UiTheme::Dark, UiTheme::Light, hc_theme] {
                 for sub_tab in [
@@ -2685,6 +3102,7 @@ mod tests {
                     let mut scroll_y = 0.0;
                     let mut max_scroll_y = 0.0;
                     hit_boxes.clear();
+                    focus_items.clear();
                     slot_rects.clear();
                     rt.BindDC(hdc, &bind_rect).unwrap();
                     rt.BeginDraw();
@@ -2708,20 +3126,227 @@ mod tests {
                         has_dwm_border: true,
                         logical_w: POPUP_WIDTH_LOGICAL,
                         logical_h: POPUP_FIXED_HEIGHT_LOGICAL,
-                        hovered_idx: Some(3),
-                        pressed_idx: None,
+                        hovered_id: Some(&hovered_id),
+                        pressed_id: None,
+                        focused_id: Some(&focused_id),
                         scroll_y: &mut scroll_y,
                         max_scroll_y: &mut max_scroll_y,
                         hit_boxes: &mut hit_boxes,
+                        focus_items: &mut focus_items,
                         metric_slot_rects: &mut slot_rects,
                         utf16_buf: &mut utf16_buf,
                     };
                     draw_popup_scene(&mut scene);
                     rt.EndDraw(None, None).unwrap();
                     assert!(!hit_boxes.is_empty());
+                    assert!(!focus_items.is_empty());
                     if sub_tab == SettingsSubTab::Metrics {
                         assert_eq!(slot_rects.len(), 5);
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_and_about_states_render_cleanly_with_focus_rings() {
+        use crate::config::AppConfig;
+        use crate::state::HardwareMetrics;
+        use crate::ui::popup::layout::{POPUP_FIXED_HEIGHT_LOGICAL, POPUP_WIDTH_LOGICAL};
+        use crate::ui::renderer::{shared_d2d_factory, shared_dwrite_factory, WindowSurface};
+        use crate::ui::theme::HighContrastColors;
+        use windows::core::Interface;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct2D::Common::{
+            D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT,
+        };
+        use windows::Win32::Graphics::Direct2D::{
+            D2D1_DASH_STYLE_DASH, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1_STROKE_STYLE_PROPERTIES,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+        unsafe {
+            let d2d = shared_d2d_factory().unwrap();
+            let dwrite = shared_dwrite_factory().unwrap();
+            let fonts = PopupFonts::new(&dwrite).unwrap();
+            let dash_stroke = d2d
+                .CreateStrokeStyle(
+                    &D2D1_STROKE_STYLE_PROPERTIES {
+                        dashStyle: D2D1_DASH_STYLE_DASH,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+
+            let mut surface = WindowSurface::new();
+            let w = POPUP_WIDTH_LOGICAL as i32;
+            let h = POPUP_FIXED_HEIGHT_LOGICAL as i32;
+            let hdc = surface.ensure_size(w, h).unwrap();
+
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                ..Default::default()
+            };
+            let rt = d2d.CreateDCRenderTarget(&props).unwrap();
+            let base_rt: ID2D1RenderTarget = rt.cast().unwrap();
+            let brush = base_rt
+                .CreateSolidColorBrush(&rgba(255, 255, 255, 1.0), None)
+                .unwrap();
+            let bind_rect = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            let hc_theme = UiTheme::HighContrast(HighContrastColors {
+                dark: false,
+                bg: (255, 255, 255),
+                fg: (0, 0, 0),
+                accent: (0, 90, 180),
+                accent_fg: (255, 255, 255),
+                muted: (80, 80, 80),
+            });
+
+            // 1. Overview with both zones disabled + focus ring on enable button.
+            let mut disabled_snap = MonitorSnapshot::new(AppConfig::default());
+            disabled_snap.config.set_hardware_enabled(false);
+            disabled_snap.config.set_wireless_enabled(false);
+
+            // 2. Overview with unavailable metrics + ACPI thermal.
+            let mut acpi_snap = MonitorSnapshot::new(AppConfig::default());
+            acpi_snap.hw = HardwareMetrics::unavailable();
+            acpi_snap.hw.acpi_temp_c = Some(53.0);
+
+            let mut hit_boxes = Vec::new();
+            let mut focus_items = Vec::new();
+            let mut slot_rects = Vec::new();
+            let mut utf16_buf = Vec::new();
+
+            for (snap, focus) in [
+                (&disabled_snap, ControlId::OverviewToggleHardware),
+                (&acpi_snap, ControlId::OverviewRefreshWireless),
+            ] {
+                for theme in [UiTheme::Dark, UiTheme::Light, hc_theme] {
+                    let mut scroll_y = 0.0;
+                    let mut max_scroll_y = 0.0;
+                    hit_boxes.clear();
+                    focus_items.clear();
+                    slot_rects.clear();
+                    rt.BindDC(hdc, &bind_rect).unwrap();
+                    rt.BeginDraw();
+                    let mut scene = SceneInput {
+                        rt: &base_rt,
+                        brush: &brush,
+                        d2d_factory: &d2d,
+                        dash_stroke: &dash_stroke,
+                        fonts: &fonts,
+                        snapshot: snap,
+                        update_status: &UpdateStatus::Idle,
+                        self_update_writable: true,
+                        theme,
+                        active_tab: PopupTab::Overview,
+                        settings_sub_tab: SettingsSubTab::Metrics,
+                        selected_metric_idx: None,
+                        drag_metric_from: None,
+                        drag_metric_active: false,
+                        drag_metric_hover: None,
+                        cached_autostart: false,
+                        has_dwm_border: true,
+                        logical_w: POPUP_WIDTH_LOGICAL,
+                        logical_h: POPUP_FIXED_HEIGHT_LOGICAL,
+                        hovered_id: None,
+                        pressed_id: None,
+                        focused_id: Some(&focus),
+                        scroll_y: &mut scroll_y,
+                        max_scroll_y: &mut max_scroll_y,
+                        hit_boxes: &mut hit_boxes,
+                        focus_items: &mut focus_items,
+                        metric_slot_rects: &mut slot_rects,
+                        utf16_buf: &mut utf16_buf,
+                    };
+                    draw_popup_scene(&mut scene);
+                    rt.EndDraw(None, None).unwrap();
+                    assert!(focus_items.iter().any(|item| item.id == focus));
+                }
+            }
+
+            // 3. About tab: missing SHA-256 disables auto-update button; Downloading shows cancel button.
+            let missing_sha = UpdateStatus::UpdateAvailable {
+                current: "0.1.0".into(),
+                latest: "0.2.0".into(),
+                release_url: "https://github.com/AmlitaEnan/AirMonitor/releases/tag/v0.2.0".into(),
+                published_at: None,
+                download_url: Some(
+                    "https://github.com/AmlitaEnan/AirMonitor/releases/download/v0.2.0/airmonitor.exe"
+                        .into(),
+                ),
+                asset_name: Some("airmonitor.exe".into()),
+                asset_size: Some(1_100_000),
+                sha256_url: None,
+            };
+            let downloading = UpdateStatus::Downloading {
+                latest: "0.2.0".into(),
+                downloaded_bytes: 256 * 1024,
+                total_bytes: Some(1024 * 1024),
+            };
+            for (status, expected_id, forbidden_id) in [
+                (
+                    &missing_sha,
+                    ControlId::AboutManualDownload,
+                    Some(ControlId::AboutAutoUpdate),
+                ),
+                (&downloading, ControlId::AboutCancelUpdate, None),
+            ] {
+                let mut scroll_y = 0.0;
+                let mut max_scroll_y = 0.0;
+                hit_boxes.clear();
+                focus_items.clear();
+                slot_rects.clear();
+                rt.BindDC(hdc, &bind_rect).unwrap();
+                rt.BeginDraw();
+                let mut scene = SceneInput {
+                    rt: &base_rt,
+                    brush: &brush,
+                    d2d_factory: &d2d,
+                    dash_stroke: &dash_stroke,
+                    fonts: &fonts,
+                    snapshot: &acpi_snap,
+                    update_status: status,
+                    self_update_writable: true,
+                    theme: UiTheme::Dark,
+                    active_tab: PopupTab::About,
+                    settings_sub_tab: SettingsSubTab::Metrics,
+                    selected_metric_idx: None,
+                    drag_metric_from: None,
+                    drag_metric_active: false,
+                    drag_metric_hover: None,
+                    cached_autostart: false,
+                    has_dwm_border: true,
+                    logical_w: POPUP_WIDTH_LOGICAL,
+                    logical_h: POPUP_FIXED_HEIGHT_LOGICAL,
+                    hovered_id: None,
+                    pressed_id: None,
+                    focused_id: Some(&expected_id),
+                    scroll_y: &mut scroll_y,
+                    max_scroll_y: &mut max_scroll_y,
+                    hit_boxes: &mut hit_boxes,
+                    focus_items: &mut focus_items,
+                    metric_slot_rects: &mut slot_rects,
+                    utf16_buf: &mut utf16_buf,
+                };
+                draw_popup_scene(&mut scene);
+                rt.EndDraw(None, None).unwrap();
+                assert!(focus_items.iter().any(|item| item.id == expected_id));
+                if let Some(forbidden) = forbidden_id {
+                    assert!(!focus_items.iter().any(|item| item.id == forbidden));
                 }
             }
         }
